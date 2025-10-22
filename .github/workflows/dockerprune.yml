@@ -72,6 +72,7 @@ jobs:
           echo "$REPO_LIST"
           echo
           # build a list of all images & tags
+          FULL_IMAGE_LIST=""
           for i in ${REPO_LIST}
           do
             # get tags for repo
