@@ -22,10 +22,10 @@ dirs = {version = "5.0.1", optional = true}
 env_logger = "0.11.3"
 fcm-push-listener = {version = "2.0.3", optional = true}
 futures = "0.3.28"
-gstreamer = {version = "0.23.0", optional = true}
-gstreamer-app = { version = "0.23.0", features = ["v1_20"], optional = true }
-gstreamer-rtsp = { version = "0.23.0", features = ["v1_20"], optional = true }
-gstreamer-rtsp-server = { version = "0.23.0", features = ["v1_20"], optional = true }
+gstreamer = {version = "0.24", optional = true}
+gstreamer-app = { version = "0.24", features = ["v1_20"], optional = true }
+gstreamer-rtsp = { version = "0.24", features = ["v1_20"], optional = true }
+gstreamer-rtsp-server = { version = "0.24", features = ["v1_20"], optional = true }
 heck = "0.5.0"
 log = { version = "0.4.17", features = [ "release_max_level_debug" ] }
 md5 = {version = "0.7.0", optional = true}
