@@ -1,7 +1,6 @@
 # Neolink
 
-![CI](https://github.com/QuantumEntangledAndy/neolink/workflows/CI/badge.svg)
-[![dependency status](https://deps.rs/repo/github/QuantumEntangledAndy/neolink/status.svg)](https://deps.rs/repo/github/QuantumEntangledAndy/neolink)
+[![dependency status](https://deps.rs/repo/github/privatecoder/neolink/status.svg)](https://deps.rs/repo/github/privatecoder/neolink)
 
 Neolink is a small program that acts as a proxy between Reolink IP cameras and
 normal RTSP clients.
@@ -20,60 +19,13 @@ does has been reverse engineered.
 ## This Fork
 
 This fork is an extension of
-[thirtythreeforty's](https://github.com/thirtythreeforty/neolink) with additional
-features not yet in upstream master.
+[QuantumEntangledAndy's](https://github.com/QuantumEntangledAndy/neolink) with some attempted improvements for stability.
 
-**Major Features**:
-
-- MQTT
-- Motion Detection
-- Paused Streams (when no rtsp client or no motion detected)
-- Save a still image to disk
-
-**Minor Features**:
-
-- Improved error messages when missing gstreamer plugins
-- Protocol more closely follows official reolink format
-  - Possibly can handle more simulatenous connections
-- More ways to connect to the camera. Including Relaying through reolink
-  servers
-- Camera battery levels can be displayed in the log
 
 ## Installation
 
 Download from the
-[release page](https://github.com/QuantumEntangledAndy/neolink/releases)
-
-Extract the zip
-
-Install the latest [gstreamer](https://gstreamer.freedesktop.org/download/)
-(1.20.5 as of writing this).
-
-- **Windows**: ensure you install `full` when prompted in the MSI options.
-- **Mac**: Install the dpkg version on the official gstreamer website over
-  the brew version
-- **Ubuntu/Debian**: These packages should work
-
-```bash
-sudo apt install \
-  libgstrtspserver-1.0-0 \
-  libgstreamer1.0-0 \
-  libgstreamer-plugins-bad1.0-0 \
-  gstreamer1.0-x \
-  gstreamer1.0-plugins-base \
-  gstreamer1.0-plugins-good \
-  gstreamer1.0-plugins-bad \
-  libssl
-```
-
-- **Windows**: You may also need to
-  [install openssl](https://wiki.openssl.org/index.php/Binaries)
-- **Macos**: You may also need to
-  [install openssl](https://wiki.openssl.org/index.php/Binaries) or
-  `brew install openssl@1.1`
-- **Ubuntu/Debian**: Install the `libssl` package
-
-Make a config file see below.
+[release page](https://github.com/privatecoder/neolink/releases)
 
 ## Config/Usage
 
@@ -101,69 +53,6 @@ password = "password"
 uid = "BCDEF0123456789A"
 address = "192.168.1.10"
 ```
-
-Create a text file called `neolink.toml` in the same folder as the
-neolink binary. With your config options.
-
-When ready start `neolink` with the following command
-using the terminal in the same folder the neolink binary is in.
-
-```bash
-./neolink rtsp --config=neolink.toml
-```
-
-### Discovery
-
-To connect to a camera using a UID we need to find the IP address of the camera
-with that UID
-
-The IP is discovered with four methods
-
-1. Local discovery: Here we send a broadcast on all visible networks asking
-   the local network if there is a camera with this UID. This only works if
-   the network supports broadcasts
-
-   If you know the ip address you can put it into the `address` field of the
-   config and attempt a direct connection without broadcasts. This requires a
-   route from neolink to the camera.
-
-2. Remote discovery: Here we ask the reolink servers what the IP address is.
-   This requires that we contact reolink and provide some basic information
-   like the UID. Once we have this information we connect directly to the
-   local IP address. This requires a route from neolink to the camera and
-   for the camera to be able to contact reolink.
-
-3. Map discovery: In this case we register our IP address with reolink and ask
-   the camera to connect to us. Once the camera either polls/recieves a connect
-   request from the reolink servers the camera will initiate a connection
-   to neolink. This requires that our IP and reolink are reachable from
-   the camera.
-
-4. Relay: In this case we request that reolink relay our connection. Neolink
-   nor the camera need to be able to direcly contact each other. But both
-   neolink and the camera need to be able to contact reolink.
-
-This can be controlled with the config
-
-```toml
-discovery = "local"
-```
-
-In the `[[cameras]]` section of the toml.
-
-Possible values are `local`, `remote`, `map`, `relay` later values implictly
-enable prior methods.
-
-#### Cellular
-
-Cellular cameras should select `"cellular"` which only enables `map` and
-`relay` since `local` and `remote` will always fail
-
-```toml
-discovery = "cellular"
-```
-
-See the sample config file for more details.
 
 ### MQTT
 
