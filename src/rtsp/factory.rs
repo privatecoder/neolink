@@ -30,11 +30,9 @@ struct StreamConfig {
     fps_table: Vec<u32>,
     vid_type: Option<VideoType>,
     aud_type: Option<AudioType>,
-    camera_name: String,
-    stream_kind: StreamKind,
 }
 impl StreamConfig {
-    async fn new(instance: &NeoInstance, name: StreamKind, camera_name: String) -> AnyResult<Self> {
+    async fn new(instance: &NeoInstance, name: StreamKind) -> AnyResult<Self> {
         let (resolution, bitrate, fps, fps_table, bitrate_table) = instance
             .run_passive_task(|cam| {
                 Box::pin(async move {
@@ -94,8 +92,6 @@ impl StreamConfig {
             bitrate_table,
             vid_type: None,
             aud_type: None,
-            camera_name,
-            stream_kind: name,
         })
     }
 
@@ -182,7 +178,7 @@ pub(super) async fn make_factory(
                         let mut buffer = vec![];
                         let mut frame_count = 0usize;
 
-                        let mut stream_config = StreamConfig::new(&camera, stream, name.clone()).await?;
+                        let mut stream_config = StreamConfig::new(&camera, stream).await?;
                         while let Some(media) = media_rx.recv().await {
                             stream_config.update_from_media(&media);
                             buffer.push(media);
@@ -573,18 +569,11 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
 
-    // Set deterministic stream ID for better debugging and consistency
-    let stream_id = format!("{}/{}/video", stream_config.camera_name, stream_config.stream_kind);
-    source.set_property("stream-id", &stream_id);
-
     let source = source
         .dynamic_cast::<Element>()
         .map_err(|_| anyhow!("Cannot cast back"))?;
     let queue = make_queue("source_queue", buffer_size)?;
     let parser = make_element("h264parse", "parser")?;
-    // Configure parser to be more tolerant of camera stream errors
-    parser.set_property("disable-passthrough", true);
-
     // let stamper = make_element("h264timestamper", "stamper")?;
 
     bin.add_many([&source, &queue, &parser])?;
@@ -635,18 +624,11 @@ fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
 
-    // Set deterministic stream ID for better debugging and consistency
-    let stream_id = format!("{}/{}/video", stream_config.camera_name, stream_config.stream_kind);
-    source.set_property("stream-id", &stream_id);
-
     let source = source
         .dynamic_cast::<Element>()
         .map_err(|_| anyhow!("Cannot cast back"))?;
     let queue = make_queue("source_queue", buffer_size)?;
     let parser = make_element("h265parse", "parser")?;
-    // Configure parser to be more tolerant of camera stream errors
-    parser.set_property("disable-passthrough", true);
-
     // let stamper = make_element("h265timestamper", "stamper")?;
 
     bin.add_many([&source, &queue, &parser])?;
@@ -698,10 +680,6 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
-
-    // Set deterministic stream ID for better debugging and consistency
-    let stream_id = format!("{}/{}/audio", stream_config.camera_name, stream_config.stream_kind);
-    source.set_property("stream-id", &stream_id);
 
     let source = source
         .dynamic_cast::<Element>()
@@ -789,10 +767,6 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
 
-    // Set deterministic stream ID for better debugging and consistency
-    let stream_id = format!("{}/{}/audio", stream_config.camera_name, stream_config.stream_kind);
-    source.set_property("stream-id", &stream_id);
-
     source.set_caps(Some(
         &Caps::builder("audio/x-adpcm")
             .field("layout", "div")
@@ -864,10 +838,6 @@ fn pipe_silence(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
-
-    // Set deterministic stream ID for better debugging and consistency
-    let stream_id = format!("{}/{}/audio", stream_config.camera_name, stream_config.stream_kind);
-    source.set_property("stream-id", &stream_id);
 
     let source = source
         .dynamic_cast::<Element>()
