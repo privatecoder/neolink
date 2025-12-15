@@ -3,7 +3,7 @@ name = "neolink"
 description = "A standards-compliant bridge to Reolink IP cameras"
 version = "0.6.4-beta.1"
 authors = []
-edition = "2025"
+edition = "2018"
 license = "AGPL-3.0-or-later"
 
 [workspace]
