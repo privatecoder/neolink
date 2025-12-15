@@ -39,7 +39,7 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
     let camera = reactor.get(&opt.camera).await?;
 
     if opt.use_stream {
-        let (stream_data_tx, mut stream_data_rx) = tokio::sync::mpsc::channel(100);
+        let (stream_data_tx, mut stream_data_rx) = tokio::sync::mpsc::channel(500);
 
         // Spawn a video stream
         let thread_camera = camera.clone();
@@ -52,7 +52,7 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
                     let stream_data_tx = stream_data_tx.clone();
 
                     Box::pin(async move {
-                        let mut stream = cam.start_video(StreamKind::Main, 100, false).await?;
+                        let mut stream = cam.start_video(StreamKind::Main, 500, false).await?;
                         while let Ok(frame) = stream.get_data().await {
                             let frame = frame?;
                             match frame {

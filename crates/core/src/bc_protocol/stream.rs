@@ -124,7 +124,7 @@ impl BcCamera {
         let abort_handle_thread = abort_handle.clone();
 
         if buffer_size == 0 {
-            buffer_size = 100;
+            buffer_size = 500;
         }
         let (tx, rx) = channel(buffer_size);
         let channel_id = self.channel_id;
