@@ -30,4 +30,12 @@ pub struct Opt {
     /// Use to change the volume of the input
     #[arg(short, long, default_value = "1.0")]
     pub volume: f32,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub noise_suppression: bool,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub echo_cancel: bool,
+    #[arg(long, default_value = "2")]
+    pub echo_suppression_level: i32,
+    #[arg(long, default_value = "1")]
+    pub noise_suppression_level: i32
 }

@@ -14,10 +14,14 @@ use byte_slice_cast::*;
 pub(super) fn from_input(
     input_src: &str,
     volume: f32,
+    noise_suppression: bool,
+    echo_cancel: bool,
+    echo_suppression_level: i32,
+    noise_suppression_level: i32,
     block_align: u16,
     sample_rate: u16,
 ) -> Result<(JoinSet<AnyResult<()>>, Receiver<Vec<u8>>)> {
-    let pipeline = create_pipeline(input_src, volume, block_align, sample_rate)?;
+    let pipeline = create_pipeline(input_src, volume, noise_suppression, echo_cancel, echo_suppression_level, noise_suppression_level, block_align, sample_rate)?;
     input(pipeline)
 }
 
@@ -135,23 +139,43 @@ fn set_data_channel(appsink: &AppSink, tx: Sender<Vec<u8>>) {
 fn create_pipeline(
     source: &str,
     volume: f32,
+    noise_suppression: bool,
+    echo_cancel: bool,
+    echo_suppression_level: i32,
+    noise_suppression_level: i32,
     block_align: u16,
     sample_rate: u16,
 ) -> Result<Pipeline> {
     gstreamer::init()
         .context("Unable to start gstreamer ensure it and all plugins are installed")?;
 
+    let mut webrtcdsp = "".to_string();
+    if noise_suppression || echo_cancel {
+        let noise_string = if noise_suppression {
+            format!("noise-suppression=true noise-suppression-level={}", noise_suppression_level)
+        } else {
+            "noise-suppression=false".to_string()
+        };
+        let echo_string = if echo_cancel {
+            format!("echo-cancel=true echo-suppression-level={}", echo_suppression_level)
+        } else {
+            "echo-cancel=false".to_string()
+        };
+        webrtcdsp = format!("! webrtcdsp {} {}", noise_string, echo_string);
+    }
+
     let launch_str = format!(
         "{} \
         ! decodebin \
+        {} \
         ! audioconvert \
         ! audioresample \
         ! audio/x-raw,rate={},channels=1 \
         ! volume volume={:.2} \
-        ! queue  \
+        ! queue max-size-buffers=1 max-size-time=0 max-size-bytes=0 \
         ! adpcmenc blockalign={} layout=dvi \
-        ! appsink name=thesink",
-        source, sample_rate, volume, block_align
+        ! appsink name=thesink sync=false",
+        source, webrtcdsp, sample_rate, volume, block_align
     );
 
     log::info!("{}", launch_str);
@@ -166,6 +190,9 @@ fn create_pipeline(
     })?;
 
     let appsink = get_sink(&pipeline)?;
+    appsink.set_property("max-buffers", &(1u32));
+    appsink.set_property("drop", &true);
+    
 
     // Tell the appsink what format we want. It will then be the audiotestsrc's job to
     // provide the format we request.

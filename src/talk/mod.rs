@@ -78,12 +78,12 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
                 "filesrc location={}",
                 path.to_str().expect("File path not UTF8 complient")
             ),
-            opt.volume,
+            opt.volume, opt.noise_suppression, opt.echo_cancel, opt.echo_suppression_level, opt.noise_suppression_level,
             block_size,
             sample_rate,
         )
         .with_context(|| format!("Failed to setup gst with the file: {:?}", path))?,
-        (None, true) => gst::from_input(&opt.input_src, opt.volume, block_size, sample_rate)
+        (None, true) => gst::from_input(&opt.input_src, opt.volume, opt.noise_suppression, opt.echo_cancel, opt.echo_suppression_level, opt.noise_suppression_level, block_size, sample_rate)
             .context("Failed to setup gst using the microphone")?,
         _ => unreachable!(),
     };
