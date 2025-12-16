@@ -1880,7 +1880,7 @@ dependencies = [
 
 [[package]]
 name = "neolink"
-version = "0.6.3-rc.3"
+version = "0.6.4-beta.8"
 dependencies = [
  "anyhow",
  "base64 0.22.0",
