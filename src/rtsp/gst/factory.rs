@@ -50,6 +50,11 @@ impl NeoMediaFactory {
         F: Fn(Element) -> AnyResult<Option<Element>> + Send + Sync + 'static,
     {
         let factory = Self::new();
+
+        // Clear the default launch string so create_element uses our callback instead
+        log::info!("new_with_callback: Clearing default launch string");
+        factory.set_launch("");
+
         factory.imp().set_callback(callback).await;
         Ok(factory)
     }

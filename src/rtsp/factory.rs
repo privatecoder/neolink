@@ -154,6 +154,8 @@ pub(super) async fn make_factory(
     camera: NeoInstance,
     stream: StreamKind,
 ) -> AnyResult<(NeoMediaFactory, JoinHandle<AnyResult<()>>)> {
+    log::error!("========== MAKE_FACTORY CALLED FOR STREAM {:?} ==========", stream);
+
     let (client_tx, mut client_rx) = mpsc(100);
 
     log::info!("Creating factory for stream {:?}", stream);
