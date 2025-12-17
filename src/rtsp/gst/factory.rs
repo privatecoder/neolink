@@ -117,27 +117,33 @@ impl NeoMediaFactoryImpl {
     where
         F: Fn(Element) -> AnyResult<Option<Element>> + Send + Sync + 'static,
     {
+        log::info!("set_callback: Storing callback in factory impl");
         self.call_back.lock().await.replace(Arc::new(callback));
+        log::info!("set_callback: Callback stored successfully");
     }
     fn build_pipeline(&self, media: Element) -> AnyResult<Option<Element>> {
-        log::debug!("build_pipeline called");
-        match self.call_back.blocking_lock().as_ref() {
+        log::info!("build_pipeline: START - acquiring callback lock");
+        let callback_guard = self.call_back.blocking_lock();
+        let has_callback = callback_guard.is_some();
+        log::info!("build_pipeline: Lock acquired, callback present: {}", has_callback);
+
+        match callback_guard.as_ref() {
             Some(call) => {
-                log::debug!("Callback is set, invoking it");
+                log::info!("build_pipeline: Invoking callback now");
                 let new_media = call(media);
                 match new_media {
                     Ok(new_media) => {
-                        log::debug!("Callback succeeded, returned element: {}", new_media.is_some());
+                        log::info!("build_pipeline: Callback succeeded, returned element: {}", new_media.is_some());
                         Ok(new_media)
                     }
                     Err(e) => {
-                        log::warn!("Callback failed: {e:?}");
+                        log::error!("build_pipeline: Callback failed with error: {e:?}");
                         Ok(None)
                     }
                 }
             }
             None => {
-                log::error!("No callback set!");
+                log::error!("build_pipeline: NO CALLBACK SET - this should not happen!");
                 Ok(None)
             }
         }

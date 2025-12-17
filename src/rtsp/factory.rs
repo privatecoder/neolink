@@ -155,6 +155,9 @@ pub(super) async fn make_factory(
     stream: StreamKind,
 ) -> AnyResult<(NeoMediaFactory, JoinHandle<AnyResult<()>>)> {
     let (client_tx, mut client_rx) = mpsc(100);
+
+    log::info!("Creating factory for stream {:?}", stream);
+
     // Create the task that creates the pipelines
     let thread = tokio::task::spawn(async move {
         let name = camera.config().await?.borrow().name.clone();
@@ -372,9 +375,11 @@ pub(super) async fn make_factory(
         AnyResult::Ok(())
     });
 
+    log::info!("Setting up factory with custom callback");
+
     // Now setup the factory
     let factory = NeoMediaFactory::new_with_callback(move |element| {
-        log::info!("=== FACTORY CALLBACK START ===");
+        log::info!("=== FACTORY CALLBACK INVOKED ===");
         log::debug!("Factory callback invoked for new client");
         let (reply, new_element) = tokio::sync::oneshot::channel();
 
@@ -398,6 +403,8 @@ pub(super) async fn make_factory(
         }
     })
     .await?;
+
+    log::info!("Factory created successfully with callback registered");
     Ok((factory, thread))
 }
 
