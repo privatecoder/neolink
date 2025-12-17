@@ -26,7 +26,7 @@ pub(crate) async fn stream_main(
     factory.add_permitted_roles(users);
 
     for path in paths.iter() {
-        log::debug!("Path: {}", path);
+        log::info!("{}: Mounting factory at path: {}", name, path);
         mounts.add_factory(path, factory.clone());
     }
     log::info!("{}: Available at {}", name, paths.join(", "));

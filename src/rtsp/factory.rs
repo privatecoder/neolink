@@ -162,7 +162,7 @@ pub(super) async fn make_factory(
         while let Some(msg) = client_rx.recv().await {
             match msg {
                 ClientMsg::NewClient { element, reply } => {
-                    log::debug!("New client for {name}::{stream}");
+                    log::info!("NewClient message received for {name}::{stream}");
                     let camera = camera.clone();
                     let name = name.clone();
                     tokio::task::spawn(async move {
@@ -364,11 +364,24 @@ pub(super) async fn make_factory(
 
     // Now setup the factory
     let factory = NeoMediaFactory::new_with_callback(move |element| {
+        log::debug!("Factory callback invoked for new client");
         let (reply, new_element) = tokio::sync::oneshot::channel();
-        client_tx.blocking_send(ClientMsg::NewClient { element, reply })?;
 
-        let element = new_element.blocking_recv()?;
-        Ok(Some(element))
+        if let Err(e) = client_tx.blocking_send(ClientMsg::NewClient { element, reply }) {
+            log::error!("Failed to send NewClient message: {:?}", e);
+            return Err(anyhow::anyhow!("Failed to send NewClient message: {:?}", e));
+        }
+
+        match new_element.blocking_recv() {
+            Ok(element) => {
+                log::debug!("Factory callback received pipeline element");
+                Ok(Some(element))
+            }
+            Err(e) => {
+                log::error!("Failed to receive pipeline element: {:?}", e);
+                Err(anyhow::anyhow!("Failed to receive pipeline element: {:?}", e))
+            }
+        }
     })
     .await?;
     Ok((factory, thread))

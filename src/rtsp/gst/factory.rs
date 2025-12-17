@@ -120,18 +120,26 @@ impl NeoMediaFactoryImpl {
         self.call_back.lock().await.replace(Arc::new(callback));
     }
     fn build_pipeline(&self, media: Element) -> AnyResult<Option<Element>> {
+        log::debug!("build_pipeline called");
         match self.call_back.blocking_lock().as_ref() {
             Some(call) => {
+                log::debug!("Callback is set, invoking it");
                 let new_media = call(media);
                 match new_media {
-                    Ok(new_media) => Ok(new_media),
+                    Ok(new_media) => {
+                        log::debug!("Callback succeeded, returned element: {}", new_media.is_some());
+                        Ok(new_media)
+                    }
                     Err(e) => {
-                        log::debug!("Media source is currently restarting: {e:?}");
+                        log::warn!("Callback failed: {e:?}");
                         Ok(None)
                     }
                 }
             }
-            None => Ok(None),
+            None => {
+                log::error!("No callback set!");
+                Ok(None)
+            }
         }
     }
 }
@@ -139,8 +147,27 @@ impl NeoMediaFactoryImpl {
 impl ObjectImpl for NeoMediaFactoryImpl {}
 impl RTSPMediaFactoryImpl for NeoMediaFactoryImpl {
     fn create_element(&self, url: &RTSPUrl) -> Option<Element> {
-        self.parent_create_element(url)
-            .and_then(|orig| self.build_pipeline(orig).expect("Could not build pipeline"))
+        log::info!("create_element called for URL: {}", url.request_uri());
+
+        let parent_element = self.parent_create_element(url);
+        if parent_element.is_none() {
+            log::error!("parent_create_element returned None");
+            return None;
+        }
+
+        let orig = parent_element.unwrap();
+        match self.build_pipeline(orig) {
+            Ok(result) => {
+                if result.is_none() {
+                    log::warn!("build_pipeline returned None (likely restarting or error)");
+                }
+                result
+            }
+            Err(e) => {
+                log::error!("build_pipeline failed: {:?}", e);
+                None
+            }
+        }
     }
 }
 
