@@ -116,8 +116,7 @@ Control messages:
 - `/control/floodlight [on|off]` Turns floodlight (if equipped) on/off
 - `/control/floodlight_tasks [on|off]` Turns floodlight (if equipped) tasks on/off
   This is the automatic tasks such as on motion and night triggers
-- `/control/wakeup (mins)` For cameras that are using `idle_disconnect` this will
-  force a wakeup for at least the given minutes
+- `/control/wakeup (mins)` Force a camera connection for at least the given minutes
 - `/control/siren on` Signal the siren, the message is always "on" as there is no
   "off" signal for the siren
 
@@ -317,36 +316,35 @@ Then start the rtsp server as usual:
 ./neolink rtsp --config=neolink.toml
 ```
 
-### Idle Disconnects
+### On-Demand Connections
 
-To really save battery we need to disconnect the camera when it is idle.
+To save battery and network bandwidth, Neolink automatically disconnects from cameras
+when they are not being used.
 
-To acheieve this you can add `idle_disconnect = true` to the `[[cameras]]`
-section
+Cameras connect **only when needed**:
+- When an RTSP client connects to view the stream
+- When an MQTT command is executed
+- When motion detection is active
 
-```toml
-bind = "0.0.0.0"
+Cameras disconnect **immediately** when:
+- All RTSP clients disconnect
+- No active tasks require the camera connection
 
-[[cameras]]
-name = "Camera01"
-username = "admin"
-password = "password"
-uid = "ABCDEF0123456789"
-idle_disconnect = true
-[cameras.pause]
-  on_client = true # Should pause when no rtsp client
-  timeout = 2.1 # How long to wait after motion stops before pausing
+This happens automatically - no configuration is required. The camera relay connection
+lifecycle is perfectly synchronized with RTSP client connections.
+
+**Example**: When you connect VLC to view a camera stream, Neolink establishes the relay
+connection. When you close VLC, Neolink immediately disconnects from the camera.
+
+You can monitor this behavior in the logs:
 ```
-
-When `idle_disconnect = true` neolink will disconnect from the camera 30s
-after it stops being used.
-
-Neolink considers it as being used if there is an active stream running, or
-if there is motion being detected or an mqtt command being run
-
-[Because google remove the api for the push notifications we cannot
-reliably use push notifications to wake up, so motion won't wake
-up neolink anymore]
+[INFO] Permit acquired, connecting to camera relay
+[INFO] RTSP client connected, establishing camera relay
+[INFO] Camera relay established
+[INFO] Client disconnected, stopping camera relay
+[INFO] All permits dropped, disconnecting from camera relay
+[INFO] Camera relay disconnected
+```
 
 You can make neolink stop active streams when there are no rtsp clients using
 

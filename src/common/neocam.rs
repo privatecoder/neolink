@@ -195,59 +195,12 @@ impl NeoCam {
             }
         });
 
-        // This thread just does a one time report on camera info
-        let report_instance = instance.subscribe().await?;
-        let report_cancel = me.cancel.clone();
-        let report_name = config.name.clone();
-        me.set.spawn(async move {
-            tokio::select! {
-                _ = report_cancel.cancelled() => {
-                    AnyResult::Ok(())
-                }
-                v = async {
-                    let version = report_instance.run_task(|cam| Box::pin(
-                        async move {
-                            Ok(cam.version().await?)
-                        }
-                    )).await?;
-                    log::info!("{}: Model {}", report_name, version.model.unwrap_or("Undeclared".to_string()));
-                    log::info!("{}: Firmware Version {}", report_name, version.firmwareVersion);
-
-                    let stream_info = report_instance.run_task(|cam| Box::pin(
-                        async move {
-                            Ok(cam.get_stream_info().await?)
-                        }
-                    )).await?;
-                    let mut supported_streams = vec![];
-                    for encode in stream_info.stream_infos.iter().flat_map(|stream_info| stream_info.encode_tables.clone()) {
-                        supported_streams.push(std::format!("    {}: {}x{}", encode.name, encode.resolution.width, encode.resolution.height));
-                    }
-
-
-                    Ok(())
-                } => v
-            }
-        });
-
-        // This thread will update the UID by asking the camera.
-        // We cache this in the uid_rx
-        let uid_instance = instance.clone();
-        let uid_cancel = me.cancel.clone();
-        me.set.spawn(async move {
-            tokio::select! {
-                _ = uid_cancel.cancelled() => {
-                    AnyResult::Ok(())
-                },
-                v = async {
-                    let uid = uid_instance.run_task(|cam| Box::pin(async move {
-                        let uid = cam.uid().await?;
-                        Ok(uid)
-                    })).await?;
-                    uid_tx.send_replace(Some(uid));
-                    AnyResult::Ok(())
-                } => v,
-            }
-        });
+        // Camera info reporting removed - was triggering connection at startup
+        // Model/firmware info and UID queries now happen only when camera is already
+        // connected for another reason (RTSP client, MQTT command, etc.)
+        let _report_instance = instance.subscribe().await?;
+        let _uid_instance = instance.clone();
+        let _uid_tx = uid_tx;
 
         // Handles push notifications
         #[cfg(feature = "pushnoti")]
@@ -332,7 +285,7 @@ impl NeoCam {
 
         // This thread manages camera connections based on active permits.
         // Permits are created when RTSP clients connect or when other tasks need the camera.
-        // When all permits are released, camera disconnects after a timeout (if idle_disconnect enabled).
+        // When all permits are released, camera disconnects immediately.
         let connect_instance = instance.subscribe().await?;
         let connect_cancel = me.cancel.clone();
         me.set.spawn(async move {
@@ -341,40 +294,19 @@ impl NeoCam {
                     AnyResult::Ok(())
                 },
                 v = async {
-                    let config_rx = connect_instance.config().await?;
                     let mut permit = connect_instance.permit().await?;
                     permit.deactivate().await?; // Watching only, don't count as active
 
                     loop {
                         // Wait for someone to acquire a permit (RTSP client connects, etc.)
                         permit.aquired_users().await?;
-                        log::debug!("Permit acquired, connecting to camera");
+                        log::info!("Permit acquired, connecting to camera relay");
                         connect_instance.connect().await?;
 
-                        // Wait for all permits to be dropped
+                        // Wait for all permits to be dropped (all clients disconnect)
                         permit.dropped_users().await?;
-                        log::debug!("All permits dropped");
-
-                        // Check if idle_disconnect is enabled
-                        let should_disconnect_on_idle = config_rx.borrow().idle_disconnect;
-
-                        if should_disconnect_on_idle {
-                            // Wait 30s before disconnecting, or reconnect if new permits arrive
-                            tokio::select! {
-                                _ = sleep(Duration::from_secs(30)) => {
-                                    log::debug!("Idle timeout reached, disconnecting from camera");
-                                    connect_instance.disconnect().await?;
-                                }
-                                _ = permit.aquired_users() => {
-                                    log::debug!("New permit acquired during idle timeout, staying connected");
-                                    continue;
-                                }
-                            };
-                        } else {
-                            // idle_disconnect disabled: disconnect immediately when no clients
-                            log::debug!("No active permits, disconnecting from camera");
-                            connect_instance.disconnect().await?;
-                        }
+                        log::info!("All permits dropped, disconnecting from camera relay");
+                        connect_instance.disconnect().await?;
                     }
                 } => {
                     v

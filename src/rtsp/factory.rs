@@ -169,7 +169,7 @@ pub(super) async fn make_factory(
                         clear_bin(&element)?;
                         log::info!("{name}::{stream}: RTSP client connected, establishing camera relay");
 
-                        // Acquire permit - this triggers camera connection via idle_disconnect thread
+                        // Acquire permit - this triggers camera relay connection
                         let _permit = camera.permit().await?;
 
                         // Start the camera relay connection
