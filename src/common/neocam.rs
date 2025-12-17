@@ -5,7 +5,7 @@
 //!    Common restart code
 //!    Clonable interface to share amongst threadsanyhow::anyhow;
 use anyhow::Context;
-use futures::{stream::StreamExt, TryFutureExt};
+use futures::stream::StreamExt;
 use std::sync::Weak;
 use tokio::{
     sync::{
@@ -60,7 +60,8 @@ impl NeoCam {
         let (watch_config_tx, watch_config_rx) = watch(config.clone());
         let (camera_watch_tx, camera_watch_rx) = watch(Weak::new());
         let (md_request_tx, md_request_rx) = mpsc(100);
-        let (state_tx, state_rx) = watch(NeoCamThreadState::Connected);
+        // Start disconnected - camera will connect when first RTSP client arrives (via permit system)
+        let (state_tx, state_rx) = watch(NeoCamThreadState::Disconnected);
         let (uid_tx, uid_rx) = watch(config.camera_uid.clone());
 
         let set = JoinSet::new();
@@ -329,11 +330,9 @@ impl NeoCam {
             }
         });
 
-        // This thread will apply battery saving by disconnecting the camera when there are no
-        // active permits.
-        //
-        // Permits are created when a camera runs a user requested task, or when motion or push
-        // notifications are observed
+        // This thread manages camera connections based on active permits.
+        // Permits are created when RTSP clients connect or when other tasks need the camera.
+        // When all permits are released, camera disconnects after a timeout (if idle_disconnect enabled).
         let connect_instance = instance.subscribe().await?;
         let connect_cancel = me.cancel.clone();
         me.set.spawn(async move {
@@ -342,40 +341,41 @@ impl NeoCam {
                     AnyResult::Ok(())
                 },
                 v = async {
-                    let mut config_rx = connect_instance.config().await?;
-                    loop {
-                        // Wait for the green light
-                        config_rx.wait_for(|config| config.idle_disconnect).await?;
+                    let config_rx = connect_instance.config().await?;
+                    let mut permit = connect_instance.permit().await?;
+                    permit.deactivate().await?; // Watching only, don't count as active
 
-                        let r = tokio::select!{
-                            // Wait for red light
-                            v = config_rx.wait_for(|config| !config.idle_disconnect).map_ok(|_| ()) => {
-                                v?;
-                                connect_instance.connect().await?; // Ensure we are online now that we are not idle_disconnect
-                                AnyResult::Ok(())
-                            }
-                            // Handle disconnects when no active permits
-                            v = async {
-                                let mut permit = connect_instance.permit().await?;
-                                permit.deactivate().await?; // Watching only from here
-                                loop {
-                                    permit.aquired_users().await?;
-                                    connect_instance.connect().await?;
-                                    permit.dropped_users().await?;
-                                    // Wait 30s or if we hit another use then go back and wait again
-                                    tokio::select! {
-                                        _ = sleep(Duration::from_secs(30)) => {},
-                                        _ = permit.aquired_users() => continue,
-                                    };
+                    loop {
+                        // Wait for someone to acquire a permit (RTSP client connects, etc.)
+                        permit.aquired_users().await?;
+                        log::debug!("Permit acquired, connecting to camera");
+                        connect_instance.connect().await?;
+
+                        // Wait for all permits to be dropped
+                        permit.dropped_users().await?;
+                        log::debug!("All permits dropped");
+
+                        // Check if idle_disconnect is enabled
+                        let should_disconnect_on_idle = config_rx.borrow().idle_disconnect;
+
+                        if should_disconnect_on_idle {
+                            // Wait 30s before disconnecting, or reconnect if new permits arrive
+                            tokio::select! {
+                                _ = sleep(Duration::from_secs(30)) => {
+                                    log::debug!("Idle timeout reached, disconnecting from camera");
                                     connect_instance.disconnect().await?;
                                 }
-                            } => v,
-                        };
-                        if r.is_err() {
-                            break r;
+                                _ = permit.aquired_users() => {
+                                    log::debug!("New permit acquired during idle timeout, staying connected");
+                                    continue;
+                                }
+                            };
+                        } else {
+                            // idle_disconnect disabled: disconnect immediately when no clients
+                            log::debug!("No active permits, disconnecting from camera");
+                            connect_instance.disconnect().await?;
                         }
-                    }?;
-                    AnyResult::Ok(())
+                    }
                 } => {
                     v
                 },
