@@ -181,22 +181,30 @@ pub(super) async fn make_factory(
 
                         log::info!("{name}::{stream}: Camera relay established");
 
-                        log::trace!("{name}::{stream}: Learning camera stream type");
+                        log::info!("{name}::{stream}: Learning camera stream type");
                         // Learn the camera data type
                         let mut buffer = vec![];
                         let mut frame_count = 0usize;
 
                         let mut stream_config = StreamConfig::new(&camera, stream).await?;
+                        log::info!("{name}::{stream}: Waiting for media frames from camera");
                         while let Some(media) = media_rx.recv().await {
+                            log::debug!("{name}::{stream}: Received media frame #{}", frame_count);
                             stream_config.update_from_media(&media);
                             buffer.push(media);
                             if frame_count > 10
                                 || (stream_config.vid_type.is_some()
                                     && stream_config.aud_type.is_some())
                             {
+                                log::info!("{name}::{stream}: Stream type learned: video={:?}, audio={:?}",
+                                    stream_config.vid_type, stream_config.aud_type);
                                 break;
                             }
                             frame_count += 1;
+                        }
+
+                        if stream_config.vid_type.is_none() && stream_config.aud_type.is_none() {
+                            log::warn!("{name}::{stream}: No media received from camera, building fallback pipeline");
                         }
 
                         log::trace!("{name}::{stream}: Building the pipeline");

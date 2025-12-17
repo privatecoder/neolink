@@ -123,25 +123,27 @@ impl NeoInstance {
                 ));
             }
 
-            // Send the camera when the pemit is active
+            // Send the camera when the permit is active
             let camera_permit = counter.create_deactivated().await?;
             let thread_camera = self.clone();
+            let thread_name2 = name.clone();
             tokio::spawn(
                 async move {
                     loop {
+                        log::debug!("{thread_name2}: Waiting for stream permit users");
                         if let Err(e) = camera_permit.aquired_users().await {
                             break AnyResult::Err(e);
                         }
-                        log::debug!("Starting stream");
+                        log::info!("{thread_name2}: Stream permit acquired, starting camera stream");
                         tokio::select! {
                             v = camera_permit.dropped_users() => {
-                                log::debug!("Dropped users: {v:?}");
+                                log::debug!("{thread_name2}: Dropped users: {v:?}");
                                 v
                             },
                             v = async {
-                                log::debug!("Getting stream");
+                                log::info!("{thread_name2}: Requesting stream from camera");
                                 let mut stream = thread_camera.stream(stream).await?;
-                                log::debug!("Got stream");
+                                log::info!("{thread_name2}: Got stream from camera, sending media");
                                 while let Some(media) = stream.recv().await {
                                     media_tx.send(media).await?;
                                 }
