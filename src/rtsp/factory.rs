@@ -167,11 +167,13 @@ pub(super) async fn make_factory(
                     let name = name.clone();
                     tokio::task::spawn(async move {
                         clear_bin(&element)?;
-                        log::trace!("{name}::{stream}: Starting camera");
+                        log::info!("{name}::{stream}: RTSP client connected, establishing camera relay");
 
-                        // Start the camera
+                        // Start the camera relay connection
                         let config = camera.config().await?.borrow().clone();
                         let mut media_rx = camera.stream_while_live(stream).await?;
+
+                        log::info!("{name}::{stream}: Camera relay established");
 
                         log::trace!("{name}::{stream}: Learning camera stream type");
                         // Learn the camera data type
@@ -262,7 +264,7 @@ pub(super) async fn make_factory(
                                     if e.to_string().contains("App source is closed")
                                         || e.to_string().contains("App source is not linked")
                                     {
-                                        log::debug!("Client pipeline closed during buffer drain: {e:?}");
+                                        log::info!("{name}::{stream}: Client disconnected during startup, stopping camera relay");
                                         return AnyResult::Ok(()); // Exit gracefully
                                     }
                                     // Unexpected error
@@ -313,7 +315,7 @@ pub(super) async fn make_factory(
                                             if e.to_string().contains("App source is closed")
                                                 || e.to_string().contains("App source is not linked")
                                             {
-                                                log::debug!("Client pipeline closed: {e:?}");
+                                                log::info!("{name}::{stream}: Client disconnected, stopping camera relay");
                                                 break; // Exit gracefully, don't propagate error
                                             }
                                             // Other errors are unexpected and should propagate
@@ -322,17 +324,27 @@ pub(super) async fn make_factory(
                                         }
                                     }
                                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                                        // No frames available right now - reset burst counter and wait
+                                        // No frames available right now - check if client is still connected
+                                        // This ensures we detect disconnections quickly even when no frames are coming
+                                        let vid_alive = vid_src.as_ref().map(|src| check_live(src).is_ok()).unwrap_or(true);
+                                        let aud_alive = aud_src.as_ref().map(|src| check_live(src).is_ok()).unwrap_or(true);
+
+                                        if !vid_alive && !aud_alive {
+                                            log::info!("{name}::{stream}: Client disconnected, stopping camera relay");
+                                            break;
+                                        }
+
                                         burst_counter = 0;
                                         std::thread::sleep(std::time::Duration::from_millis(1));
                                     }
                                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                                         // Channel closed, exit loop
+                                        log::info!("{name}::{stream}: Camera stream ended, stopping relay");
                                         break;
                                     }
                                 }
                             }
-                            log::trace!("All media recieved");
+                            log::info!("{name}::{stream}: Camera relay disconnected");
                             AnyResult::Ok(())
                         });
                         AnyResult::Ok(())
