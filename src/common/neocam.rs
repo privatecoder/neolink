@@ -297,15 +297,18 @@ impl NeoCam {
                     let mut permit = connect_instance.permit().await?;
                     permit.deactivate().await?; // Watching only, don't count as active
 
+                    let config_rx = connect_instance.config().await?;
+                    let name = config_rx.borrow().name.clone();
+
                     loop {
                         // Wait for someone to acquire a permit (RTSP client connects, etc.)
                         permit.aquired_users().await?;
-                        log::info!("Permit acquired, connecting to camera relay");
+                        log::info!("{name}: Permit acquired, connecting to camera relay");
                         connect_instance.connect().await?;
 
                         // Wait for all permits to be dropped (all clients disconnect)
                         permit.dropped_users().await?;
-                        log::info!("All permits dropped, disconnecting from camera relay");
+                        log::info!("{name}: All permits dropped, disconnecting from camera relay");
                         connect_instance.disconnect().await?;
                     }
                 } => {

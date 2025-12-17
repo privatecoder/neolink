@@ -167,10 +167,13 @@ pub(super) async fn make_factory(
                     let name = name.clone();
                     tokio::task::spawn(async move {
                         clear_bin(&element)?;
-                        log::info!("{name}::{stream}: RTSP client connected, establishing camera relay");
+                        log::info!("{name}::{stream}: Factory received new client, setting up pipeline");
 
                         // Acquire permit - this triggers camera relay connection
-                        let _permit = camera.permit().await?;
+                        // IMPORTANT: Must be moved into blocking thread to keep it alive
+                        log::debug!("{name}::{stream}: Acquiring permit to trigger camera connection");
+                        let permit = camera.permit().await?;
+                        log::debug!("{name}::{stream}: Permit acquired successfully");
 
                         // Start the camera relay connection
                         let config = camera.config().await?.borrow().clone();
@@ -246,8 +249,9 @@ pub(super) async fn make_factory(
                         let _ = reply.send(element);
 
                         // Run blocking code on a seperate thread
-                        // This is not an async thread
+                        // Move permit into this thread to keep it alive for the session duration
                         std::thread::spawn(move || {
+                            let _permit = permit; // Hold permit for entire blocking thread lifetime
                             let mut aud_ts = 0u32;
                             let mut vid_ts = 0u32;
                             let mut pools = Default::default();
