@@ -160,22 +160,42 @@ impl RTSPMediaFactoryImpl for NeoMediaFactoryImpl {
     fn create_element(&self, url: &RTSPUrl) -> Option<Element> {
         log::info!("create_element called for URL: {}", url.request_uri());
 
+        // Try parent first in case there's a launch string
         let parent_element = self.parent_create_element(url);
-        if parent_element.is_none() {
-            log::error!("parent_create_element returned None");
-            return None;
+
+        if let Some(orig) = parent_element {
+            // Parent provided an element (from launch string), let callback modify it
+            log::info!("Using parent element from launch string");
+            match self.build_pipeline(orig) {
+                Ok(result) => {
+                    if result.is_none() {
+                        log::warn!("build_pipeline returned None");
+                    }
+                    return result;
+                }
+                Err(e) => {
+                    log::error!("build_pipeline failed: {:?}", e);
+                    return None;
+                }
+            }
         }
 
-        let orig = parent_element.unwrap();
-        match self.build_pipeline(orig) {
+        // No parent element (empty launch string), create from scratch via callback
+        log::info!("No parent element, creating bin from callback");
+
+        // Create an empty bin for the callback to populate
+        let bin = gstreamer::Bin::builder().build();
+        let element = bin.upcast::<Element>();
+
+        match self.build_pipeline(element) {
             Ok(result) => {
                 if result.is_none() {
-                    log::warn!("build_pipeline returned None (likely restarting or error)");
+                    log::warn!("build_pipeline returned None from scratch");
                 }
                 result
             }
             Err(e) => {
-                log::error!("build_pipeline failed: {:?}", e);
+                log::error!("build_pipeline from scratch failed: {:?}", e);
                 None
             }
         }
