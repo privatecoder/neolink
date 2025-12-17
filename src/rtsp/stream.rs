@@ -20,13 +20,20 @@ pub(crate) async fn stream_main(
     let mounts = rtsp
         .mount_points()
         .ok_or(anyhow!("RTSP server lacks mount point"))?;
-    // Create the factory
+
+    // Remove dummy factories from all paths first
+    for path in paths.iter() {
+        log::info!("{}: Removing dummy factory from path: {}", name, path);
+        mounts.remove_factory(path);
+    }
+
+    // Create the real factory with permit-based camera connection
     let (factory, thread) = make_factory(camera, stream).await?;
 
     factory.add_permitted_roles(users);
 
     for path in paths.iter() {
-        log::info!("{}: Mounting factory at path: {}", name, path);
+        log::info!("{}: Mounting real factory at path: {}", name, path);
         mounts.add_factory(path, factory.clone());
     }
     log::info!("{}: Available at {}", name, paths.join(", "));
