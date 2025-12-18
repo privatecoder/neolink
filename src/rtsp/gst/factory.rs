@@ -52,7 +52,7 @@ impl NeoMediaFactory {
         let factory = Self::new();
 
         // Clear the default launch string so create_element uses our callback instead
-        log::info!("new_with_callback: Clearing default launch string");
+        log::debug!("new_with_callback: Clearing default launch string");
         factory.set_launch("");
 
         factory.imp().set_callback(callback).await;
@@ -122,23 +122,23 @@ impl NeoMediaFactoryImpl {
     where
         F: Fn(Element) -> AnyResult<Option<Element>> + Send + Sync + 'static,
     {
-        log::info!("set_callback: Storing callback in factory impl");
+        log::debug!("set_callback: Storing callback in factory impl");
         self.call_back.lock().await.replace(Arc::new(callback));
-        log::info!("set_callback: Callback stored successfully");
+        log::debug!("set_callback: Callback stored successfully");
     }
     fn build_pipeline(&self, media: Element) -> AnyResult<Option<Element>> {
-        log::info!("build_pipeline: START - acquiring callback lock");
+        log::debug!("build_pipeline: Acquiring callback lock");
         let callback_guard = self.call_back.blocking_lock();
         let has_callback = callback_guard.is_some();
-        log::info!("build_pipeline: Lock acquired, callback present: {}", has_callback);
+        log::debug!("build_pipeline: Lock acquired, callback present: {}", has_callback);
 
         match callback_guard.as_ref() {
             Some(call) => {
-                log::info!("build_pipeline: Invoking callback now");
+                log::debug!("build_pipeline: Invoking callback");
                 let new_media = call(media);
                 match new_media {
                     Ok(new_media) => {
-                        log::info!("build_pipeline: Callback succeeded, returned element: {}", new_media.is_some());
+                        log::debug!("build_pipeline: Callback succeeded, returned element: {}", new_media.is_some());
                         Ok(new_media)
                     }
                     Err(e) => {
@@ -158,30 +158,38 @@ impl NeoMediaFactoryImpl {
 impl ObjectImpl for NeoMediaFactoryImpl {}
 impl RTSPMediaFactoryImpl for NeoMediaFactoryImpl {
     fn create_element(&self, url: &RTSPUrl) -> Option<Element> {
-        log::info!("create_element called for URL: {}", url.request_uri());
+        log::debug!("create_element called for URL: {}", url.request_uri());
 
-        // Try parent first in case there's a launch string
-        let parent_element = self.parent_create_element(url);
+        // Check if we have a launch string before calling parent
+        // This avoids the GStreamer CRITICAL warning about empty pipeline
+        let launch_str = self.obj().launch();
+        let has_launch_string = launch_str.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
 
-        if let Some(orig) = parent_element {
-            // Parent provided an element (from launch string), let callback modify it
-            log::info!("Using parent element from launch string");
-            match self.build_pipeline(orig) {
-                Ok(result) => {
-                    if result.is_none() {
-                        log::warn!("build_pipeline returned None");
+        if has_launch_string {
+            // Try parent first when there's a launch string
+            log::debug!("Launch string present, using parent element");
+            let parent_element = self.parent_create_element(url);
+
+            if let Some(orig) = parent_element {
+                // Parent provided an element (from launch string), let callback modify it
+                log::debug!("Using parent element from launch string");
+                match self.build_pipeline(orig) {
+                    Ok(result) => {
+                        if result.is_none() {
+                            log::warn!("build_pipeline returned None");
+                        }
+                        return result;
                     }
-                    return result;
-                }
-                Err(e) => {
-                    log::error!("build_pipeline failed: {:?}", e);
-                    return None;
+                    Err(e) => {
+                        log::error!("build_pipeline failed: {:?}", e);
+                        return None;
+                    }
                 }
             }
         }
 
-        // No parent element (empty launch string), create from scratch via callback
-        log::info!("No parent element, creating bin from callback");
+        // No launch string, create from scratch via callback
+        log::debug!("No launch string, creating bin from callback");
 
         // Create an empty bin for the callback to populate
         let bin = gstreamer::Bin::builder().build();

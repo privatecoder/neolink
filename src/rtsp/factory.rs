@@ -154,11 +154,11 @@ pub(super) async fn make_factory(
     camera: NeoInstance,
     stream: StreamKind,
 ) -> AnyResult<(NeoMediaFactory, JoinHandle<AnyResult<()>>)> {
-    log::error!("========== MAKE_FACTORY CALLED FOR STREAM {:?} ==========", stream);
+    log::debug!("make_factory called for stream {:?}", stream);
 
     let (client_tx, mut client_rx) = mpsc(100);
 
-    log::info!("Creating factory for stream {:?}", stream);
+    log::debug!("Creating factory for stream {:?}", stream);
 
     // Create the task that creates the pipelines
     let thread = tokio::task::spawn(async move {
@@ -169,7 +169,7 @@ pub(super) async fn make_factory(
             log::debug!("{name}::{stream}: Received message in handler");
             match msg {
                 ClientMsg::NewClient { element, reply } => {
-                    log::info!("NewClient message received for {name}::{stream}");
+                    log::debug!("NewClient message received for {name}::{stream}");
                     let camera = camera.clone();
                     let name = name.clone();
                     tokio::task::spawn(async move {
@@ -199,8 +199,11 @@ pub(super) async fn make_factory(
                             log::debug!("{name}::{stream}: Received media frame #{}", frame_count);
                             stream_config.update_from_media(&media);
                             buffer.push(media);
-                            if frame_count > 10
-                                || (stream_config.vid_type.is_some()
+                            // Increased from 10 to 50 frames for better initial buffering
+                            // This reduces stuttering at stream start by ensuring smooth playback from the beginning
+                            if frame_count > 50
+                                || (frame_count > 10
+                                    && stream_config.vid_type.is_some()
                                     && stream_config.aud_type.is_some())
                             {
                                 log::info!("{name}::{stream}: Stream type learned: video={:?}, audio={:?}",
@@ -263,9 +266,10 @@ pub(super) async fn make_factory(
                         // Send the pipeline back to the factory so it can start
                         let _ = reply.send(element);
 
-                        // Run blocking code on a seperate thread
+                        // Run blocking code in tokio's blocking thread pool
+                        // This maintains the tokio runtime context needed for permit drop
                         // Move permit into this thread to keep it alive for the session duration
-                        std::thread::spawn(move || {
+                        tokio::task::spawn_blocking(move || {
                             let _permit = permit; // Hold permit for entire blocking thread lifetime
                             let mut aud_ts = 0u32;
                             let mut vid_ts = 0u32;
@@ -377,11 +381,10 @@ pub(super) async fn make_factory(
         AnyResult::Ok(())
     });
 
-    log::info!("Setting up factory with custom callback");
+    log::debug!("Setting up factory with custom callback");
 
     // Now setup the factory
     let factory = NeoMediaFactory::new_with_callback(move |element| {
-        log::info!("=== FACTORY CALLBACK INVOKED ===");
         log::debug!("Factory callback invoked for new client");
         let (reply, new_element) = tokio::sync::oneshot::channel();
 
@@ -395,7 +398,7 @@ pub(super) async fn make_factory(
         log::debug!("Waiting for pipeline element response...");
         match new_element.blocking_recv() {
             Ok(element) => {
-                log::info!("Factory callback received pipeline element successfully");
+                log::debug!("Factory callback received pipeline element successfully");
                 Ok(Some(element))
             }
             Err(e) => {
@@ -406,7 +409,7 @@ pub(super) async fn make_factory(
     })
     .await?;
 
-    log::info!("Factory created successfully with callback registered");
+    log::debug!("Factory created successfully with callback registered");
     Ok((factory, thread))
 }
 
@@ -694,13 +697,22 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
 
-    source.set_is_live(false);
+    source.set_is_live(false);  // Mark as live stream for proper real-time handling
     source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
+    // Set minimum latency in nanoseconds based on actual FPS
+    // e.g., 15 FPS: 1 second / 15 = 66.7ms = 66,666,666 nanoseconds
+    // e.g., 25 FPS: 1 second / 25 = 40ms = 40,000,000 nanoseconds
+    source.set_min_latency(1_000_000_000 / (stream_config.fps as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
+    source.set_do_timestamp(true);  // Enable timestamping for smooth playback
     source.set_stream_type(AppStreamType::Stream);
+
+    // Set caps so RTSP server can build SDP before data flows
+    let caps = Caps::builder("video/x-h264")
+        .field("stream-format", "byte-stream")
+        .build();
+    source.set_caps(Some(&caps));
 
     let source = source
         .dynamic_cast::<Element>()
@@ -752,13 +764,22 @@ fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     let source = make_element("appsrc", "vidsrc")?
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
-    source.set_is_live(false);
+    source.set_is_live(false);  // Mark as live stream for proper real-time handling
     source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
+    // Set minimum latency in nanoseconds based on actual FPS
+    // e.g., 15 FPS: 1 second / 15 = 66.7ms = 66,666,666 nanoseconds
+    // e.g., 25 FPS: 1 second / 25 = 40ms = 40,000,000 nanoseconds
+    source.set_min_latency(1_000_000_000 / (stream_config.fps as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
+    source.set_do_timestamp(true);  // Enable timestamping for smooth playback
     source.set_stream_type(AppStreamType::Stream);
+
+    // Set caps so RTSP server can build SDP before data flows
+    let caps = Caps::builder("video/x-h265")
+        .field("stream-format", "byte-stream")
+        .build();
+    source.set_caps(Some(&caps));
 
     let source = source
         .dynamic_cast::<Element>()
@@ -812,13 +833,22 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
 
-    source.set_is_live(false);
+    source.set_is_live(false);  // Mark as live stream for proper real-time handling
     source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
+    // Set minimum latency in nanoseconds based on actual FPS
+    // e.g., 15 FPS: 1 second / 15 = 66.7ms = 66,666,666 nanoseconds
+    // e.g., 25 FPS: 1 second / 25 = 40ms = 40,000,000 nanoseconds
+    source.set_min_latency(1_000_000_000 / (stream_config.fps as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
+    source.set_do_timestamp(true);  // Enable timestamping for smooth playback
     source.set_stream_type(AppStreamType::Stream);
+
+    // Set caps so RTSP server can build SDP before data flows
+    let caps = Caps::builder("audio/mpeg")
+        .field("mpegversion", 4i32)
+        .build();
+    source.set_caps(Some(&caps));
 
     let source = source
         .dynamic_cast::<Element>()
@@ -898,12 +928,15 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
     let source = make_element("appsrc", "audsrc")?
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
-    source.set_is_live(false);
+    source.set_is_live(false);  // Mark as live stream for proper real-time handling
     source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
+    // Set minimum latency in nanoseconds based on actual FPS
+    // e.g., 15 FPS: 1 second / 15 = 66.7ms = 66,666,666 nanoseconds
+    // e.g., 25 FPS: 1 second / 25 = 40ms = 40,000,000 nanoseconds
+    source.set_min_latency(1_000_000_000 / (stream_config.fps as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
+    source.set_do_timestamp(true);  // Enable timestamping for smooth playback
     source.set_stream_type(AppStreamType::Stream);
 
     source.set_caps(Some(
@@ -1146,8 +1179,8 @@ fn make_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
 }
 
 fn buffer_size(bitrate: u32) -> u32 {
-    // Increased from 2 to 10 to handle keyframe bursts
-    // This gives ~1 second of buffering instead of 0.25 seconds
-    // Prevents dropped frames during high-motion scenes with large keyframes
-    std::cmp::max(bitrate * 10 / 8u32, 4u32 * 1024u32)
+    // Increased to 30 (from 10) for 3-4 seconds of buffering
+    // This prevents stuttering when camera output is bursty or network is jittery
+    // Larger buffer = smoother playback at cost of slightly higher latency
+    std::cmp::max(bitrate * 30 / 8u32, 16u32 * 1024u32)
 }

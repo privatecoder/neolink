@@ -28,3 +28,6 @@ token.toml
 
 # Debug FCM build
 crates/fcm-push-listener
+
+neolink.toml
+.claude/

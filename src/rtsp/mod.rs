@@ -58,13 +58,7 @@ use log::*;
 use neolink_core::bc_protocol::StreamKind;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::{
-    sync::watch::channel as watch,
-    task::JoinSet,
-    time::{interval, Duration},
-};
-use tokio_stream::wrappers::IntervalStream;
-use tokio_stream::StreamExt;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 mod cmdline;
@@ -253,42 +247,10 @@ async fn apply_users(rtsp: &NeoRtspServer, curr_users: &HashSet<UserConfig>) -> 
 async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
     let name = camera.config().await?.borrow().name.clone();
     log::debug!("{name}: Camera Main");
-    let later_camera = camera.clone();
-    let (supported_streams_tx, supported_streams) = watch(HashSet::<StreamKind>::new());
 
-    let mut set = JoinSet::new();
-    set.spawn(async move {
-        let mut i = IntervalStream::new(interval(Duration::from_secs(15)));
-        while i.next().await.is_some() {
-            let stream_info = later_camera
-                .run_passive_task(|cam| Box::pin(async move { Ok(cam.get_stream_info().await?) }))
-                .await?;
-
-            let new_supported_streams = stream_info
-                .stream_infos
-                .iter()
-                .flat_map(|stream_info| stream_info.encode_tables.clone())
-                .flat_map(|encode| match encode.name.as_str() {
-                    "mainStream" => Some(StreamKind::Main),
-                    "subStream" => Some(StreamKind::Sub),
-                    "externStream" => Some(StreamKind::Extern),
-                    new_stream_name => {
-                        log::debug!("New stream name {}", new_stream_name);
-                        None
-                    }
-                })
-                .collect::<HashSet<_>>();
-            supported_streams_tx.send_if_modified(|old| {
-                if *old != new_supported_streams {
-                    *old = new_supported_streams;
-                    true
-                } else {
-                    false
-                }
-            });
-        }
-        AnyResult::Ok(())
-    });
+    // Stream info polling removed - no longer needed since we trust the config
+    // If a configured stream isn't actually supported by the camera, it will fail
+    // when a client tries to connect, which is acceptable behavior
 
     let mut camera_config = camera.config().await?.clone();
     loop {
@@ -331,9 +293,6 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                 // Create the dummy factory
                 let dummy_factory = make_dummy_factory(use_splash, splash_pattern).await?;
                 dummy_factory.add_permitted_roles(&permitted_users);
-                let mut supported_streams_1 = supported_streams.clone();
-                let mut supported_streams_2 = supported_streams.clone();
-                let mut supported_streams_3 = supported_streams.clone();
                 tokio::select! {
                     v = async {
                         let name = camera.config().await?.borrow().name.clone();
@@ -362,7 +321,7 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                         }
                         log::debug!("{}: Preparing at {}", name, paths.join(", "));
 
-                        supported_streams_1.wait_for(|ss| ss.contains(&StreamKind::Main)).await?;
+                        // No longer wait for camera to confirm - trust the config
                         stream_main(camera.clone(), StreamKind::Main, rtsp, &permitted_users, &paths).await
                     }, if active_streams.contains(&StreamKind::Main) => v,
                     v = async {
@@ -396,8 +355,7 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                         }
                         log::debug!("{}: Preparing at {}", name, paths.join(", "));
 
-                        supported_streams_2.wait_for(|ss| ss.contains(&StreamKind::Sub)).await?;
-
+                        // No longer wait for camera to confirm - trust the config
                         stream_main(camera.clone(), StreamKind::Sub, rtsp, &permitted_users, &paths).await
                     }, if active_streams.contains(&StreamKind::Sub) => v,
                     v = async {
@@ -430,7 +388,7 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                         }
                         log::debug!("{}: Preparing at {}", name, paths.join(", "));
 
-                        supported_streams_3.wait_for(|ss| ss.contains(&StreamKind::Extern)).await?;
+                        // No longer wait for camera to confirm - trust the config
                         stream_main(camera.clone(), StreamKind::Extern, rtsp, &permitted_users, &paths).await
                     }, if active_streams.contains(&StreamKind::Extern) => v,
                     else => {

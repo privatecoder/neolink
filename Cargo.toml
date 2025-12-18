@@ -1,7 +1,7 @@
 [package]
 name = "neolink"
 description = "A standards-compliant bridge to Reolink IP cameras"
-version = "0.6.4-beta.9"
+version = "0.6.4-beta.11"
 authors = []
 edition = "2018"
 license = "AGPL-3.0-or-later"
