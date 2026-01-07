@@ -7,12 +7,18 @@ use gstreamer_app::{AppSrc, AppSrcCallbacks, AppStreamType};
 use neolink_core::{
     bc_protocol::StreamKind,
     bcmedia::model::{
-        BcMedia, BcMediaIframe, BcMediaInfoV1, BcMediaInfoV2, BcMediaPframe, VideoType,
+        AacDurationInfo, BcMedia, BcMediaIframe, BcMediaInfoV1, BcMediaInfoV2, BcMediaPframe,
+        VideoType,
     },
 };
-use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle};
+use std::sync::mpsc as std_mpsc;
+use tokio::sync::mpsc as tokio_mpsc;
+use tokio::task::JoinHandle;
 
 use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{RecvTimeoutError, TrySendError};
 
 #[derive(Clone, Debug)]
 pub enum AudioType {
@@ -150,13 +156,18 @@ enum ClientMsg {
     },
 }
 
+struct TimedMedia {
+    recv_at: std::time::Instant,
+    media: BcMedia,
+}
+
 pub(super) async fn make_factory(
     camera: NeoInstance,
     stream: StreamKind,
 ) -> AnyResult<(NeoMediaFactory, JoinHandle<AnyResult<()>>)> {
     log::debug!("make_factory called for stream {:?}", stream);
 
-    let (client_tx, mut client_rx) = mpsc(100);
+    let (client_tx, mut client_rx) = tokio_mpsc::channel(100);
 
     log::debug!("Creating factory for stream {:?}", stream);
 
@@ -201,7 +212,7 @@ pub(super) async fn make_factory(
                             buffer.push(media);
                             // Increased from 10 to 50 frames for better initial buffering
                             // This reduces stuttering at stream start by ensuring smooth playback from the beginning
-                            if frame_count > 50
+                            if frame_count > 15
                                 || (frame_count > 10
                                     && stream_config.vid_type.is_some()
                                     && stream_config.aud_type.is_some())
@@ -263,19 +274,111 @@ pub(super) async fn make_factory(
                         }
 
                         log::trace!("{name}::{stream}: Sending pipeline to gstreamer");
-                        // Send the pipeline back to the factory so it can start
+                        // Send the pipeline back to the fac
+                        // tory so it can start
                         let _ = reply.send(element);
+
+
+                        // ---- Clean fix: keep tokio receiver async; forward into bounded std channel ----
+                        let (std_tx, std_rx): (
+                            std_mpsc::SyncSender<TimedMedia>,
+                            std_mpsc::Receiver<TimedMedia>,
+                        ) = std_mpsc::sync_channel(200);
+
+                        let in_audio = std::sync::Arc::new(AtomicU64::new(0));
+                        let in_video = std::sync::Arc::new(AtomicU64::new(0));
+                        let in_other = std::sync::Arc::new(AtomicU64::new(0));
+                        let drop_audio = std::sync::Arc::new(AtomicU64::new(0));
+                        let drop_video = std::sync::Arc::new(AtomicU64::new(0));
+                        let drop_other = std::sync::Arc::new(AtomicU64::new(0));
+
+                        let in_audio_fwd = in_audio.clone();
+                        let in_video_fwd = in_video.clone();
+                        let in_other_fwd = in_other.clone();
+                        let drop_audio_fwd = drop_audio.clone();
+                        let drop_video_fwd = drop_video.clone();
+                        let drop_other_fwd = drop_other.clone();
+
+                        // Forwarder task: runs on tokio, owns media_rx
+                        tokio::spawn(async move {
+                            while let Some(m) = media_rx.recv().await {
+                                let kind = match &m {
+                                    BcMedia::Aac(_) | BcMedia::Adpcm(_) => 0,
+                                    BcMedia::Iframe(_) | BcMedia::Pframe(_) => 1,
+                                    _ => 2,
+                                };
+                                match kind {
+                                    0 => in_audio_fwd.fetch_add(1, Ordering::Relaxed),
+                                    1 => in_video_fwd.fetch_add(1, Ordering::Relaxed),
+                                    _ => in_other_fwd.fetch_add(1, Ordering::Relaxed),
+                                };
+
+                                let timed = TimedMedia {
+                                    recv_at: std::time::Instant::now(),
+                                    media: m,
+                                };
+                                match std_tx.try_send(timed) {
+                                    Ok(()) => {}
+                                    Err(TrySendError::Full(_)) => {
+                                        match kind {
+                                            0 => drop_audio_fwd.fetch_add(1, Ordering::Relaxed),
+                                            1 => drop_video_fwd.fetch_add(1, Ordering::Relaxed),
+                                            _ => drop_other_fwd.fetch_add(1, Ordering::Relaxed),
+                                        };
+                                    }
+                                    Err(TrySendError::Disconnected(_)) => break,
+                                }
+                            }
+                            // Dropping std_tx will cause std_rx.recv_timeout to return Disconnected
+                        });
 
                         // Run blocking code in tokio's blocking thread pool
                         // This maintains the tokio runtime context needed for permit drop
                         // Move permit into this thread to keep it alive for the session duration
                         tokio::task::spawn_blocking(move || {
-                            let _permit = permit; // Hold permit for entire blocking thread lifetime
-                            let mut aud_ts = 0u32;
-                            let mut vid_ts = 0u32;
-                            let mut pools = Default::default();
+                            use std::time::{Duration, Instant};
 
-                            log::trace!("{name}::{stream}: Sending buffered frames");
+                            let start = Instant::now();
+                            let _permit = permit; // hold for lifetime
+
+                            // Wait for the RTSP server to link the pads (client reaches PLAY).
+                            let link_deadline = Instant::now() + Duration::from_secs(2);
+                            loop {
+                                let vid_linked = vid_src.as_ref().map(|s| is_linked(s)).unwrap_or(true);
+                                let aud_linked = aud_src.as_ref().map(|s| is_linked(s)).unwrap_or(true);
+
+                                if vid_linked && aud_linked {
+                                    break;
+                                }
+                                if Instant::now() >= link_deadline {
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+
+                            let mut aud_ts: u64 = 0;
+                            let mut vid_ts: u64 = 0;
+
+                            let mut vid_pacer = Some(PacerState::new(start, Duration::ZERO));
+                            let mut aud_pacer = Some(PacerState::new(start, Duration::ZERO));
+
+                            let mut pools: HashMap<usize, gstreamer::BufferPool> = Default::default();
+                            let mut stats = StreamStats::new(Instant::now());
+
+                            let frame_step_us: u64 = {
+                                let fps = stream_config.fps.max(1) as u64;
+                                1_000_000u64 / fps
+                            };
+
+                            let mut drop_until_keyframe: bool = false;
+                            let lag_enter_threshold = Duration::from_millis(500);
+                            let lag_exit_threshold  = Duration::from_millis(150);
+                            let mut client_active = false;
+                            let mut last_linked = Instant::now();
+                            let client_active_deadline = Instant::now() + Duration::from_secs(10);
+                            let disconnect_grace = Duration::from_secs(2);
+
+                            // Send buffered frames (no pacing)
                             for buffered in buffer.drain(..) {
                                 if let Err(e) = send_to_sources(
                                     buffered,
@@ -285,91 +388,209 @@ pub(super) async fn make_factory(
                                     &mut vid_ts,
                                     &mut aud_ts,
                                     &stream_config,
+                                    false,
+                                    &mut vid_pacer,
+                                    &mut aud_pacer,
+                                    &mut stats,
+                                    None,
                                 ) {
-                                    // AppSrc closed during buffered frame send means client disconnected
-                                    if e.to_string().contains("App source is closed")
-                                        || e.to_string().contains("App source is not linked")
-                                    {
-                                        log::info!("{name}::{stream}: Client disconnected during startup, stopping camera relay");
-                                        return AnyResult::Ok(()); // Exit gracefully
+                                    if e.to_string().contains("App source is closed") {
+                                        log::info!("{name}::{stream}: Client disconnected, stopping camera relay");
+                                        return AnyResult::Ok(());
                                     }
-                                    // Unexpected error
                                     return Err(e);
                                 }
                             }
 
-                            log::trace!("{name}::{stream}: Sending new frames");
-                            let mut burst_counter = 0u32;
+                            // Live loop: recv_timeout so heartbeat + disconnect checks keep running
                             loop {
-                                // Use try_recv to drain channel without blocking
-                                // This prevents blocking when channel is full and allows frame dropping
-                                match media_rx.try_recv() {
-                                    Ok(data) => {
-                                        burst_counter += 1;
+                                let vid_closed = vid_src.as_ref().map(|src| is_closed(src)).unwrap_or(true);
+                                let aud_closed = aud_src.as_ref().map(|src| is_closed(src)).unwrap_or(true);
+                                let vid_linked = vid_src.as_ref().map(|s| is_linked(s)).unwrap_or(false);
+                                let aud_linked = aud_src.as_ref().map(|s| is_linked(s)).unwrap_or(false);
 
-                                        // Detect backpressure: if we're receiving frames rapidly without blocking,
-                                        // the channel is likely backed up
-                                        let in_backpressure = burst_counter > 50;
+                                if vid_linked || aud_linked {
+                                    client_active = true;
+                                    last_linked = Instant::now();
+                                }
 
-                                        // Drop P-frames during backpressure to keep channel draining
-                                        let should_drop = in_backpressure
-                                            && matches!(
-                                                data,
-                                                neolink_core::bcmedia::model::BcMedia::Pframe(_)
-                                            );
-
-                                        if should_drop {
-                                            log::debug!(
-                                                "Dropping P-frame due to channel backpressure (burst: {})",
-                                                burst_counter
-                                            );
-                                            continue;
-                                        }
-
-                                        let r = send_to_sources(
-                                            data,
-                                            &mut pools,
-                                            &vid_src,
-                                            &aud_src,
-                                            &mut vid_ts,
-                                            &mut aud_ts,
-                                            &stream_config,
-                                        );
-                                        if let Err(e) = r {
-                                            // AppSrc closed means client disconnected or pipeline torn down
-                                            // This is expected during reconnection or client disconnect
-                                            if e.to_string().contains("App source is closed")
-                                                || e.to_string().contains("App source is not linked")
-                                            {
-                                                log::info!("{name}::{stream}: Client disconnected, stopping camera relay");
-                                                break; // Exit gracefully, don't propagate error
-                                            }
-                                            // Other errors are unexpected and should propagate
-                                            log::warn!("Failed to send to source: {e:?}");
-                                            return Err(e);
-                                        }
+                                if client_active {
+                                    if vid_closed && aud_closed {
+                                        log::info!("{name}::{stream}: Client disconnected, stopping camera relay");
+                                        break;
                                     }
-                                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                                        // No frames available right now - check if client is still connected
-                                        // This ensures we detect disconnections quickly even when no frames are coming
-                                        let vid_alive = vid_src.as_ref().map(|src| check_live(src).is_ok()).unwrap_or(true);
-                                        let aud_alive = aud_src.as_ref().map(|src| check_live(src).is_ok()).unwrap_or(true);
-
-                                        if !vid_alive && !aud_alive {
-                                            log::info!("{name}::{stream}: Client disconnected, stopping camera relay");
-                                            break;
-                                        }
-
-                                        burst_counter = 0;
-                                        std::thread::sleep(std::time::Duration::from_millis(1));
+                                    if !(vid_linked || aud_linked)
+                                        && Instant::now().duration_since(last_linked) >= disconnect_grace
+                                    {
+                                        log::info!("{name}::{stream}: Client disconnected, stopping camera relay");
+                                        break;
                                     }
-                                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                                        // Channel closed, exit loop
+                                } else if Instant::now() >= client_active_deadline {
+                                    log::info!("{name}::{stream}: Client never reached PLAY, stopping camera relay");
+                                    break;
+                                }
+
+                                // once-per-second heartbeat
+                                let now = Instant::now();
+                                if now.duration_since(stats.last_report) >= Duration::from_secs(1) {
+                                    let elapsed = start.elapsed();
+
+                                    let vid_level = vid_src.as_ref().map(|s| s.current_level_bytes()).unwrap_or(0);
+                                    let vid_max   = vid_src.as_ref().map(|s| s.max_bytes()).unwrap_or(0);
+                                    let aud_level = aud_src.as_ref().map(|s| s.current_level_bytes()).unwrap_or(0);
+                                    let aud_max   = aud_src.as_ref().map(|s| s.max_bytes()).unwrap_or(0);
+
+                                    let since_last_media = now.duration_since(stats.last_media_instant);
+                                    let av_drift_ms = (vid_ts as i64 - aud_ts as i64) / 1000;
+                                    let aud_snap = stats.aud_stats_snapshot();
+                                    let report_interval = now.duration_since(stats.last_report);
+                                    let report_interval_us =
+                                        report_interval.as_micros().max(1) as u64;
+                                    let aud_total_ms = aud_snap.total_us / 1000;
+                                    let aud_ratio_pct =
+                                        aud_snap.total_us.saturating_mul(100) / report_interval_us;
+                                    let in_audio = in_audio.swap(0, Ordering::Relaxed);
+                                    let in_video = in_video.swap(0, Ordering::Relaxed);
+                                    let in_other = in_other.swap(0, Ordering::Relaxed);
+                                    let drop_audio = drop_audio.swap(0, Ordering::Relaxed);
+                                    let drop_video = drop_video.swap(0, Ordering::Relaxed);
+                                    let drop_other = drop_other.swap(0, Ordering::Relaxed);
+
+                                    log::info!(
+                                        "{name}::{stream}: HB elapsed={:?} vid_ts={:?} aud_ts={:?} \
+                                        vid_buf={}/{} aud_buf={}/{} last_media={:?} \
+                                        vid_push={} aud_push={} dropP_pressure={} dropP_backpressure={} \
+                                        fps={} frame_us={} av_drift_ms={} \
+                                        aud_avg_us={} aud_min_us={} aud_max_us={} aud_last_us={} aud_rate={} \
+                                        aud_adts_frames={} aud_raw_blocks={} aud_profile={} aud_samp_idx={} aud_ch={} \
+                                        aud_frame_len={} aud_hdr_len={} aud_payload={} aud_parsed={} aud_bytes={} \
+                                        aud_pkt={} aud_total_ms={} aud_ratio_pct={} \
+                                        aud_gap_avg_us={} aud_gap_min_us={} aud_gap_max_us={} \
+                                        in_audio={} in_video={} in_other={} drop_audio={} drop_video={} drop_other={}",
+                                        elapsed,
+                                        Duration::from_micros(vid_ts),
+                                        Duration::from_micros(aud_ts),
+                                        vid_level, vid_max,
+                                        aud_level, aud_max,
+                                        since_last_media,
+                                        stats.vid_pushed, stats.aud_pushed,
+                                        stats.p_dropped_pressure, stats.p_dropped_backpressure,
+                                        stream_config.fps,
+                                        frame_step_us,
+                                        av_drift_ms,
+                                        aud_snap.avg_us,
+                                        aud_snap.min_us,
+                                        aud_snap.max_us,
+                                        stats.aud_last_us,
+                                        stats.aud_last_rate,
+                                        stats.aud_last_adts_frames,
+                                        stats.aud_last_raw_blocks,
+                                        stats.aud_last_profile,
+                                        stats.aud_last_sampling_index,
+                                        stats.aud_last_channel_config,
+                                        stats.aud_last_frame_len,
+                                        stats.aud_last_header_len,
+                                        stats.aud_last_payload_len,
+                                        stats.aud_last_parsed_len,
+                                        stats.aud_last_bytes,
+                                        aud_snap.packets,
+                                        aud_total_ms,
+                                        aud_ratio_pct,
+                                        aud_snap.gap_avg_us,
+                                        aud_snap.gap_min_us,
+                                        aud_snap.gap_max_us,
+                                        in_audio,
+                                        in_video,
+                                        in_other,
+                                        drop_audio,
+                                        drop_video,
+                                        drop_other,
+                                    );
+
+                                    stats.last_report = now;
+                                    stats.reset_aud_stats();
+                                }
+
+                                // Receive next frame (or timeout to keep loop responsive)
+                                let timed = match std_rx.recv_timeout(Duration::from_millis(200)) {
+                                    Ok(d) => d,
+                                    Err(RecvTimeoutError::Timeout) => {
+                                        // no frame right now; loop continues (heartbeat/disconnect still works)
+                                        continue;
+                                    }
+                                    Err(RecvTimeoutError::Disconnected) => {
                                         log::info!("{name}::{stream}: Camera stream ended, stopping relay");
                                         break;
                                     }
+                                };
+
+                                stats.tryrecv_ok += 1;
+                                stats.last_media_instant = Instant::now();
+
+                                // ---- Backpressure + lag handling ----
+                                let vid_fill = vid_src
+                                    .as_ref()
+                                    .map(|s| s.current_level_bytes() as f32 / s.max_bytes().max(1) as f32)
+                                    .unwrap_or(0.0);
+
+                                let in_backpressure = vid_fill > 0.85;
+
+                                let elapsed = start.elapsed();
+                                let vid_ts_dur = Duration::from_micros(vid_ts);
+                                let lag = elapsed.checked_sub(vid_ts_dur).unwrap_or(Duration::ZERO);
+
+                                if in_backpressure && lag >= lag_enter_threshold && !drop_until_keyframe {
+                                    log::warn!("{name}::{stream}: CATCHUP enter (lag={:?}), drop until keyframe", lag);
+                                    drop_until_keyframe = true;
+                                }
+
+                                if drop_until_keyframe && lag <= lag_exit_threshold && !in_backpressure {
+                                    log::warn!("{name}::{stream}: CATCHUP exit (lag={:?})", lag);
+                                    drop_until_keyframe = false;
+                                }
+
+                                if drop_until_keyframe
+                                    && is_video(&timed.media)
+                                    && !is_video_keyframe(&timed.media)
+                                {
+                                    vid_ts = stats.video_ts_from_recv(timed.recv_at, vid_ts);
+                                    stats.p_dropped_backpressure += 1;
+                                    continue;
+                                }
+
+                                let should_drop_p =
+                                    in_backpressure && matches!(timed.media, BcMedia::Pframe(_));
+                                if should_drop_p {
+                                    stats.p_dropped_backpressure += 1;
+                                    vid_ts = stats.video_ts_from_recv(timed.recv_at, vid_ts);
+                                    continue;
+                                }
+
+                                if let Err(e) = send_to_sources(
+                                    timed.media,
+                                    &mut pools,
+                                    &vid_src,
+                                    &aud_src,
+                                    &mut vid_ts,
+                                    &mut aud_ts,
+                                    &stream_config,
+                                    true,
+                                    &mut vid_pacer,
+                                    &mut aud_pacer,
+                                    &mut stats,
+                                    Some(timed.recv_at),
+                                ) {
+                                    if e.to_string().contains("App source is closed")
+                                        || e.to_string().contains("App source is not linked")
+                                    {
+                                        log::info!("{name}::{stream}: Client disconnected, stopping camera relay");
+                                        break;
+                                    }
+                                    log::warn!("Failed to send to source: {e:?}");
+                                    return Err(e);
                                 }
                             }
+
                             log::info!("{name}::{stream}: Camera relay disconnected");
                             AnyResult::Ok(())
                         });
@@ -413,52 +634,106 @@ pub(super) async fn make_factory(
     Ok((factory, thread))
 }
 
+fn is_video_keyframe(m: &BcMedia) -> bool {
+    matches!(m, BcMedia::Iframe(_))
+}
+
+fn is_video(m: &BcMedia) -> bool {
+    matches!(m, BcMedia::Iframe(_) | BcMedia::Pframe(_))
+}
+
 fn send_to_sources(
     data: BcMedia,
     pools: &mut HashMap<usize, gstreamer::BufferPool>,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
-    vid_ts: &mut u32,
-    aud_ts: &mut u32,
+    vid_ts: &mut u64,
+    aud_ts: &mut u64,
     stream_config: &StreamConfig,
+    pace: bool,
+    vid_pacer: &mut Option<PacerState>,
+    aud_pacer: &mut Option<PacerState>,
+    stats: &mut StreamStats,
+    recv_at: Option<std::time::Instant>,
 ) -> AnyResult<()> {
     // Update TS
     match data {
         BcMedia::Aac(aac) => {
-            let duration = aac.duration().expect("Could not calculate AAC duration");
+            let info = aac
+                .duration_info()
+                .expect("Could not calculate AAC duration");
+            let aac_len = aac.data.len();
+            if let Some(recv_at) = recv_at {
+                stats.record_aac_gap(recv_at);
+            }
+            let ts_us = recv_at
+                .map(|t| stats.audio_ts_from_recv(t, *aud_ts))
+                .unwrap_or(*aud_ts);
+            let dur = Duration::from_micros(info.duration_us as u64);
             if let Some(aud_src) = aud_src.as_ref() {
-                log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts as u64));
+                log::debug!("Sending AAC: {:?}", Duration::from_micros(ts_us));
                 send_to_appsrc(
                     aud_src,
                     aac.data,
-                    Duration::from_micros(*aud_ts as u64),
+                    Duration::from_micros(ts_us),
+                    Some(dur),
                     pools,
+                    pace,
+                    aud_pacer,
                 )?;
+                stats.aud_pushed += 1;
             }
-            *aud_ts += duration;
+            stats.record_aac(&info, aac_len);
+            *aud_ts = ts_us + info.duration_us as u64;
         }
         BcMedia::Adpcm(adpcm) => {
             let duration = adpcm
                 .duration()
                 .expect("Could not calculate ADPCM duration");
+            let dur = Duration::from_micros(duration as u64);
             if let Some(aud_src) = aud_src.as_ref() {
-                log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts as u64));
+                let ts_us = recv_at
+                    .map(|t| stats.audio_ts_from_recv(t, *aud_ts))
+                    .unwrap_or(*aud_ts);
+                log::trace!("Sending ADPCM: {:?}", Duration::from_micros(ts_us));
                 send_to_appsrc(
                     aud_src,
                     adpcm.data,
-                    Duration::from_micros(*aud_ts as u64),
+                    Duration::from_micros(ts_us),
+                    Some(dur),
                     pools,
+                    pace,
+                    aud_pacer,
                 )?;
+                stats.aud_pushed += 1;
+                *aud_ts = ts_us + duration as u64;
+                return Ok(());
             }
-            *aud_ts += duration;
         }
         BcMedia::Iframe(BcMediaIframe { data, .. }) => {
             if let Some(vid_src) = vid_src.as_ref() {
-                log::trace!("Sending I-frame: {:?}", Duration::from_micros(*vid_ts as u64));
-                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64), pools)?;
+                if let Some(recv_at) = recv_at {
+                    stats.record_video_gap(recv_at);
+                }
+                let ts_us = recv_at
+                    .map(|t| stats.video_ts_from_recv(t, *vid_ts))
+                    .unwrap_or(*vid_ts);
+                let frame_dur =
+                    Duration::from_micros(1_000_000u64 / stream_config.fps.max(1) as u64);
+                log::trace!("Sending I-frame: {:?}", Duration::from_micros(ts_us));
+                send_to_appsrc(
+                    vid_src,
+                    data,
+                    Duration::from_micros(ts_us),
+                    Some(frame_dur),
+                    pools,
+                    pace,
+                    vid_pacer,
+                )?;
+                stats.vid_pushed += 1;
+                *vid_ts = ts_us;
+                return Ok(());
             }
-            const MICROSECONDS: u32 = 1000000;
-            *vid_ts += MICROSECONDS / stream_config.fps;
         }
         BcMedia::Pframe(BcMediaPframe { data, .. }) => {
             if let Some(vid_src) = vid_src.as_ref() {
@@ -466,8 +741,17 @@ fn send_to_sources(
                 // to prioritize I-frames (keyframes) which can restart the stream
                 let level = vid_src.current_level_bytes();
                 let max = vid_src.max_bytes();
+                if let Some(recv_at) = recv_at {
+                    stats.record_video_gap(recv_at);
+                }
+                let ts_us = recv_at
+                    .map(|t| stats.video_ts_from_recv(t, *vid_ts))
+                    .unwrap_or(*vid_ts);
+                let frame_dur =
+                    Duration::from_micros(1_000_000u64 / stream_config.fps.max(1) as u64);
 
-                if level >= max * 80 / 100 {
+                if max > 0 && level >= max * 80 / 100 {
+                    stats.p_dropped_pressure += 1;
                     log::trace!(
                         "Dropping P-frame due to buffer pressure ({}/{} bytes, {}%)",
                         level,
@@ -475,12 +759,21 @@ fn send_to_sources(
                         level * 100 / max
                     );
                 } else {
-                    log::trace!("Sending P-frame: {:?}", Duration::from_micros(*vid_ts as u64));
-                    send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64), pools)?;
+                    log::trace!("Sending P-frame: {:?}", Duration::from_micros(ts_us));
+                    send_to_appsrc(
+                        vid_src,
+                        data,
+                        Duration::from_micros(ts_us),
+                        Some(frame_dur),
+                        pools,
+                        pace,
+                        vid_pacer,
+                    )?;
+                    stats.vid_pushed += 1;
                 }
+                *vid_ts = ts_us;
+                return Ok(());
             }
-            const MICROSECONDS: u32 = 1000000;
-            *vid_ts += MICROSECONDS / stream_config.fps;
         }
         _ => {}
     }
@@ -554,80 +847,84 @@ fn acquire_pooled_buffer(
 fn send_to_appsrc(
     appsrc: &gstreamer_app::AppSrc,
     data: Vec<u8>,
-    mut ts: std::time::Duration,
+    ts: std::time::Duration,
+    duration: Option<std::time::Duration>,
     pools: &mut std::collections::HashMap<usize, gstreamer::BufferPool>,
+    pace: bool,
+    pacer: &mut Option<PacerState>,
 ) -> AnyResult<()> {
-    check_live(appsrc)?; // Stop if appsrc is dropped
+    // Treat shutdown as clean stop
+    // if is_closed(appsrc) {
+    //     return Ok(());
+    // }
 
-    // In live mode we follow the advice in
-    // https://gstreamer.freedesktop.org/documentation/additional/design/element-source.html?gi-language=c#live-sources
-    // Only push buffers when in play state and have a clock
-    // we also timestamp at the current time
-    if appsrc.is_live() {
-        if let Some(time) = appsrc
-            .current_clock_time()
-            .and_then(|t| appsrc.base_time().map(|bt| t - bt))
-        {
-            if matches!(appsrc.current_state(), gstreamer::State::Playing) {
-                ts = Duration::from_micros(time.useconds());
-            } else {
-		// Not playing
-                return Ok(());
+    // (don’t early-return on !linked — push_buffer will return NotLinked and we already ignore it)
+
+
+    if pace {
+        let now = std::time::Instant::now();
+        if let Some(st) = pacer.as_ref() {
+            let target = st.target_instant(ts);
+            if target > now {
+                std::thread::sleep(target - now);
             }
-        } else {
-	    // Clock not up yet
-            return Ok(());
         }
     }
 
-    let timestamp = ClockTime::from_useconds(ts.as_micros() as u64);
-    let buf = acquire_pooled_buffer(pools, &data, timestamp)?;
+    let timestamp = ClockTime::from_nseconds(ts.as_nanos() as u64);
+    let mut buf = acquire_pooled_buffer(pools, &data, timestamp)?;
 
-    // Proactive backpressure check before pushing
-    let level = appsrc.current_level_bytes();
-    let max = appsrc.max_bytes();
-
-    // If buffer is nearly full, skip this frame to prevent overflow
-    // Using 95% threshold now that buffer is larger (was 90%)
-    if level >= max * 95 / 100 {
-        log::debug!(
-            "Buffer nearly full on {} ({}/{} bytes), dropping frame to prevent overflow",
-            appsrc.name(),
-            level,
-            max
-        );
-        return Ok(());
+    if let Some(dur) = duration {
+        let dur_ct = ClockTime::from_nseconds(dur.as_nanos() as u64);
+        if let Some(b) = buf.get_mut() {
+            b.set_duration(dur_ct);
+        }
     }
 
     match appsrc.push_buffer(buf) {
-        Ok(_) => {}
+        Ok(_) => Ok(()),
         Err(gstreamer::FlowError::Flushing) => {
-            log::debug!(
-                "AppSrc {} is in flushing state (pipeline resetting or client disconnecting)",
-                appsrc.name()
-            );
-            return Ok(());
+            log::debug!("push_buffer => FLUSHING");
+            Ok(())
         }
-        Err(e) => return Err(anyhow::anyhow!("Error in streaming: {e:?}")),
+        Err(gstreamer::FlowError::NotLinked) => {
+            log::debug!("push_buffer => NOT_LINKED");
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!("Error in streaming: {e:?}")),
     }
-
-    // Backpressure-Logic: Adjust state based on buffer fill level
-    if level >= max * 2 / 3 && matches!(appsrc.current_state(), gstreamer::State::Paused) {
-        let _ = appsrc.set_state(gstreamer::State::Playing);
-    } else if level <= max / 3 && matches!(appsrc.current_state(), gstreamer::State::Playing) {
-        let _ = appsrc.set_state(gstreamer::State::Paused);
-    }
-
-    Ok(())
 }
 
-fn check_live(app: &AppSrc) -> Result<()> {
-    app.bus().ok_or(anyhow!("App source is closed"))?;
-    app.pads()
-        .iter()
-        .all(|pad| pad.is_linked())
-        .then_some(())
-        .ok_or(anyhow!("App source is not linked"))
+#[derive(Clone, Debug)]
+struct PacerState {
+    base_instant: std::time::Instant,
+    base_ts: std::time::Duration,
+}
+
+impl PacerState {
+    fn new(now: std::time::Instant, ts: std::time::Duration) -> Self {
+        Self { base_instant: now, base_ts: ts }
+    }
+
+    fn target_instant(&self, ts: std::time::Duration) -> std::time::Instant {
+        if ts >= self.base_ts {
+            self.base_instant + (ts - self.base_ts)
+        } else {
+            // If timestamps go backwards, clamp to "now-ish" rather than panicking.
+            self.base_instant
+        }
+    }
+}
+
+fn is_closed(app: &AppSrc) -> bool {
+    let (_res, current, pending) = app.state(None);
+    current == gstreamer::State::Null && pending == gstreamer::State::Null
+}
+
+fn is_linked(app: &AppSrc) -> bool {
+    app.static_pad("src")
+        .map(|p| p.is_linked())
+        .unwrap_or(false)
 }
 
 fn clear_bin(bin: &Element) -> Result<()> {
@@ -697,16 +994,13 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
 
-    source.set_is_live(false);  // Mark as live stream for proper real-time handling
-    source.set_block(false);
-    // Set minimum latency in nanoseconds based on actual FPS
-    // e.g., 15 FPS: 1 second / 15 = 66.7ms = 66,666,666 nanoseconds
-    // e.g., 25 FPS: 1 second / 25 = 40ms = 40,000,000 nanoseconds
-    source.set_min_latency(1_000_000_000 / (stream_config.fps as i64));
+    source.set_is_live(true);
+    source.set_property("format", &gstreamer::Format::Time);
+    source.set_do_timestamp(false);        // ✅ was true
+    source.set_block(false);               // ok if you choose dropping
     source.set_property("emit-signals", false);
-    source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(true);  // Enable timestamping for smooth playback
     source.set_stream_type(AppStreamType::Stream);
+    source.set_max_bytes(buffer_size as u64);
 
     // Set caps so RTSP server can build SDP before data flows
     let caps = Caps::builder("video/x-h264")
@@ -764,16 +1058,14 @@ fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     let source = make_element("appsrc", "vidsrc")?
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
-    source.set_is_live(false);  // Mark as live stream for proper real-time handling
-    source.set_block(false);
-    // Set minimum latency in nanoseconds based on actual FPS
-    // e.g., 15 FPS: 1 second / 15 = 66.7ms = 66,666,666 nanoseconds
-    // e.g., 25 FPS: 1 second / 25 = 40ms = 40,000,000 nanoseconds
-    source.set_min_latency(1_000_000_000 / (stream_config.fps as i64));
+    
+    source.set_is_live(true);
+    source.set_property("format", &gstreamer::Format::Time);
+    source.set_do_timestamp(false);        // ✅ was true
+    source.set_block(false);               // ok if you choose dropping
     source.set_property("emit-signals", false);
-    source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(true);  // Enable timestamping for smooth playback
     source.set_stream_type(AppStreamType::Stream);
+    source.set_max_bytes(buffer_size as u64);
 
     // Set caps so RTSP server can build SDP before data flows
     let caps = Caps::builder("video/x-h265")
@@ -821,7 +1113,7 @@ fn build_h265(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
     Ok(linked.appsrc)
 }
 
-fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
+fn pipe_aac(bin: &Element, _stream_config: &StreamConfig) -> Result<Linked> {
     // Audio seems to run at about 800kbs
     let buffer_size = 512 * 1416;
     let bin = bin
@@ -833,16 +1125,13 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
 
-    source.set_is_live(false);  // Mark as live stream for proper real-time handling
-    source.set_block(false);
-    // Set minimum latency in nanoseconds based on actual FPS
-    // e.g., 15 FPS: 1 second / 15 = 66.7ms = 66,666,666 nanoseconds
-    // e.g., 25 FPS: 1 second / 25 = 40ms = 40,000,000 nanoseconds
-    source.set_min_latency(1_000_000_000 / (stream_config.fps as i64));
+    source.set_is_live(true);
+    source.set_property("format", &gstreamer::Format::Time);
+    source.set_do_timestamp(false);        // ✅ was true
+    source.set_block(false);               // ok if you choose dropping
     source.set_property("emit-signals", false);
-    source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(true);  // Enable timestamping for smooth playback
     source.set_stream_type(AppStreamType::Stream);
+    source.set_max_bytes(buffer_size as u64);
 
     // Set caps so RTSP server can build SDP before data flows
     let caps = Caps::builder("audio/mpeg")
@@ -870,9 +1159,10 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         fallback_switch.set_property("immediate-fallback", true);
     }
 
+    let audiorate = make_element("audiorate", "audrate")?;
     let encoder = make_element("audioconvert", "audencoder")?;
 
-    bin.add_many([&source, &queue, &parser, &decoder, &encoder])?;
+    bin.add_many([&source, &queue, &parser, &decoder, &audiorate, &encoder])?;
     if let Ok(fallback_switch) = fallback_switch.as_ref() {
         bin.add_many([&silence, fallback_switch])?;
         Element::link_many([
@@ -881,11 +1171,12 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
             &parser,
             &decoder,
             fallback_switch,
+            &audiorate,
             &encoder,
         ])?;
         Element::link_many([&silence, fallback_switch])?;
     } else {
-        Element::link_many([&source, &queue, &parser, &decoder, &encoder])?;
+        Element::link_many([&source, &queue, &parser, &decoder, &audiorate, &encoder])?;
     }
 
     let source = source
@@ -911,7 +1202,7 @@ fn build_aac(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
     Ok(linked.appsrc)
 }
 
-fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> Result<Linked> {
+fn pipe_adpcm(bin: &Element, block_size: u32, _stream_config: &StreamConfig) -> Result<Linked> {
     let buffer_size = 512 * 1416;
     let bin = bin
         .clone()
@@ -928,16 +1219,14 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
     let source = make_element("appsrc", "audsrc")?
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
-    source.set_is_live(false);  // Mark as live stream for proper real-time handling
-    source.set_block(false);
-    // Set minimum latency in nanoseconds based on actual FPS
-    // e.g., 15 FPS: 1 second / 15 = 66.7ms = 66,666,666 nanoseconds
-    // e.g., 25 FPS: 1 second / 25 = 40ms = 40,000,000 nanoseconds
-    source.set_min_latency(1_000_000_000 / (stream_config.fps as i64));
+
+    source.set_is_live(true);
+    source.set_property("format", &gstreamer::Format::Time);
+    source.set_do_timestamp(false);        // ✅ was true
+    source.set_block(false);               // ok if you choose dropping
     source.set_property("emit-signals", false);
-    source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(true);  // Enable timestamping for smooth playback
     source.set_stream_type(AppStreamType::Stream);
+    source.set_max_bytes(buffer_size as u64);
 
     source.set_caps(Some(
         &Caps::builder("audio/x-adpcm")
@@ -954,18 +1243,21 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
 
     let queue = make_queue("audqueue", buffer_size)?;
     let decoder = make_element("decodebin", "auddecoder")?;
+    let audiorate = make_element("audiorate", "audrate")?;
     let encoder = make_element("audioconvert", "audencoder")?;
     let encoder_out = encoder.clone();
+    let audiorate_for_pad = audiorate.clone();
 
-    bin.add_many([&source, &queue, &decoder, &encoder])?;
+    bin.add_many([&source, &queue, &decoder, &audiorate, &encoder])?;
     Element::link_many([&source, &queue, &decoder])?;
     decoder.connect_pad_added(move |_element, pad| {
-        let sink_pad = encoder
+        let sink_pad = audiorate_for_pad
             .static_pad("sink")
             .expect("Encoder is missing its pad");
         pad.link(&sink_pad)
-            .expect("Failed to link ADPCM decoder to encoder");
+            .expect("Failed to link ADPCM decoder to audiorate");
     });
+    Element::link_many([&audiorate, &encoder])?;
 
     let source = source
         .dynamic_cast::<AppSrc>()
@@ -1003,13 +1295,14 @@ fn pipe_silence(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
 
-    source.set_is_live(false);
+    source.set_is_live(true);
+    source.set_property("format", &gstreamer::Format::Time);
     source.set_block(false);
     source.set_min_latency(1000 / (stream_config.fps as i64));
     source.set_property("emit-signals", false);
-    source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
+    source.set_max_bytes(buffer_size as u64);
 
     let source = source
         .dynamic_cast::<Element>()
@@ -1093,6 +1386,7 @@ fn make_element(kind: &str, name: &str) -> AnyResult<Element> {
         let plugin = match kind {
             "appsrc" => "app (gst-plugins-base)",
             "audioconvert" => "audioconvert (gst-plugins-base)",
+            "audiorate" => "audiorate (gst-plugins-base)",
             "adpcmdec" => "Required for audio",
             "h264parse" => "videoparsersbad (gst-plugins-bad)",
             "h265parse" => "videoparsersbad (gst-plugins-bad)",
@@ -1118,28 +1412,245 @@ fn make_element(kind: &str, name: &str) -> AnyResult<Element> {
     })
 }
 
+struct StreamStats {
+    last_report: std::time::Instant,
+
+    vid_pushed: u64,
+    aud_pushed: u64,
+    p_dropped_pressure: u64,
+    p_dropped_backpressure: u64,
+
+    tryrecv_ok: u64,
+
+    last_media_instant: std::time::Instant,
+
+    aud_last_us: u32,
+    aud_last_rate: u32,
+    aud_last_adts_frames: u32,
+    aud_last_raw_blocks: u32,
+    aud_last_profile: u8,
+    aud_last_sampling_index: u8,
+    aud_last_channel_config: u8,
+    aud_last_frame_len: u16,
+    aud_last_header_len: u8,
+    aud_last_payload_len: u16,
+    aud_last_parsed_len: u16,
+    aud_last_bytes: usize,
+    aud_packets: u64,
+    aud_dur_total_us: u64,
+    aud_dur_min_us: u32,
+    aud_dur_max_us: u32,
+
+    aud_gap_last_instant: Option<std::time::Instant>,
+    aud_gap_samples: u64,
+    aud_gap_total_us: u64,
+    aud_gap_min_us: u64,
+    aud_gap_max_us: u64,
+
+    vid_gap_last_instant: Option<std::time::Instant>,
+    aud_base_instant: Option<std::time::Instant>,
+    vid_base_instant: Option<std::time::Instant>,
+}
+
+impl StreamStats {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            last_report: now,
+            last_media_instant: now,
+            vid_pushed: 0,
+            aud_pushed: 0,
+            p_dropped_pressure: 0,
+            p_dropped_backpressure: 0,
+            tryrecv_ok: 0,
+            aud_last_us: 0,
+            aud_last_rate: 0,
+            aud_last_adts_frames: 0,
+            aud_last_raw_blocks: 0,
+            aud_last_profile: 0,
+            aud_last_sampling_index: 0,
+            aud_last_channel_config: 0,
+            aud_last_frame_len: 0,
+            aud_last_header_len: 0,
+            aud_last_payload_len: 0,
+            aud_last_parsed_len: 0,
+            aud_last_bytes: 0,
+            aud_packets: 0,
+            aud_dur_total_us: 0,
+            aud_dur_min_us: u32::MAX,
+            aud_dur_max_us: 0,
+
+            aud_gap_last_instant: None,
+            aud_gap_samples: 0,
+            aud_gap_total_us: 0,
+            aud_gap_min_us: u64::MAX,
+            aud_gap_max_us: 0,
+
+            vid_gap_last_instant: None,
+            aud_base_instant: None,
+            vid_base_instant: None,
+        }
+    }
+
+    fn record_aac(&mut self, info: &AacDurationInfo, bytes: usize) {
+        self.aud_last_us = info.duration_us;
+        self.aud_last_rate = info.sample_rate;
+        self.aud_last_adts_frames = info.adts_frames;
+        self.aud_last_raw_blocks = info.raw_blocks;
+        self.aud_last_profile = info.profile;
+        self.aud_last_sampling_index = info.sampling_index;
+        self.aud_last_channel_config = info.channel_config;
+        self.aud_last_frame_len = info.frame_length;
+        self.aud_last_header_len = info.header_len;
+        self.aud_last_payload_len = info.payload_len;
+        self.aud_last_parsed_len = info.parsed_len;
+        self.aud_last_bytes = bytes;
+        self.aud_packets += 1;
+        self.aud_dur_total_us += info.duration_us as u64;
+        self.aud_dur_min_us = self.aud_dur_min_us.min(info.duration_us);
+        self.aud_dur_max_us = self.aud_dur_max_us.max(info.duration_us);
+    }
+
+    fn record_aac_gap(&mut self, now: std::time::Instant) -> Option<u64> {
+        if let Some(prev) = self.aud_gap_last_instant {
+            let gap_us = now.duration_since(prev).as_micros() as u64;
+            self.aud_gap_samples += 1;
+            self.aud_gap_total_us += gap_us;
+            self.aud_gap_min_us = self.aud_gap_min_us.min(gap_us);
+            self.aud_gap_max_us = self.aud_gap_max_us.max(gap_us);
+            self.aud_gap_last_instant = Some(now);
+            return Some(gap_us);
+        }
+        self.aud_gap_last_instant = Some(now);
+        None
+    }
+
+    fn record_video_gap(&mut self, now: std::time::Instant) -> Option<u64> {
+        if let Some(prev) = self.vid_gap_last_instant {
+            let gap_us = now.duration_since(prev).as_micros() as u64;
+            self.vid_gap_last_instant = Some(now);
+            return Some(gap_us);
+        }
+        self.vid_gap_last_instant = Some(now);
+        None
+    }
+
+    fn audio_ts_from_recv(&mut self, recv_at: std::time::Instant, current_ts: u64) -> u64 {
+        let base = match self.aud_base_instant {
+            Some(base) => base,
+            None => {
+                let base = recv_at
+                    .checked_sub(std::time::Duration::from_micros(current_ts))
+                    .unwrap_or(recv_at);
+                self.aud_base_instant = Some(base);
+                base
+            }
+        };
+        let ts_us = recv_at.duration_since(base).as_micros() as u64;
+        ts_us.max(current_ts)
+    }
+
+    fn video_ts_from_recv(&mut self, recv_at: std::time::Instant, current_ts: u64) -> u64 {
+        let base = match self.vid_base_instant {
+            Some(base) => base,
+            None => {
+                let base = recv_at
+                    .checked_sub(std::time::Duration::from_micros(current_ts))
+                    .unwrap_or(recv_at);
+                self.vid_base_instant = Some(base);
+                base
+            }
+        };
+        let ts_us = recv_at.duration_since(base).as_micros() as u64;
+        ts_us.max(current_ts)
+    }
+
+    fn aud_stats_snapshot(&self) -> AudStatsSnapshot {
+        if self.aud_packets == 0 {
+            return AudStatsSnapshot::empty();
+        }
+        let avg = self.aud_dur_total_us / self.aud_packets;
+        let min = self.aud_dur_min_us;
+        let max = self.aud_dur_max_us;
+        let gap_avg = if self.aud_gap_samples == 0 {
+            0
+        } else {
+            self.aud_gap_total_us / self.aud_gap_samples
+        };
+        let gap_min = if self.aud_gap_samples == 0 {
+            0
+        } else {
+            self.aud_gap_min_us
+        };
+        let gap_max = if self.aud_gap_samples == 0 {
+            0
+        } else {
+            self.aud_gap_max_us
+        };
+        AudStatsSnapshot {
+            avg_us: avg,
+            min_us: min,
+            max_us: max,
+            total_us: self.aud_dur_total_us,
+            packets: self.aud_packets,
+            gap_avg_us: gap_avg,
+            gap_min_us: gap_min,
+            gap_max_us: gap_max,
+        }
+    }
+
+    fn reset_aud_stats(&mut self) {
+        self.aud_packets = 0;
+        self.aud_dur_total_us = 0;
+        self.aud_dur_min_us = u32::MAX;
+        self.aud_dur_max_us = 0;
+        self.aud_gap_samples = 0;
+        self.aud_gap_total_us = 0;
+        self.aud_gap_min_us = u64::MAX;
+        self.aud_gap_max_us = 0;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AudStatsSnapshot {
+    avg_us: u64,
+    min_us: u32,
+    max_us: u32,
+    total_us: u64,
+    packets: u64,
+    gap_avg_us: u64,
+    gap_min_us: u64,
+    gap_max_us: u64,
+}
+
+impl AudStatsSnapshot {
+    fn empty() -> Self {
+        Self {
+            avg_us: 0,
+            min_us: 0,
+            max_us: 0,
+            total_us: 0,
+            packets: 0,
+            gap_avg_us: 0,
+            gap_min_us: 0,
+            gap_max_us: 0,
+        }
+    }
+}
+
 #[allow(dead_code)]
 fn make_dbl_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
     let queue = make_element("queue", &format!("queue1_{}", name))?;
     queue.set_property("max-size-bytes", buffer_size);
     queue.set_property("max-size-buffers", 0u32);
     queue.set_property("max-size-time", 0u64);
-    // queue.set_property(
-    //     "max-size-time",
-    //     std::convert::TryInto::<u64>::try_into(tokio::time::Duration::from_secs(5).as_nanos())
-    //         .unwrap_or(0),
-    // );
+    //queue.set_property_from_str("leaky", "downstream");
 
     let queue2 = make_element("queue2", &format!("queue2_{}", name))?;
     queue2.set_property("max-size-bytes", buffer_size * 2u32 / 3u32);
-    queue.set_property("max-size-buffers", 0u32);
-    queue.set_property("max-size-time", 0u64);
-    queue2.set_property(
-        "max-size-time",
-        std::convert::TryInto::<u64>::try_into(tokio::time::Duration::from_secs(5).as_nanos())
-            .unwrap_or(0),
-    );
+    queue2.set_property("max-size-buffers", 0u32);
+    queue2.set_property("max-size-time", 0u64);
     queue2.set_property("use-buffering", false);
+    //queue2.set_property_from_str("leaky", "downstream");
 
     let bin = gstreamer::Bin::builder().name(name).build();
     bin.add_many([&queue, &queue2])?;
@@ -1170,17 +1681,19 @@ fn make_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
     queue.set_property("max-size-bytes", buffer_size);
     queue.set_property("max-size-buffers", 0u32);
     queue.set_property("max-size-time", 0u64);
-    queue.set_property(
-        "max-size-time",
-        std::convert::TryInto::<u64>::try_into(tokio::time::Duration::from_secs(5).as_nanos())
-            .unwrap_or(0),
-    );
+
+    // Alternatives:
+    // "downstream" → drop oldest buffers (best for live)
+    // "upstream"   → block upstream instead (higher latency)
+    //queue.set_property_from_str("leaky", "downstream");
+
     Ok(queue)
 }
 
 fn buffer_size(bitrate: u32) -> u32 {
-    // Increased to 30 (from 10) for 3-4 seconds of buffering
-    // This prevents stuttering when camera output is bursty or network is jittery
-    // Larger buffer = smoother playback at cost of slightly higher latency
-    std::cmp::max(bitrate * 30 / 8u32, 16u32 * 1024u32)
+    // bitrate is bits/sec
+    let bytes_per_sec = bitrate / 8;
+    let target_ms = 1000u32;
+    let bytes = bytes_per_sec * target_ms / 1000;
+    std::cmp::max(bytes, 64 * 1024)
 }

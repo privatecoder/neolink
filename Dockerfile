@@ -4,10 +4,30 @@
 #                    Miroslav Šedivý
 # SPDX-License-Identifier: AGPL-3.0-only
 
-FROM docker.io/rust:slim-bookworm AS build
+FROM docker.io/rust:slim-bookworm AS build-base
 ARG TARGETPLATFORM
 
 ENV DEBIAN_FRONTEND=noninteractive
+WORKDIR /usr/local/src/neolink
+
+# hadolint ignore=DL3008
+RUN apt-get update && \
+    apt-get upgrade -y && \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      openssl \
+      libssl-dev \
+      ca-certificates \
+      libgstrtspserver-1.0-dev \
+      libgstreamer1.0-dev \
+      libgtk2.0-dev \
+      protobuf-compiler \
+      libglib2.0-dev && \
+    apt-get clean -y && rm -rf /var/lib/apt/lists/*
+
+FROM build-base AS build
+ARG TARGETPLATFORM
+
 WORKDIR /usr/local/src/neolink
 COPY . /usr/local/src/neolink
 
@@ -21,7 +41,6 @@ COPY . /usr/local/src/neolink
 # docker to see if it will build from scratch
 # so if it is failing please make a PR
 #
-# hadolint ignore=DL3008
 RUN  echo "TARGETPLATFORM: ${TARGETPLATFORM}"; \
   if [ -f "${TARGETPLATFORM}/neolink" ]; then \
     echo "Restoring from artifact"; \
@@ -29,19 +48,6 @@ RUN  echo "TARGETPLATFORM: ${TARGETPLATFORM}"; \
     cp "${TARGETPLATFORM}/neolink" "/usr/local/src/neolink/target/release/neolink"; \
   else \
     echo "Building from scratch"; \
-    apt-get update && \
-        apt-get upgrade -y && \
-        apt-get install -y --no-install-recommends \
-          build-essential \
-          openssl \
-          libssl-dev \
-          ca-certificates \
-          libgstrtspserver-1.0-dev \
-          libgstreamer1.0-dev \
-          libgtk2.0-dev \
-          protobuf-compiler \
-          libglib2.0-dev && \
-        apt-get clean -y && rm -rf /var/lib/apt/lists/* ; \
     cargo build --release; \
   fi
 
@@ -90,4 +96,3 @@ ENV NEO_LINK_MODE="rtsp" NEO_LINK_PORT=8554
 CMD /usr/local/bin/neolink "${NEO_LINK_MODE}" --config /etc/neolink.toml
 ENTRYPOINT ["/entrypoint.sh"]
 EXPOSE ${NEO_LINK_PORT}
-
