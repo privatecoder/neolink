@@ -41,13 +41,18 @@ impl NeoCamThread {
         let camera = Arc::new(connect_and_login(config).await?);
         log::trace!("  - Connected");
 
-        sleep(Duration::from_secs(2)).await; // Delay a little since some calls will error if camera is waking up
-        if let Err(e) = update_camera_time(&camera, &name, config.update_time).await {
-            log::warn!("Could not set camera time, (perhaps missing on this camera of your login in not an admin): {e:?}");
-        }
-        sleep(Duration::from_secs(2)).await; // Delay a little since some calls will error if camera is waking up
-
         self.camera_watch.send_replace(Arc::downgrade(&camera));
+        if config.update_time {
+            let camera = Arc::clone(&camera);
+            let name = name.clone();
+            tokio::spawn(async move {
+                // Avoid blocking time-to-video; update time in background with a small delay.
+                sleep(Duration::from_millis(250)).await;
+                if let Err(e) = update_camera_time(&camera, &name, true).await {
+                    log::warn!("Could not set camera time (perhaps missing on this camera or login not admin): {e:?}");
+                }
+            });
+        }
 
         let cancel_check = self.cancel.clone();
         // Now we wait for a disconnect

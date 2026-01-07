@@ -11,8 +11,10 @@ use neolink_core::{
         VideoType,
     },
 };
+use once_cell::sync::Lazy;
 use std::sync::mpsc as std_mpsc;
 use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
 use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
@@ -24,6 +26,31 @@ use std::sync::mpsc::{RecvTimeoutError, TrySendError};
 pub enum AudioType {
     Aac,
     Adpcm(u32),
+}
+
+#[derive(Clone, Debug)]
+struct StreamTypeCache {
+    vid_type: Option<VideoType>,
+    aud_type: Option<AudioType>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct StreamCacheKey {
+    camera_id: String,
+    stream: StreamKind,
+}
+
+static STREAM_TYPE_CACHE: Lazy<RwLock<HashMap<StreamCacheKey, StreamTypeCache>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+async fn cached_stream_types(key: &StreamCacheKey) -> Option<StreamTypeCache> {
+    let cache = STREAM_TYPE_CACHE.read().await;
+    cache.get(key).cloned()
+}
+
+async fn store_stream_types(key: StreamCacheKey, types: StreamTypeCache) {
+    let mut cache = STREAM_TYPE_CACHE.write().await;
+    cache.insert(key, types);
 }
 
 #[derive(Clone, Debug)]
@@ -204,16 +231,48 @@ pub(super) async fn make_factory(
                         let mut buffer = vec![];
                         let mut frame_count = 0usize;
 
+                        let camera_id = config
+                            .camera_uid
+                            .clone()
+                            .unwrap_or_else(|| config.name.clone());
+                        let cache_key = StreamCacheKey {
+                            camera_id,
+                            stream,
+                        };
+
                         let mut stream_config = StreamConfig::new(&camera, stream).await?;
+                        if let Some(cached) = cached_stream_types(&cache_key).await {
+                            if cached.vid_type.is_some() || cached.aud_type.is_some() {
+                                log::info!(
+                                    "{name}::{stream}: Using cached stream types: video={:?}, audio={:?}",
+                                    cached.vid_type,
+                                    cached.aud_type
+                                );
+                            }
+                            stream_config.vid_type = cached.vid_type;
+                            stream_config.aud_type = cached.aud_type;
+                        }
+                        let cached_both =
+                            stream_config.vid_type.is_some() && stream_config.aud_type.is_some();
+                        let cached_any =
+                            stream_config.vid_type.is_some() || stream_config.aud_type.is_some();
+                        let buffer_target = if cached_both {
+                            3
+                        } else if cached_any {
+                            8
+                        } else {
+                            15
+                        };
+
                         log::info!("{name}::{stream}: Waiting for media frames from camera");
                         while let Some(media) = media_rx.recv().await {
                             log::debug!("{name}::{stream}: Received media frame #{}", frame_count);
                             stream_config.update_from_media(&media);
                             buffer.push(media);
-                            // Increased from 10 to 50 frames for better initial buffering
-                            // This reduces stuttering at stream start by ensuring smooth playback from the beginning
-                            if frame_count > 15
-                                || (frame_count > 10
+                            frame_count += 1;
+                            // Buffer a few frames before building the pipeline (shorter when cached types exist).
+                            if frame_count >= buffer_target
+                                || (frame_count >= 10
                                     && stream_config.vid_type.is_some()
                                     && stream_config.aud_type.is_some())
                             {
@@ -221,11 +280,19 @@ pub(super) async fn make_factory(
                                     stream_config.vid_type, stream_config.aud_type);
                                 break;
                             }
-                            frame_count += 1;
                         }
 
                         if stream_config.vid_type.is_none() && stream_config.aud_type.is_none() {
                             log::warn!("{name}::{stream}: No media received from camera, building fallback pipeline");
+                        } else {
+                            store_stream_types(
+                                cache_key.clone(),
+                                StreamTypeCache {
+                                    vid_type: stream_config.vid_type.clone(),
+                                    aud_type: stream_config.aud_type.clone(),
+                                },
+                            )
+                            .await;
                         }
 
                         log::trace!("{name}::{stream}: Building the pipeline");
