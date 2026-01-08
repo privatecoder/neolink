@@ -46,9 +46,9 @@ pub(crate) struct RegisterResult {
 }
 
 #[derive(Debug, Clone)]
-struct RegisterCacheEntry {
+struct LookupCacheEntry {
     cached_at: Instant,
-    result: RegisterResult,
+    lookup: UidLookupResults,
 }
 
 #[derive(Debug, Clone)]
@@ -66,7 +66,7 @@ struct UidLookupResults {
 }
 
 const MTU: u32 = 1350;
-const REG_CACHE_TTL: Duration = Duration::from_secs(300);
+const LOOKUP_CACHE_TTL: Duration = Duration::from_secs(300);
 lazy_static! {
     static ref P2P_RELAY_HOSTNAMES: [&'static str; 12] = [
         "p2p.reolink.com",
@@ -95,7 +95,7 @@ lazy_static! {
     static ref TCP_WAIT: Duration = Duration::from_secs(4);
     /// How long to wait before resending
     static ref RESEND_WAIT: Duration = Duration::from_millis(500);
-    static ref REG_CACHE: RwLock<HashMap<String, RegisterCacheEntry>> =
+    static ref LOOKUP_CACHE: RwLock<HashMap<String, LookupCacheEntry>> =
         RwLock::new(HashMap::new());
 }
 
@@ -125,26 +125,26 @@ fn valid_addr(ip_port: &IpPort) -> bool {
     valid_ip(&ip_port.ip) && valid_port(ip_port.port)
 }
 
-async fn cached_registration(uid: &str) -> Option<RegisterResult> {
-    let mut cache = REG_CACHE.write().await;
+async fn cached_lookup(uid: &str) -> Option<UidLookupResults> {
+    let mut cache = LOOKUP_CACHE.write().await;
     if let Some(entry) = cache.get(uid) {
         let age = entry.cached_at.elapsed();
-        if age <= REG_CACHE_TTL {
-            log::info!("Discovery: Using cached registration for {uid} (age={age:?})");
-            return Some(entry.result.clone());
+        if age <= LOOKUP_CACHE_TTL {
+            log::info!("Discovery: Using cached lookup for {uid} (age={age:?})");
+            return Some(entry.lookup.clone());
         }
     }
     cache.remove(uid);
     None
 }
 
-async fn store_registration(uid: &str, result: RegisterResult) {
-    let mut cache = REG_CACHE.write().await;
+async fn store_lookup(uid: &str, lookup: UidLookupResults) {
+    let mut cache = LOOKUP_CACHE.write().await;
     cache.insert(
         uid.to_string(),
-        RegisterCacheEntry {
+        LookupCacheEntry {
             cached_at: Instant::now(),
-            result,
+            lookup,
         },
     );
 }
@@ -1072,8 +1072,16 @@ impl Discovery {
     }
 
     pub(crate) async fn get_registration(&self, uid: &str) -> Result<RegisterResult> {
-        if let Some(cached) = cached_registration(uid).await {
-            return Ok(cached);
+        if let Some(lookup) = cached_lookup(uid).await {
+            let client_id = self.client_id;
+            match self.discoverer.register_address(uid, client_id, &lookup).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    log::warn!(
+                        "Discovery: Cached lookup registration failed for {uid}, retrying: {e:?}"
+                    );
+                }
+            }
         }
 
         let lookups = self.discoverer.uid_lookup_all(uid).await?;
@@ -1096,7 +1104,7 @@ impl Discovery {
                         trace!("lookup: {:?}", lookup);
                         let reg_result = discoverer.register_address(uid, client_id, &lookup).await;
                         trace!("reg_result: {:?}", reg_result);
-                        reg_result
+                        reg_result.map(|result| (result, lookup))
                     }
                 })
                 .filter_map(|f| async { f.ok() }),
@@ -1107,7 +1115,8 @@ impl Discovery {
             "No reolink registers returned valid device data.",
         ))?;
 
-        store_registration(uid, reg_result.clone()).await;
+        let (reg_result, lookup) = reg_result;
+        store_lookup(uid, lookup).await;
         Ok(reg_result)
     }
 
