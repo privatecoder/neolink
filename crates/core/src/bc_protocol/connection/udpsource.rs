@@ -11,6 +11,7 @@ use futures::{
     stream::{IntoAsyncRead, Stream, StreamExt, TryStreamExt},
 };
 use rand::{seq::SliceRandom, thread_rng, Rng};
+use socket2::SockRef;
 use std::collections::BTreeMap;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::net::SocketAddr;
@@ -37,6 +38,8 @@ use tokio_util::{
 
 const MTU: usize = 1350;
 const UDPDATA_HEADER_SIZE: usize = 20;
+const SOCKET_IN_CAPACITY: usize = 2000;
+const SOCKET_OUT_CAPACITY: usize = 16000;
 
 pub(crate) type InnerFramed = Framed<Compat<IntoAsyncRead<UdpPayloadSource>>, BcCodex>;
 pub(crate) struct UdpSource {
@@ -302,6 +305,7 @@ struct UdpPayloadInner {
     packets_want: u32,
     sent: BTreeMap<u32, UdpData>,
     recieved: BTreeMap<u32, Vec<u8>>,
+    last_delivery_at: Instant,
     /// Offical Client does ack every 10ms if we don't also do this the camera
     /// seems to think we have a poor connection and will abort
     /// This `ack_interval` controls how ofen we do this
@@ -329,8 +333,8 @@ impl UdpPayloadInner {
         // In order to achieve this we use dedicated threads for ACK
         // and the socket
 
-        let (socket_in_tx, socket_in_rx) = channel::<BcUdp>(500);
-        let (socket_out_tx, socket_out_rx) = channel::<(BcUdp, SocketAddr)>(500);
+        let (socket_in_tx, socket_in_rx) = channel::<BcUdp>(SOCKET_IN_CAPACITY);
+        let (socket_out_tx, socket_out_rx) = channel::<(BcUdp, SocketAddr)>(SOCKET_OUT_CAPACITY);
         // let (mut socket_tx, mut socket_rx) = inner.split();
 
         // Send/Recv on the socket
@@ -343,6 +347,8 @@ impl UdpPayloadInner {
         const TIME_OUT: u64 = 10;
         let mut recv_timeout = Box::pin(sleep(Duration::from_secs(TIME_OUT)));
         set.spawn(async move {
+            let mut dropped = 0u64;
+            let mut last_drop_log = Instant::now();
             let result = tokio::select! {
                 _ = send_cancel.cancelled() => {
                     Result::Ok(())
@@ -358,7 +364,29 @@ impl UdpPayloadInner {
                                 let packet = packet.ok_or(Error::BcUdpDropReciver(BcUdpDropReciverKind::NoneRecieved))??;
                                 recv_timeout.as_mut().reset(Instant::now() + Duration::from_secs(TIME_OUT));
                                 // let packet = socket_rx.next().await.ok_or(Error::BcUdpDropReciver)??;
-                                socket_out_tx.try_send(packet).map_err(|e| Error::BcUdpDropReciver(BcUdpDropReciverKind::SendFailed(format!("{e:?}"))))?;
+                                match socket_out_tx.try_send(packet) {
+                                    Ok(()) => {}
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                        dropped += 1;
+                                        let now = Instant::now();
+                                        if now.duration_since(last_drop_log) >= Duration::from_secs(1) {
+                                            log::warn!(
+                                                "UDP recv queue full; dropped {} packets in last {:?}",
+                                                dropped,
+                                                now.duration_since(last_drop_log)
+                                            );
+                                            dropped = 0;
+                                            last_drop_log = now;
+                                        }
+                                    }
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                        return Err(Error::BcUdpDropReciver(
+                                            BcUdpDropReciverKind::SendFailed(
+                                                "socket_out channel closed".to_string(),
+                                            ),
+                                        ));
+                                    }
+                                }
                                 continue;
                             },
                             packet = socket_in_rx.next() => {
@@ -471,6 +499,7 @@ impl UdpPayloadInner {
             packets_want: 0,
             sent: Default::default(),
             recieved: Default::default(),
+            last_delivery_at: Instant::now(),
             resend_interval: interval(Duration::from_millis(500)), // Offical Client does resend every 500ms
             ack_latency: Default::default(),
             cancel,
@@ -550,10 +579,28 @@ impl UdpPayloadInner {
             },
         }?;
         log::trace!("Send");
+        if self.packets_want > 0 && !self.recieved.is_empty() {
+            let wait = self.last_delivery_at.elapsed();
+            if wait >= Duration::from_millis(300) {
+                if let Some(&next_id) = self.recieved.keys().next() {
+                    if next_id > self.packets_want {
+                        log::warn!(
+                            "UDP payload gap: skipping missing packets {}..{} after {:?}",
+                            self.packets_want,
+                            next_id.saturating_sub(1),
+                            wait
+                        );
+                        self.packets_want = next_id;
+                        self.ack_tx.send_replace(self.build_send_ack());
+                    }
+                }
+            }
+        }
         while let Some(payload) = self.recieved.remove(&self.packets_want) {
             log::trace!("  + {}", self.packets_want);
             self.packets_want += 1;
             self.thread_stream.feed(Ok(payload)).await?;
+            self.last_delivery_at = Instant::now();
         }
         log::trace!("recieved: {}", self.recieved.len());
         log::trace!("Flush");
@@ -759,6 +806,24 @@ impl futures::AsyncWrite for UdpPayloadSource {
     }
 }
 
+fn set_udp_buffer_sizes(socket: &std::net::UdpSocket, size: usize) {
+    let sock_ref = SockRef::from(socket);
+    if let Err(e) = sock_ref.set_recv_buffer_size(size) {
+        log::warn!("UDP recv buffer size not set: {e:?}");
+    }
+    if let Err(e) = sock_ref.set_send_buffer_size(size) {
+        log::warn!("UDP send buffer size not set: {e:?}");
+    }
+    match sock_ref.recv_buffer_size() {
+        Ok(actual) => log::info!("UDP recv buffer size: {actual}"),
+        Err(e) => log::warn!("UDP recv buffer size read failed: {e:?}"),
+    }
+    match sock_ref.send_buffer_size() {
+        Ok(actual) => log::info!("UDP send buffer size: {actual}"),
+        Err(e) => log::warn!("UDP send buffer size read failed: {e:?}"),
+    }
+}
+
 /// Helper to create a UdpStream
 async fn connect() -> Result<UdpSocket> {
     let mut ports: Vec<u16> = (53500..54000).collect();
@@ -773,8 +838,13 @@ async fn connect() -> Result<UdpSocket> {
         .map(|&port| SocketAddr::from(([0, 0, 0, 0], port)))
         .collect();
     let socket = UdpSocket::bind(&addrs[..]).await?;
+    let std_socket = socket.into_std()?;
+    std_socket.set_nonblocking(true)?;
+    // Larger UDP buffers help high-bitrate streams avoid packet loss.
+    const UDP_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+    set_udp_buffer_sizes(&std_socket, UDP_BUFFER_SIZE);
 
-    Ok(socket)
+    Ok(UdpSocket::from_std(std_socket)?)
 }
 
 async fn connect_try_port(port: u16) -> Result<UdpSocket> {
@@ -791,6 +861,11 @@ async fn connect_try_port(port: u16) -> Result<UdpSocket> {
         .map(|&port| SocketAddr::from(([0, 0, 0, 0], port)))
         .collect();
     let socket = UdpSocket::bind(&addrs[..]).await?;
+    let std_socket = socket.into_std()?;
+    std_socket.set_nonblocking(true)?;
+    // Larger UDP buffers help high-bitrate streams avoid packet loss.
+    const UDP_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+    set_udp_buffer_sizes(&std_socket, UDP_BUFFER_SIZE);
 
-    Ok(socket)
+    Ok(UdpSocket::from_std(std_socket)?)
 }

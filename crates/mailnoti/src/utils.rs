@@ -88,6 +88,7 @@ impl AddressOrUid {
             uid: camera_config.camera_uid.clone(),
             protocol: ConnectionProtocol::TcpUdp,
             discovery: camera_config.discovery,
+            relay_server_region: camera_config.relay_server_region.clone(),
             max_discovery_retries: 10,
             credentials: Credentials {
                 username: camera_config.username.clone(),

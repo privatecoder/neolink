@@ -257,14 +257,49 @@ pub(super) async fn make_factory(
                         let cached_any =
                             stream_config.vid_type.is_some() || stream_config.aud_type.is_some();
                         let buffer_target = if cached_both {
-                            3
+                            1
                         } else if cached_any {
-                            8
+                            4
                         } else {
                             15
                         };
+                        let learn_timeout = if cached_both {
+                            Some(Duration::from_secs(2))
+                        } else if cached_any {
+                            Some(Duration::from_secs(4))
+                        } else {
+                            None
+                        };
 
                         log::info!("{name}::{stream}: Waiting for media frames from camera");
+                        if let Some(timeout) = learn_timeout {
+                            let mut deadline = tokio::time::sleep(timeout);
+                            tokio::pin!(deadline);
+                            loop {
+                                tokio::select! {
+                                    _ = &mut deadline => {
+                                        log::info!("{name}::{stream}: Stream type timeout, proceeding with cached types");
+                                        break;
+                                    }
+                                    media = media_rx.recv() => {
+                                        let Some(media) = media else { break; };
+                                        log::debug!("{name}::{stream}: Received media frame #{}", frame_count);
+                                        stream_config.update_from_media(&media);
+                                        buffer.push(media);
+                                        frame_count += 1;
+                                        if frame_count >= buffer_target
+                                            || (frame_count >= 10
+                                                && stream_config.vid_type.is_some()
+                                                && stream_config.aud_type.is_some())
+                                        {
+                                            log::info!("{name}::{stream}: Stream type learned: video={:?}, audio={:?}",
+                                                stream_config.vid_type, stream_config.aud_type);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
                         while let Some(media) = media_rx.recv().await {
                             log::debug!("{name}::{stream}: Received media frame #{}", frame_count);
                             stream_config.update_from_media(&media);
@@ -280,6 +315,7 @@ pub(super) async fn make_factory(
                                     stream_config.vid_type, stream_config.aud_type);
                                 break;
                             }
+                        }
                         }
 
                         if stream_config.vid_type.is_none() && stream_config.aud_type.is_none() {

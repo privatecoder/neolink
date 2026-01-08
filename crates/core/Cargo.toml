@@ -24,6 +24,7 @@ quick-xml = { version = "0.36.0", features = ["serialize"] }
 rand = "0.8.5"
 regex = "1.7.3"
 serde = { version = "1.0.106", features = ["derive"] }
+socket2 = "0.5.6"
 thiserror = "1.0.58"
 time = { version = "0.3.36" , features = [ "macros", "parsing", "local-offset" ]}
 tokio = { version = "1.27.0", features = ["full"] }

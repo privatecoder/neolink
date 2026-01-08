@@ -162,6 +162,9 @@ pub(crate) struct CameraConfig {
     #[serde(default = "default_discovery")]
     pub(crate) discovery: DiscoveryMethods,
 
+    #[serde(default, alias = "relay_region")]
+    pub(crate) relay_server_region: Option<String>,
+
     #[serde(default = "default_maxenc")]
     #[validate(regex(
         path = *RE_MAXENC_SRC,

@@ -16,6 +16,7 @@ use futures::{
 use lazy_static::lazy_static;
 use log::*;
 use rand::{seq::SliceRandom, thread_rng, Rng};
+use socket2::SockRef;
 use std::collections::{btree_map::Entry, BTreeMap, HashMap, HashSet};
 use std::convert::TryInto;
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
@@ -63,6 +64,7 @@ struct ConnectResult {
 struct UidLookupResults {
     reg: SocketAddr,
     relay: SocketAddr,
+    lookup_addr: SocketAddr,
 }
 
 const MTU: u32 = 1350;
@@ -99,6 +101,19 @@ lazy_static! {
         RwLock::new(HashMap::new());
 }
 
+fn relay_hostname_for_region(region: &str) -> Option<&'static str> {
+    match region.trim().to_ascii_lowercase().as_str() {
+        "north america (east us)" => Some("p2p1.reolink.com"),
+        "europe (germany)" => Some("p2p2.reolink.com"),
+        "asia (hong kong)" => Some("p2p3.reolink.com"),
+        "middle east" => Some("p2p6.reolink.com"),
+        "europe (france)" => Some("p2p7.reolink.com"),
+        "europe (unite kingdom)" => Some("p2p8.reolink.com"),
+        "north america (west us)" => Some("p2p9.reolink.com"),
+        _ => None,
+    }
+}
+
 type Subscriber = Arc<RwLock<BTreeMap<u32, Sender<Result<(UdpDiscovery, SocketAddr)>>>>>;
 type Handlers = Arc<RwLock<Vec<Sender<Result<(UdpDiscovery, SocketAddr)>>>>>;
 type ArcFramedSocket = UdpFramed<BcUdpCodex, Arc<UdpSocket>>;
@@ -123,6 +138,24 @@ fn valid_port(port: u16) -> bool {
 
 fn valid_addr(ip_port: &IpPort) -> bool {
     valid_ip(&ip_port.ip) && valid_port(ip_port.port)
+}
+
+fn set_udp_buffer_sizes(socket: &std::net::UdpSocket, size: usize, label: &str) {
+    let sock_ref = SockRef::from(socket);
+    if let Err(e) = sock_ref.set_recv_buffer_size(size) {
+        log::warn!("{label} UDP recv buffer size not set: {e:?}");
+    }
+    if let Err(e) = sock_ref.set_send_buffer_size(size) {
+        log::warn!("{label} UDP send buffer size not set: {e:?}");
+    }
+    match sock_ref.recv_buffer_size() {
+        Ok(actual) => log::info!("{label} UDP recv buffer size: {actual}"),
+        Err(e) => log::warn!("{label} UDP recv buffer size read failed: {e:?}"),
+    }
+    match sock_ref.send_buffer_size() {
+        Ok(actual) => log::info!("{label} UDP send buffer size: {actual}"),
+        Err(e) => log::warn!("{label} UDP send buffer size read failed: {e:?}"),
+    }
 }
 
 async fn cached_lookup(uid: &str) -> Option<UidLookupResults> {
@@ -439,10 +472,20 @@ impl Discoverer {
     async fn uid_lookup_all<'a>(
         &'a self,
         uid: &'a str,
+        relay_region: Option<&'a str>,
     ) -> Result<impl Stream<Item = UidLookupResults> + 'a> {
+        let relay_region = relay_region.map(|value| value.to_string());
+        let log_region = relay_region.clone();
         let task = tokio::task::spawn_blocking(move || {
             let mut addrs = vec![];
-            for p2p_relay in P2P_RELAY_HOSTNAMES.iter() {
+            let relay_host = relay_region
+                .as_deref()
+                .and_then(relay_hostname_for_region);
+            let hostnames: Vec<&str> = match relay_host {
+                Some(host) => vec![host],
+                None => P2P_RELAY_HOSTNAMES.to_vec(),
+            };
+            for p2p_relay in hostnames.iter() {
                 addrs.append(
                     &mut format!("{}:9999", p2p_relay)
                         .to_socket_addrs()
@@ -453,6 +496,13 @@ impl Discoverer {
             addrs
         });
         let mut addrs = timeout(*MAXIMUM_WAIT, task).await??;
+        if let Some(region) = log_region {
+            if let Some(host) = relay_hostname_for_region(&region) {
+                log::info!("UID lookup using relay region '{region}' -> {host}");
+            } else {
+                log::warn!("Unknown relay region '{region}', using all relay servers");
+            }
+        }
         trace!("Uid lookup to: {:?}", addrs);
 
         Ok(addrs
@@ -494,6 +544,7 @@ impl Discoverer {
         Ok(UidLookupResults {
             reg: SocketAddr::new(reg.ip.parse()?, reg.port),
             relay: SocketAddr::new(relay.ip.parse()?, relay.port),
+            lookup_addr: addr,
         })
     }
 
@@ -1061,13 +1112,19 @@ impl Drop for Discoverer {
 pub(crate) struct Discovery {
     discoverer: Discoverer,
     client_id: i32,
+    relay_region: Option<String>,
 }
 
 impl Discovery {
     pub(crate) async fn new() -> Result<Self> {
+        Self::new_with_region(None).await
+    }
+
+    pub(crate) async fn new_with_region(relay_region: Option<String>) -> Result<Self> {
         Ok(Self {
             discoverer: Discoverer::new().await?,
             client_id: generate_cid(),
+            relay_region,
         })
     }
 
@@ -1084,7 +1141,10 @@ impl Discovery {
             }
         }
 
-        let lookups = self.discoverer.uid_lookup_all(uid).await?;
+        let lookups = self
+            .discoverer
+            .uid_lookup_all(uid, self.relay_region.as_deref())
+            .await?;
 
         let checked_reg = Arc::new(RwLock::new(HashSet::new()));
         let reg_result = Box::pin(
@@ -1116,6 +1176,11 @@ impl Discovery {
         ))?;
 
         let (reg_result, lookup) = reg_result;
+        log::info!(
+            "Discovery: Using relay lookup server {} (relay {}) for {uid}",
+            lookup.lookup_addr,
+            lookup.relay
+        );
         store_lookup(uid, lookup).await;
         Ok(reg_result)
     }
@@ -1332,9 +1397,14 @@ async fn connect() -> Result<UdpSocket> {
         .map(|&port| SocketAddr::from(([0, 0, 0, 0], port)))
         .collect();
     let socket = UdpSocket::bind(&addrs[..]).await?;
-    socket.set_broadcast(true)?;
+    let std_socket = socket.into_std()?;
+    std_socket.set_nonblocking(true)?;
+    std_socket.set_broadcast(true)?;
+    // Larger UDP buffers help main-stream H265 avoid packet loss and long stalls.
+    const UDP_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+    set_udp_buffer_sizes(&std_socket, UDP_BUFFER_SIZE, "Discovery");
 
-    Ok(socket)
+    Ok(UdpSocket::from_std(std_socket)?)
 }
 
 /*

@@ -19,6 +19,7 @@
 //!     uid: Some("CAMUID".to_string()),
 //!     protocol: ConnectionProtocol::TcpUdp,
 //!     discovery: DiscoveryMethods::Relay,
+//!     relay_server_region: None,
 //!     credentials: Credentials {
 //!         username: "username".to_string(),
 //!         password: Some("password".to_string()),
@@ -43,6 +44,7 @@
 //! #    uid: Some("CAMUID".to_string()),
 //! #    protocol: ConnectionProtocol::TcpUdp,
 //! #    discovery: DiscoveryMethods::Relay,
+//! #    relay_server_region: None,
 //! #    credentials: Credentials {
 //! #        username: "username".to_string(),
 //! #        password: Some("password".to_string()),

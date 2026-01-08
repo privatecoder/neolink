@@ -98,6 +98,8 @@ pub struct BcCameraOpt {
     pub protocol: ConnectionProtocol,
     /// Discovery method to allow
     pub discovery: DiscoveryMethods,
+    /// Optional relay server region (maps to a specific p2p*.reolink.com)
+    pub relay_server_region: Option<String>,
     /// Maximum number of retries for discovery
     pub max_discovery_retries: usize,
     /// Credentials for login
@@ -141,7 +143,7 @@ impl BcCamera {
     /// Try to connect to the camera via appropaite methods and return
     /// the location that should be used
     async fn find_camera(options: &BcCameraOpt) -> Result<CameraLocation> {
-        let discovery = Discovery::new().await?;
+        let discovery = Discovery::new_with_region(options.relay_server_region.clone()).await?;
         if let ConnectionProtocol::Tcp | ConnectionProtocol::TcpUdp = options.protocol {
             let mut sockets = vec![];
             match options.port {
@@ -219,7 +221,8 @@ impl BcCamera {
                     }
                 }, if allow_local => Ok(v),
                 Ok(v) = async {
-                    let mut discovery = Discovery::new().await?;
+                    let mut discovery =
+                        Discovery::new_with_region(options.relay_server_region.clone()).await?;
                     let reg_result;
                     // Registration is looped as it seems that reolink
                     // only updates the registration lazily when someone attempts
@@ -250,7 +253,8 @@ impl BcCamera {
                         retry += 1;
                         tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
                         // New discovery to get new client IDs
-                        discovery = Discovery::new().await?;
+                        discovery =
+                            Discovery::new_with_region(options.relay_server_region.clone()).await?;
                     };
                     tokio::select! {
                         Ok(v) = async {
