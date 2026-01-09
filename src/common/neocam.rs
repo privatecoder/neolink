@@ -307,7 +307,30 @@ impl NeoCam {
                         connect_instance.connect().await?;
 
                         // Wait for all permits to be dropped (all clients disconnect)
-                        permit.dropped_users().await?;
+                        loop {
+                            permit.dropped_users().await?;
+                            let warm_secs = config_rx.borrow().relay_warm_seconds;
+                            if warm_secs == 0 {
+                                break;
+                            }
+                            log::info!(
+                                "{name}: All permits dropped, keeping relay warm for {}s",
+                                warm_secs
+                            );
+                            let mut warm_deadline = sleep(Duration::from_secs(warm_secs));
+                            tokio::pin!(warm_deadline);
+                            tokio::select! {
+                                _ = &mut warm_deadline => {
+                                    break;
+                                }
+                                v = permit.aquired_users() => {
+                                    v?;
+                                    log::info!("{name}: Permit reacquired during warm relay window");
+                                    continue;
+                                }
+                            }
+                        }
+
                         log::info!("{name}: All permits dropped, disconnecting from camera relay");
                         connect_instance.disconnect().await?;
                     }

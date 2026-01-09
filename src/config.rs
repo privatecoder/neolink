@@ -165,6 +165,21 @@ pub(crate) struct CameraConfig {
     #[serde(default, alias = "relay_region")]
     pub(crate) relay_server_region: Option<String>,
 
+    #[validate(range(
+        min = 0,
+        max = 3600,
+        message = "Invalid relay warm seconds",
+        code = "relay_warm_seconds"
+    ))]
+    /// Keep the camera connection warm after last client disconnects (0 disables).
+    #[serde(
+        default = "default_relay_warm_seconds",
+        alias = "relay_warm",
+        alias = "relay_warm_secs",
+        alias = "relay_warm_seconds"
+    )]
+    pub(crate) relay_warm_seconds: u64,
+
     #[serde(default = "default_maxenc")]
     #[validate(regex(
         path = *RE_MAXENC_SRC,
@@ -320,6 +335,10 @@ fn default_print() -> PrintFormat {
 
 fn default_discovery() -> DiscoveryMethods {
     DiscoveryMethods::Relay
+}
+
+fn default_relay_warm_seconds() -> u64 {
+    60
 }
 
 fn default_maxenc() -> String {

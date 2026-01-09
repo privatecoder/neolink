@@ -790,41 +790,115 @@ impl Discoverer {
         &self,
         register_result: &RegisterResult,
     ) -> Result<ConnectResult> {
-        let (addr, local_tid, local_did) = self
-            .handle_incoming(|bc, addr| {
-                trace!("bc: {:?}", bc);
-                match (bc, register_result) {
-                    (
-                        UdpDiscovery {
-                            tid,
-                            payload:
-                                UdpXml::D2cT(D2cT {
-                                    sid,
-                                    cid,
-                                    did,
-                                    conn,
-                                    ..
-                                }),
-                        },
-                        RegisterResult {
-                            dmap: register_dmap,
-                            sid: register_sid,
-                            ..
-                        },
-                    ) if cid == register_result.client_id
-                        && &sid == register_sid
-                        && register_dmap
-                            .as_ref()
-                            .map(|dmap| &addr == dmap)
-                            .unwrap_or(false)
-                        && &conn == "map" =>
-                    {
-                        Some((addr, tid, did))
-                    }
-                    _ => None,
+        const MAP_PUNCH_ATTEMPTS: usize = 5;
+        let register_dmap = register_result.dmap;
+        let mut reply = ReceiverStream::new(self.subscribe(0).await?);
+        let mut deadline = tokio::time::sleep(*MAXIMUM_WAIT);
+        tokio::pin!(deadline);
+
+        let mut punch_interval = interval(*RESEND_WAIT);
+        punch_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut punch_attempts = 0usize;
+
+        let (addr, local_tid, local_did) = loop {
+            tokio::select! {
+                _ = &mut deadline => {
+                    return Err(Error::DiscoveryTimeout);
                 }
-            })
-            .await?;
+                _ = punch_interval.tick(), if register_dmap.is_some() && punch_attempts < MAP_PUNCH_ATTEMPTS => {
+                    if let Some(dmap) = register_dmap {
+                        if punch_attempts == 0 {
+                            log::info!("Relay-assisted P2P map: sending map punch to {}", dmap);
+                        }
+                        let msg = UdpDiscovery {
+                            tid: generate_tid(),
+                            payload: UdpXml::C2dT(C2dT {
+                                sid: register_result.sid,
+                                cid: register_result.client_id,
+                                mtu: MTU,
+                                conn: "map".to_string(),
+                            }),
+                        };
+                        if let Err(e) = self.send(BcUdp::Discovery(msg), dmap).await {
+                            log::debug!("Relay-assisted P2P map: failed to send map punch to {}: {:?}", dmap, e);
+                        }
+                    }
+                    punch_attempts += 1;
+                }
+                reply_msg = reply.next() => {
+                    let (bc, addr) = reply_msg.ok_or(Error::ConnectionUnavailable)??;
+                    trace!("bc: {:?}", bc);
+                    match (bc, register_result) {
+                        (
+                            UdpDiscovery {
+                                tid,
+                                payload:
+                                    UdpXml::D2cT(D2cT {
+                                        sid,
+                                        cid,
+                                        did,
+                                        conn,
+                                        ..
+                                    }),
+                            },
+                            RegisterResult {
+                                dmap: register_dmap,
+                                sid: register_sid,
+                                ..
+                            },
+                        ) if cid == register_result.client_id && &sid == register_sid && &conn == "map" =>
+                        {
+                            log::info!(
+                                "Relay-assisted P2P map: received D2cT from {} sid={} cid={} did={}",
+                                addr,
+                                sid,
+                                cid,
+                                did
+                            );
+                            if let Some(dmap) = register_dmap.as_ref() {
+                                if addr.ip() == dmap.ip() {
+                                    if addr.port() != dmap.port() {
+                                        log::info!(
+                                            "Relay-assisted P2P map: dmap port changed {} -> {}",
+                                            dmap.port(),
+                                            addr.port()
+                                        );
+                                    }
+                                    break (addr, tid, did);
+                                }
+                                log::info!(
+                                    "Relay-assisted P2P map: D2cT from unexpected addr {}, expected dmap {}",
+                                    addr,
+                                    dmap
+                                );
+                            } else {
+                                log::info!(
+                                    "Relay-assisted P2P map: D2cT received without dmap, accepting {}",
+                                    addr
+                                );
+                                break (addr, tid, did);
+                            }
+                        }
+                        (
+                            UdpDiscovery {
+                                payload: UdpXml::D2cT(D2cT { sid, cid, conn, .. }),
+                                ..
+                            },
+                            RegisterResult { sid: register_sid, .. },
+                        ) if &sid == register_sid && &conn == "map" => {
+                            log::debug!(
+                                "Relay-assisted P2P map: ignoring D2cT from {} (sid={}, cid={}, conn={})",
+                                addr,
+                                sid,
+                                cid,
+                                conn
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        };
 
         let msg = UdpDiscovery {
             tid: local_tid,
@@ -1339,6 +1413,42 @@ impl Discovery {
             client_id: self.client_id,
             camera_id: connect_result.camera_id,
         })
+    }
+
+    pub(crate) async fn relay_assisted_p2p(
+        &self,
+        reg_result: &RegisterResult,
+    ) -> Result<DiscoveryResult> {
+        if let Some(dmap) = reg_result.dmap {
+            log::info!("Trying relay-assisted P2P map via dmap {dmap}");
+            let map_attempt = tokio::time::timeout(
+                Duration::from_secs(3),
+                self.discoverer.device_initiated_map(reg_result),
+            )
+            .await;
+            match map_attempt {
+                Ok(Ok(connect_result)) => {
+                    log::info!("Relay-assisted P2P map succeeded at {}", connect_result.addr);
+                    let socket = self.discoverer.get_socket().await;
+                    return Ok(DiscoveryResult {
+                        socket,
+                        addr: connect_result.addr,
+                        client_id: self.client_id,
+                        camera_id: connect_result.camera_id,
+                    });
+                }
+                Ok(Err(e)) => {
+                    log::warn!("Relay-assisted P2P map failed: {e:?}");
+                }
+                Err(_) => {
+                    log::warn!("Relay-assisted P2P map timed out, falling back to relay");
+                }
+            }
+        } else {
+            log::info!("Relay-assisted P2P map skipped: no dmap available");
+        }
+
+        self.relay(reg_result).await
     }
 }
 

@@ -298,11 +298,11 @@ impl BcCamera {
                             let uid_relay = uid.clone();
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                             info!("{}: Trying relay discovery", options.name);
-                            let result = discovery.relay(&reg_result).await;
+                            let result = discovery.relay_assisted_p2p(&reg_result).await;
                             match result {
                                 Ok(disc) => {
                                     info!(
-                                        "{}: Relay success {} at {}",
+                                        "{}: Relay-assisted discovery success {} at {}",
                                         options.name,
                                         uid_relay,
                                         disc.get_addr()
