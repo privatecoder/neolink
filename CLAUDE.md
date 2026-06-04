@@ -82,14 +82,19 @@ connection without locking. Understanding this requires reading several files in
   - The retry/reconnect logic keys off a `watch<Weak<BcCamera>>`: when the camera object
     is swapped (reconnect), in-flight tasks observe the change and re-run.
 
-- **On-demand connection** via **`UseCounter` / `Permit`** (`usecounter.rs`): a permit is
-  an RAII token. The connect loop in `neocam.rs` waits for `aquired_users()` > 0 to call
-  `connect()`, and `dropped_users()` == 0 to `disconnect()`. RTSP clients, MQTT commands,
-  and motion events each take a permit, so the relay connection is established only when
-  something needs the camera and torn down immediately after — except for an optional
-  `relay_warm_seconds` grace window that keeps the connection warm after the last permit
-  drops. This is why most of `src/common/neocam.rs` is careful about *not* connecting at
-  startup (see the "Camera info reporting removed" comment).
+- **Connection lifecycle** via **`UseCounter` / `Permit`** (`usecounter.rs`): a permit is
+  an RAII token. RTSP clients, MQTT commands, and motion events each take a permit. The
+  connect loop in `neocam.rs` branches on the per-camera **`connect_mode`** (`config.rs`,
+  `ConnectMode`):
+  - **`Always`** (default) → `connect()` at startup and stay connected (camthread
+    reconnects on drops). If `idle_timeout_secs` > 0, it disconnects after that many
+    seconds with no permits and reconnects on demand; `0` = never disconnect.
+  - **`OnDemand`** → waits for `aquired_users()` > 0 to `connect()`, and `dropped_users()`
+    == 0 to `disconnect()` (with an optional `relay_warm_seconds` grace window). The
+    camera stays dark until something needs it — this is why the startup info-queries were
+    removed (see the "Camera info reporting removed" comment) so `OnDemand` truly never
+    connects at boot.
+  The loop re-reads the config each cycle, so `connect_mode` can change at runtime.
 
 Subcommands (`src/{rtsp,mqtt,ptz,battery,...}/`) each have a `cmdline.rs` (clap `Opt`) and
 a `mod.rs` `main(opts, reactor)`. `src/main.rs` parses, loads+validates config, builds the

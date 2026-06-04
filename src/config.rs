@@ -171,6 +171,23 @@ impl StreamConfig {
     }
 }
 
+/// How a camera maintains its connection to Neolink.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Eq, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ConnectMode {
+    /// Connect at startup and stay connected, reconnecting on drops. Idle
+    /// disconnection is governed by `idle_timeout_secs` (0 = never disconnect).
+    /// This is the regular, always-available behaviour.
+    #[default]
+    #[serde(alias = "always", alias = "connected", alias = "on")]
+    Always,
+    /// Connect only when needed (an RTSP client connects, an MQTT command runs,
+    /// motion is active) and disconnect when idle. Idle linger is governed by
+    /// `relay_warm_seconds`. Useful for battery-powered cameras.
+    #[serde(alias = "ondemand", alias = "demand", alias = "lazy")]
+    OnDemand,
+}
+
 #[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq)]
 #[validate(schema(function = "validate_camera_config"))]
 pub(crate) struct CameraConfig {
@@ -238,6 +255,23 @@ pub(crate) struct CameraConfig {
         alias = "relay_warm_seconds"
     )]
     pub(crate) relay_warm_seconds: u64,
+
+    /// How the camera maintains its connection: `always` (default) connects at
+    /// startup and stays connected; `on_demand` connects only when needed.
+    #[serde(default, alias = "connect", alias = "connection_mode")]
+    pub(crate) connect_mode: ConnectMode,
+
+    #[validate(range(
+        min = 0,
+        max = 86400,
+        message = "Invalid idle timeout seconds",
+        code = "idle_timeout_secs"
+    ))]
+    /// In `connect_mode = always`: seconds the camera may stay idle (no active
+    /// use) before disconnecting; 0 = never disconnect. Ignored in `on_demand`
+    /// mode (which uses `relay_warm_seconds`).
+    #[serde(default, alias = "idle_timeout", alias = "idle_secs")]
+    pub(crate) idle_timeout_secs: u64,
 
     #[serde(default = "default_maxenc")]
     #[validate(regex(

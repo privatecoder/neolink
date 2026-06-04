@@ -1,5 +1,26 @@
 # Release Notes
 
+## 0.6.4-beta.14
+
+### Highlight: choose always-connected or on-demand per camera
+
+This branch had been hardcoded to on-demand (disconnect whenever idle). That's
+ideal for battery cameras but unnecessary for mains-powered ones, where you'd
+rather keep the camera connected and ready. A new per-camera `connect_mode`
+setting lets one build do both:
+
+- **`connect_mode = "always"` (default)** — connect at startup and stay
+  connected, reconnecting automatically on drops. Add `idle_timeout_secs = N` to
+  disconnect after N seconds idle (0 = never, the default).
+- **`connect_mode = "on_demand"`** — connect only when something needs the camera
+  and disconnect when idle; `relay_warm_seconds` controls the linger. Best for
+  battery cameras.
+
+The default is now always-connected (the "regular" behaviour). Existing configs
+keep working unchanged; set `connect_mode = "on_demand"` on the cameras you want
+to behave the old way. All the stream/bitrate/caching fixes from recent releases
+apply to both modes. See the README "Connection Modes" section.
+
 ## 0.6.4-beta.13
 
 ### Highlight: audio/video sync

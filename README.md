@@ -359,35 +359,56 @@ Then start the rtsp server as usual:
 ./neolink rtsp --config=neolink.toml
 ```
 
-### On-Demand Connections
+### Connection Modes
 
-To save battery and network bandwidth, Neolink automatically disconnects from cameras
-when they are not being used.
+Each camera chooses how it maintains its connection via `connect_mode`:
 
-Cameras connect **only when needed**:
-- When an RTSP client connects to view the stream
-- When an MQTT command is executed
-- When motion detection is active
+```toml
+[[cameras]]
+  connect_mode = "always"      # default: connect at startup and stay connected
+  # connect_mode = "on_demand" # connect only when needed (best for battery cams)
+```
 
-Cameras disconnect **immediately** when:
-- All RTSP clients disconnect
-- No active tasks require the camera connection
+**`always` (default)** — the camera connects at startup and stays connected,
+reconnecting automatically if the link drops. Optionally set `idle_timeout_secs`
+to drop the connection after a period with no active use (and reconnect on
+demand). `0` (the default) means never disconnect:
 
-This happens automatically - no configuration is required. The camera relay connection
-lifecycle is perfectly synchronized with RTSP client connections.
+```toml
+[[cameras]]
+  connect_mode = "always"
+  idle_timeout_secs = 0     # 0 = stay connected forever (default)
+  # idle_timeout_secs = 30  # disconnect after 30s idle, reconnect on demand
+```
 
-**Example**: When you connect VLC to view a camera stream, Neolink establishes the relay
-connection. When you close VLC, Neolink immediately disconnects from the camera.
+**`on_demand`** — the camera stays disconnected until something needs it, and
+disconnects again when idle. Good for battery-powered cameras. Use
+`relay_warm_seconds` to keep the connection warm briefly after the last client
+leaves so a quick re-view reconnects instantly:
 
-You can monitor this behavior in the logs:
+```toml
+[[cameras]]
+  connect_mode = "on_demand"
+  relay_warm_seconds = 60   # linger 60s after last client (0 = disconnect immediately)
+```
+
+A camera connects on demand when:
+- an RTSP client connects to view the stream
+- an MQTT command is executed
+- motion detection is active
+
+You can monitor the lifecycle in the logs:
 ```
 [INFO] Permit acquired, connecting to camera relay
-[INFO] RTSP client connected, establishing camera relay
 [INFO] Camera relay established
-[INFO] Client disconnected, stopping camera relay
 [INFO] All permits dropped, disconnecting from camera relay
 [INFO] Camera relay disconnected
 ```
+
+> Note: a fully-disconnected `on_demand` camera cannot observe motion itself, and
+> push-notification wake-ups are no longer available (Google removed the API the
+> camera used). Wake such cameras with an external trigger (an RTSP client, an
+> MQTT command, or `/control/wakeup`).
 
 You can make neolink stop active streams when there are no rtsp clients using
 

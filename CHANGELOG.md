@@ -3,6 +3,23 @@
 All notable changes to this fork are documented here.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.6.4-beta.14] - 2026-06-04
+
+### Added
+
+- **Per-camera `connect_mode`** so a single build serves both styles:
+  - **`always`** (default) — connect at startup and stay connected, reconnecting
+    on drops (the "regular" always-available behaviour). Optional
+    **`idle_timeout_secs`** (default `0` = never) disconnects after that many
+    seconds idle and reconnects on demand.
+  - **`on_demand`** — connect only when needed and disconnect when idle (best for
+    battery cameras). Uses `relay_warm_seconds` for the idle linger.
+
+  Previously the branch was hardcoded on-demand; the default is now always-connected.
+  Existing configs need no change (default = always); set `connect_mode = "on_demand"`
+  per camera for the old behaviour. The removed `idle_disconnect` flag is superseded
+  by `connect_mode` + `idle_timeout_secs`.
+
 ## [0.6.4-beta.13] - 2026-06-04
 
 ### Fixed

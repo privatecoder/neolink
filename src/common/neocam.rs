@@ -25,7 +25,10 @@ use super::{
 };
 #[cfg(feature = "pushnoti")]
 use super::{PnRequest, PushNoti};
-use crate::{config::CameraConfig, AnyResult, Result};
+use crate::{
+    config::{CameraConfig, ConnectMode},
+    AnyResult, Result,
+};
 use neolink_core::bc_protocol::BcCamera;
 
 #[allow(dead_code)]
@@ -283,9 +286,13 @@ impl NeoCam {
             }
         });
 
-        // This thread manages camera connections based on active permits.
+        // This thread manages the camera connection lifecycle per `connect_mode`:
+        //   - Always:    connect at startup and stay connected; if idle_timeout_secs > 0,
+        //                disconnect after that long idle and reconnect on demand.
+        //   - OnDemand:  connect only when a permit is held; disconnect when idle, after
+        //                an optional relay_warm_seconds grace.
         // Permits are created when RTSP clients connect or when other tasks need the camera.
-        // When all permits are released, camera disconnects immediately.
+        // The loop re-reads the config each cycle so changes take effect.
         let connect_instance = instance.subscribe().await?;
         let connect_cancel = me.cancel.clone();
         me.set.spawn(async move {
@@ -297,43 +304,90 @@ impl NeoCam {
                     let mut permit = connect_instance.permit().await?;
                     permit.deactivate().await?; // Watching only, don't count as active
 
-                    let config_rx = connect_instance.config().await?;
+                    let mut config_rx = connect_instance.config().await?;
                     let name = config_rx.borrow().name.clone();
 
                     loop {
-                        // Wait for someone to acquire a permit (RTSP client connects, etc.)
-                        permit.aquired_users().await?;
-                        log::info!("{name}: Permit acquired, connecting to camera relay");
-                        connect_instance.connect().await?;
-
-                        // Wait for all permits to be dropped (all clients disconnect)
-                        loop {
-                            permit.dropped_users().await?;
-                            let warm_secs = config_rx.borrow().relay_warm_seconds;
-                            if warm_secs == 0 {
-                                break;
-                            }
-                            log::info!(
-                                "{name}: All permits dropped, keeping relay warm for {}s",
-                                warm_secs
-                            );
-                            let warm_deadline = sleep(Duration::from_secs(warm_secs));
-                            tokio::pin!(warm_deadline);
-                            tokio::select! {
-                                _ = &mut warm_deadline => {
-                                    break;
-                                }
-                                v = permit.aquired_users() => {
-                                    v?;
-                                    log::info!("{name}: Permit reacquired during warm relay window");
+                        // Snapshot the mode (and mark the current config as seen so a
+                        // later `changed()` only fires on a genuine config change).
+                        let mode = config_rx.borrow_and_update().connect_mode;
+                        match mode {
+                            ConnectMode::Always => {
+                                // Connect at startup / stay connected (idempotent).
+                                connect_instance.connect().await?;
+                                let idle_timeout = config_rx.borrow().idle_timeout_secs;
+                                if idle_timeout == 0 {
+                                    // Never idle-disconnect; just wait for a config change.
+                                    if config_rx.changed().await.is_err() {
+                                        break;
+                                    }
                                     continue;
                                 }
+                                // idle_timeout > 0: disconnect after being idle that long.
+                                tokio::select! {
+                                    r = config_rx.changed() => { if r.is_err() { break; } continue; }
+                                    r = permit.dropped_users() => {
+                                        r?;
+                                        let idle_deadline = sleep(Duration::from_secs(idle_timeout));
+                                        tokio::pin!(idle_deadline);
+                                        tokio::select! {
+                                            _ = &mut idle_deadline => {
+                                                log::info!("{name}: idle {idle_timeout}s, disconnecting (connect_mode=always)");
+                                                connect_instance.disconnect().await?;
+                                                // Reconnect on demand (or re-evaluate on config change).
+                                                tokio::select! {
+                                                    r = permit.aquired_users() => { r?; }
+                                                    r = config_rx.changed() => { if r.is_err() { break; } }
+                                                }
+                                            }
+                                            // Re-used before timeout: stay connected.
+                                            r = permit.aquired_users() => { r?; }
+                                            r = config_rx.changed() => { if r.is_err() { break; } }
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+                            ConnectMode::OnDemand => {
+                                // Wait for demand before connecting.
+                                tokio::select! {
+                                    r = config_rx.changed() => { if r.is_err() { break; } continue; }
+                                    r = permit.aquired_users() => { r?; }
+                                }
+                                log::info!("{name}: Permit acquired, connecting to camera relay");
+                                connect_instance.connect().await?;
+
+                                // Stay connected until all permits drop, plus a warm grace.
+                                loop {
+                                    permit.dropped_users().await?;
+                                    let warm_secs = config_rx.borrow().relay_warm_seconds;
+                                    if warm_secs == 0 {
+                                        break;
+                                    }
+                                    log::info!(
+                                        "{name}: All permits dropped, keeping relay warm for {}s",
+                                        warm_secs
+                                    );
+                                    let warm_deadline = sleep(Duration::from_secs(warm_secs));
+                                    tokio::pin!(warm_deadline);
+                                    tokio::select! {
+                                        _ = &mut warm_deadline => {
+                                            break;
+                                        }
+                                        v = permit.aquired_users() => {
+                                            v?;
+                                            log::info!("{name}: Permit reacquired during warm relay window");
+                                            continue;
+                                        }
+                                    }
+                                }
+
+                                log::info!("{name}: All permits dropped, disconnecting from camera relay");
+                                connect_instance.disconnect().await?;
                             }
                         }
-
-                        log::info!("{name}: All permits dropped, disconnecting from camera relay");
-                        connect_instance.disconnect().await?;
                     }
+                    AnyResult::Ok(())
                 } => {
                     v
                 },
