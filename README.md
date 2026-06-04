@@ -364,8 +364,8 @@ All per-camera options (under `[[cameras]]`), with defaults. Sub-tables
 | `print_format` (alias `print`) | `None` | Log formatting for some values: `None`, `Human`, `Xml`. |
 | `debug` (alias `verbose`) | `false` | Dump decrypted XML from the camera (noisy; troubleshooting only). |
 | `enabled` (alias `enable`) | `true` | Set `false` to disable a camera without deleting it. |
-| `use_splash` (alias `splash`) | `true` | Serve a placeholder pattern over RTSP while the real stream isn't ready (camera connecting, on-demand wake, or paused) so clients show something instead of erroring/timing out. Most useful with `connect_mode = "on_demand"`. |
-| `splash_pattern` (alias `pattern`) | `Snow` | Placeholder look: `Snow`, `Smpte`, `Black`, `White`, `Red`, `Green`, … |
+| `use_splash` (alias `splash`) | `true` | Show the `splash_pattern` ("Stream not Ready") instead of a **404** in the brief window before the real stream factory is mounted (helps clients like Blue Iris that give up forever on a 404), and as a fallback if the video codec can't be determined. **Not** a live "connecting" placeholder — it does not play during a connect and transition to the real stream. |
+| `splash_pattern` (alias `pattern`) | `Snow` | Splash look: `Snow`, `Smpte`, `Black`, `White`, `Red`, `Green`, … |
 | `push_notifications` (aliases `push`, `push_noti`) | `true` | **No-op.** The FCM wake-on-motion API was removed by Google, and the `pushnoti` build feature is off by default — so this setting currently does nothing regardless of value. |
 
 Global (top-level) options: `bind` (default `0.0.0.0`), the RTSP port (default
