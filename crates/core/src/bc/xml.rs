@@ -84,9 +84,6 @@ pub struct BcXml {
     /// Recieved on request for a users persmissions/capabilitoes
     #[serde(rename = "AbilityInfo", skip_serializing_if = "Option::is_none")]
     pub ability_info: Option<AbilityInfo>,
-    /// Recieved on request for a users persmissions/capabilitoes
-    #[serde(rename = "PushInfo", skip_serializing_if = "Option::is_none")]
-    pub push_info: Option<PushInfo>,
     /// Recieved on request for a link type
     #[serde(rename = "LinkType", skip_serializing_if = "Option::is_none")]
     pub link_type: Option<LinkType>,
@@ -795,19 +792,6 @@ pub struct AbilityInfoSubModule {
     /// The comma seperated list of permissions like this: `general_rw, norm_rw, version_ro`
     #[serde(rename = "abilityValue")]
     pub ability_value: String,
-}
-
-/// PushInfo XML
-#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
-pub struct PushInfo {
-    /// The token from FCM registration
-    pub token: String,
-    /// The phone type, known values: `reo_iphone`
-    #[serde(rename = "phoneType")]
-    pub phone_type: String,
-    /// A client ID, seems to be an all CAPS MD5 hash of something
-    #[serde(rename = "clientID")]
-    pub client_id: String,
 }
 
 /// The Link Type contains the type of connection present

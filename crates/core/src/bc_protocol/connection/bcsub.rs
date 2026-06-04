@@ -3,8 +3,6 @@ use crate::bcmedia::codex::BcMediaCodex;
 use crate::{bc::model::*, bcmedia::model::*, Error, Result};
 use futures::stream::{Stream, TryStreamExt};
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use tokio::sync::mpsc::Receiver;
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tokio_util::codec::FramedRead;
@@ -14,25 +12,6 @@ pub struct BcSubscription<'a> {
     rx: ReceiverStream<Result<Bc>>,
     msg_num: Option<u32>,
     conn: &'a BcConnection,
-}
-
-pub struct BcStream<'a> {
-    rx: &'a mut ReceiverStream<Result<Bc>>,
-}
-
-impl Unpin for BcStream<'_> {}
-
-impl Stream for BcStream<'_> {
-    type Item = Result<Bc>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Bc>>> {
-        let mut this = self.as_mut();
-        match Pin::new(&mut this.rx).poll_next(cx) {
-            Poll::Ready(Some(bc)) => Poll::Ready(Some(bc)),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
 }
 
 impl<'a> BcSubscription<'a> {
@@ -69,11 +48,6 @@ impl<'a> BcSubscription<'a> {
             }
         }
         bc
-    }
-
-    #[allow(unused)]
-    pub fn bc_stream(&'_ mut self) -> BcStream<'_> {
-        BcStream { rx: &mut self.rx }
     }
 
     pub fn payload_stream(&'_ mut self) -> impl Stream<Item = IoResult<Vec<u8>>> + '_ {

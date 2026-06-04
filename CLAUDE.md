@@ -49,10 +49,11 @@ cargo run -- mqtt-rtsp --config=neolink.toml     # RTSP + MQTT control together
 - Root crate (`src/`) — the `neolink` binary: CLI, config, RTSP/MQTT servers, and the
   per-camera orchestration layer (`src/common/`).
 - `crates/core` (`neolink_core`) — the reverse-engineered BC protocol library. The
-  `BcCamera` type and all camera operations live here; everything else depends on it.
-- `crates/decoder`, `crates/mailnoti` — supporting crates (media decoding,
-  email-based notifications). (FCM push notifications were removed — the API is dead.)
+  `BcCamera` type and all camera operations live here; it's the only workspace member
+  besides the root binary, which depends on it.
 - `dissector/` — Wireshark Lua dissector for the BC protocol (debugging aid, not built).
+  (The `pushnoti`, `mailnoti`, and `decoder` auxiliary crates were removed — push
+  notifications are dead, the others were unused experiments/dev tools.)
 
 ## Architecture: the camera ownership model
 

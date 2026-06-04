@@ -134,15 +134,6 @@ impl BcConnection {
         Ok(())
     }
 
-    /// Stop a message handler created using [`handle_msg`]
-    #[allow(dead_code)] // Currently unused but added for future use
-    pub async fn unhandle_msg(&self, msg_id: u32) -> Result<()> {
-        self.poll_commander
-            .send(PollCommand::RemoveHandler(msg_id))
-            .await?;
-        Ok(())
-    }
-
     /// Some times we want to wait for a reply on a new message ID
     /// to do this we wait for the next packet with a certain ID
     /// grab it's message ID and then subscribe to that ID
@@ -205,7 +196,6 @@ impl Drop for BcConnection {
 enum PollCommand {
     Bc(Box<Result<Bc>>),
     AddHandler(u32, Arc<MsgHandler>),
-    RemoveHandler(u32),
     AddSubscriber(u32, Option<u16>, Sender<Result<Bc>>),
     Disconnect,
 }
@@ -215,7 +205,6 @@ impl std::fmt::Debug for PollCommand {
         match self {
             PollCommand::Bc(_) => f.write_str("PollCommand::Bc"),
             PollCommand::AddHandler(_, _) => f.write_str("PollCommand::AddHandler"),
-            PollCommand::RemoveHandler(_) => f.write_str("PollCommand::RemoveHandler"),
             PollCommand::AddSubscriber(_, _, _) => f.write_str("PollCommand::AddSubscriber"),
             PollCommand::Disconnect => f.write_str("PollCommand::Disconnect"),
         }
@@ -368,9 +357,6 @@ impl Poller {
                             return Err(Error::SimultaneousSubscriptionId { msg_id });
                         }
                     };
-                }
-                PollCommand::RemoveHandler(msg_id) => {
-                    self.subscribers.id.remove(&msg_id);
                 }
                 PollCommand::AddSubscriber(msg_id, msg_num, tx) => {
                     match self

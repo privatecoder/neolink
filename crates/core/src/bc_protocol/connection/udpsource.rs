@@ -48,23 +48,6 @@ pub(crate) struct UdpSource {
 }
 
 impl UdpSource {
-    #[allow(unused)]
-    pub(crate) async fn new<T: Into<String>, U: Into<String>>(
-        addr: SocketAddr,
-        client_id: i32,
-        camera_id: i32,
-        username: T,
-        password: Option<U>,
-        debug: bool,
-        gap_skip_wait: Duration,
-    ) -> Result<Self> {
-        let stream = Arc::new(connect().await?);
-
-        Self::new_from_socket(
-            stream, addr, client_id, camera_id, username, password, debug, gap_skip_wait,
-        )
-        .await
-    }
     pub(crate) async fn new_from_discovery<T: Into<String>, U: Into<String>>(
         discovery: DiscoveryResult,
         username: T,
@@ -162,18 +145,6 @@ pub(crate) struct BcUdpSource {
 }
 
 impl BcUdpSource {
-    #[allow(unused)]
-    pub(crate) async fn new(addr: SocketAddr) -> Result<Self> {
-        let stream = Arc::new(connect().await?);
-
-        Self::new_from_socket(stream, addr).await
-    }
-
-    #[allow(unused)]
-    pub(crate) async fn new_from_discovery(discovery: DiscoveryResult) -> Result<Self> {
-        Self::new_from_socket(discovery.socket, discovery.addr).await
-    }
-
     pub(crate) async fn new_from_socket(stream: Arc<UdpSocket>, addr: SocketAddr) -> Result<Self> {
         Ok(Self {
             inner: Box::pin(UdpFramed::new(stream, BcUdpCodex::new())),
@@ -218,15 +189,6 @@ impl Sink<(BcUdp, SocketAddr)> for BcUdpSource {
             fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>>;
         }
     }
-}
-
-#[allow(dead_code)]
-#[derive(Debug)]
-enum State {
-    Normal,   // Normal recieve
-    Flushing, // Used to send ack packets and things in the buffer
-    Closed,   // Used to shutdown
-    YieldNow, // Used to ensure we rest between polling packets so as to not starve the runtime
 }
 
 #[derive(Default)]
@@ -906,27 +868,6 @@ fn set_udp_buffer_sizes(socket: &std::net::UdpSocket, size: usize) {
 }
 
 /// Helper to create a UdpStream
-async fn connect() -> Result<UdpSocket> {
-    let mut ports: Vec<u16> = (53500..54000).collect();
-    {
-        let mut rng = thread_rng();
-        ports.shuffle(&mut rng);
-        drop(rng); // Do not hold RNG over an await
-    }
-
-    let addrs: Vec<_> = ports
-        .iter()
-        .map(|&port| SocketAddr::from(([0, 0, 0, 0], port)))
-        .collect();
-    let socket = UdpSocket::bind(&addrs[..]).await?;
-    let std_socket = socket.into_std()?;
-    std_socket.set_nonblocking(true)?;
-    // Larger UDP buffers help high-bitrate streams avoid packet loss.
-    const UDP_BUFFER_SIZE: usize = 4 * 1024 * 1024;
-    set_udp_buffer_sizes(&std_socket, UDP_BUFFER_SIZE);
-
-    Ok(UdpSocket::from_std(std_socket)?)
-}
 
 async fn connect_try_port(port: u16) -> Result<UdpSocket> {
     let mut ports: Vec<u16> = (53500..54000).collect();

@@ -34,7 +34,14 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
   are ignored.
 - **Internal dead code cleanup** — removed an orphaned (never-compiled) `adpcm.rs`
   module, a commented-out experimental `build_mpegts` pipeline and its unused
-  helpers, and several unused functions/fields/commands in the binary.
+  helpers, and several unused functions/fields/commands in the binary. In
+  `neolink_core` removed the dead `pushinfo` FCM-registration module (and its
+  `PushInfo` XML wire struct), unused UDP/connection constructors and an unused
+  `State` enum, the unused `BcStream`/`bc_stream`, `unhandle_msg`, and a speculative
+  `keep_alive_relay`.
+- **Unused auxiliary crates** — removed `crates/decoder` (a standalone AES-decode
+  dev tool) and `crates/mailnoti` (an incomplete email-notification experiment);
+  neither was used by the binary. Also removed the stale `kubernetes/` manifests.
 - **`stream_tuning` (`bitrate_kbps` / `interframe_speed`)** — these only resized
   the internal video buffer and didn't change the camera's encode or skip stream
   detection; `buffer_duration` already covers buffer sizing more directly. Removed
