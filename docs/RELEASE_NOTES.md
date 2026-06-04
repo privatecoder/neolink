@@ -1,5 +1,23 @@
 # Release Notes
 
+## 0.6.4-beta.13
+
+### Highlight: audio/video sync
+
+Audio drifted ahead of video (about 0.4 s on the main stream, more on the sub
+stream) and the offset was effectively permanent. The cause was timestamping every
+frame by its *arrival* time while the audio path also accumulated frame durations —
+so when the camera delivered media in bursts (which it does), the audio timeline ran
+ahead of video.
+
+Timestamps now come from a single media clock instead of arrival time:
+- **Video** uses the camera's own capture timestamp carried on each frame.
+- **Audio** (which has no timestamp) advances by its own frame durations, anchored
+  once to the video clock.
+
+Both then advance at true media rate from one origin, so they stay in sync and
+playback is smooth even under bursty delivery. A/V drift now stays near zero.
+
 ## 0.6.4-beta.12
 
 ### Highlight: full-bitrate direct P2P streaming

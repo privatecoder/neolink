@@ -3,6 +3,25 @@
 All notable changes to this fork are documented here.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.6.4-beta.13] - 2026-06-04
+
+### Fixed
+
+- **Audio/video drift eliminated.** Audio ran progressively/persistently ahead of
+  video (~0.4 s on the main stream) because every media frame was timestamped by
+  its *arrival* time, and the audio path additionally accumulated frame durations,
+  so during bursty network delivery the audio PTS raced ahead of video. Timestamps
+  are now derived from a single media clock:
+  - **Video** uses the camera's own per-frame capture timestamp
+    (`BcMediaIframe`/`BcMediaPframe.microseconds`), rebased to a monotonic PTS
+    (wrap-safe; a camera clock reset is detected and skipped). The catch-up/drop
+    paths advance this clock too, so it stays continuous across dropped frames.
+  - **Audio** (which carries no timestamp) rides a content-clock (advancing by each
+    frame's own duration) that is anchored once to the video camera-clock, keeping
+    audio smooth *and* aligned with video regardless of bursty arrival.
+
+  A/V drift now stays near zero with no playback stalls.
+
 ## [0.6.4-beta.12] - 2026-06-04
 
 ### Fixed

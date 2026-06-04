@@ -143,6 +143,17 @@ touching `crates/core/src/bc_protocol/connection/udpsource.rs`:
 - The displayed version comes from `git describe --tags` (build.rs), not just the
   `Cargo.toml` version — tag releases for the version string to be meaningful.
 
+## A/V timestamping (RTSP factory)
+
+In `src/rtsp/factory.rs::send_to_sources`, PTS must come from a **single media
+clock**, never arrival time. Video uses the camera's per-frame `microseconds`
+(`video_ts_from_camera`, wrap-safe); audio (no timestamp) uses a `+ duration`
+content-clock anchored once to the video clock (`aud_anchored`). Do NOT switch
+audio to arrival-based timestamps — audio is constant-rate but arrives bursty, so
+arrival-timed PTS destabilizes the pipeline and causes periodic stalls (tried, fails).
+The catch-up/backpressure drop paths must keep advancing the video clock
+(`video_microseconds` helper) so it stays continuous across dropped frames.
+
 ## Config
 
 A TOML `--config` file is mandatory for every subcommand. The `Config`/`CameraConfig`

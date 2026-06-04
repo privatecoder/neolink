@@ -755,7 +755,10 @@ pub(super) async fn make_factory(
                                     && is_video(&timed.media)
                                     && !is_video_keyframe(&timed.media)
                                 {
-                                    vid_ts = stats.video_ts_from_recv(timed.recv_at, vid_ts);
+                                    // Keep the camera-clock advancing even for dropped frames.
+                                    if let Some(us) = video_microseconds(&timed.media) {
+                                        vid_ts = stats.video_ts_from_camera(us);
+                                    }
                                     stats.p_dropped_backpressure += 1;
                                     continue;
                                 }
@@ -764,7 +767,9 @@ pub(super) async fn make_factory(
                                     in_backpressure && matches!(timed.media, BcMedia::Pframe(_));
                                 if should_drop_p {
                                     stats.p_dropped_backpressure += 1;
-                                    vid_ts = stats.video_ts_from_recv(timed.recv_at, vid_ts);
+                                    if let Some(us) = video_microseconds(&timed.media) {
+                                        vid_ts = stats.video_ts_from_camera(us);
+                                    }
                                     continue;
                                 }
 
@@ -845,6 +850,15 @@ fn is_video(m: &BcMedia) -> bool {
     matches!(m, BcMedia::Iframe(_) | BcMedia::Pframe(_))
 }
 
+/// The camera's capture timestamp (microseconds) for a video frame, if present.
+fn video_microseconds(m: &BcMedia) -> Option<u32> {
+    match m {
+        BcMedia::Iframe(f) => Some(f.microseconds),
+        BcMedia::Pframe(f) => Some(f.microseconds),
+        _ => None,
+    }
+}
+
 fn send_to_sources(
     data: BcMedia,
     stream_label: &str,
@@ -870,11 +884,16 @@ fn send_to_sources(
             if let Some(recv_at) = recv_at {
                 stats.record_aac_gap(recv_at);
             }
-            let ts_us = recv_at
-                .map(|t| stats.audio_ts_from_recv(t, *aud_ts))
-                .unwrap_or(*aud_ts);
             let dur = Duration::from_micros(info.duration_us as u64);
             if let Some(aud_src) = aud_src.as_ref() {
+                // Audio carries no camera timestamp: ride a content-clock (advance by
+                // the frame's own duration), anchored once to the video camera-clock so
+                // it stays aligned with video without following bursty network arrival.
+                if !stats.aud_anchored {
+                    stats.aud_anchored = true;
+                    *aud_ts = stats.last_vid_pts_us;
+                }
+                let ts_us = *aud_ts;
                 log::debug!("Sending AAC: {:?}", Duration::from_micros(ts_us));
                 send_to_appsrc(
                     aud_src,
@@ -887,9 +906,9 @@ fn send_to_sources(
                     aud_pacer,
                 )?;
                 stats.aud_pushed += 1;
+                *aud_ts = ts_us + info.duration_us as u64;
             }
             stats.record_aac(&info, aac_len);
-            *aud_ts = ts_us + info.duration_us as u64;
         }
         BcMedia::Adpcm(adpcm) => {
             let duration = adpcm
@@ -897,9 +916,11 @@ fn send_to_sources(
                 .expect("Could not calculate ADPCM duration");
             let dur = Duration::from_micros(duration as u64);
             if let Some(aud_src) = aud_src.as_ref() {
-                let ts_us = recv_at
-                    .map(|t| stats.audio_ts_from_recv(t, *aud_ts))
-                    .unwrap_or(*aud_ts);
+                if !stats.aud_anchored {
+                    stats.aud_anchored = true;
+                    *aud_ts = stats.last_vid_pts_us;
+                }
+                let ts_us = *aud_ts;
                 log::trace!("Sending ADPCM: {:?}", Duration::from_micros(ts_us));
                 send_to_appsrc(
                     aud_src,
@@ -916,14 +937,14 @@ fn send_to_sources(
                 return Ok(());
             }
         }
-        BcMedia::Iframe(BcMediaIframe { data, .. }) => {
+        BcMedia::Iframe(BcMediaIframe {
+            data, microseconds, ..
+        }) => {
             if let Some(vid_src) = vid_src.as_ref() {
                 if let Some(recv_at) = recv_at {
                     stats.record_video_gap(recv_at);
                 }
-                let ts_us = recv_at
-                    .map(|t| stats.video_ts_from_recv(t, *vid_ts))
-                    .unwrap_or(*vid_ts);
+                let ts_us = stats.video_ts_from_camera(microseconds);
                 let frame_dur =
                     Duration::from_micros(1_000_000u64 / stream_config.fps.max(1) as u64);
                 log::trace!("Sending I-frame: {:?}", Duration::from_micros(ts_us));
@@ -942,7 +963,9 @@ fn send_to_sources(
                 return Ok(());
             }
         }
-        BcMedia::Pframe(BcMediaPframe { data, .. }) => {
+        BcMedia::Pframe(BcMediaPframe {
+            data, microseconds, ..
+        }) => {
             if let Some(vid_src) = vid_src.as_ref() {
                 // Intelligent frame dropping: drop P-frames when buffer is getting full
                 // to prioritize I-frames (keyframes) which can restart the stream
@@ -951,9 +974,7 @@ fn send_to_sources(
                 if let Some(recv_at) = recv_at {
                     stats.record_video_gap(recv_at);
                 }
-                let ts_us = recv_at
-                    .map(|t| stats.video_ts_from_recv(t, *vid_ts))
-                    .unwrap_or(*vid_ts);
+                let ts_us = stats.video_ts_from_camera(microseconds);
                 let frame_dur =
                     Duration::from_micros(1_000_000u64 / stream_config.fps.max(1) as u64);
 
@@ -1683,7 +1704,15 @@ struct StreamStats {
     aud_gap_max_us: u64,
 
     vid_gap_last_instant: Option<std::time::Instant>,
-    media_base_instant: Option<std::time::Instant>,
+
+    // Camera-clock timestamping. Video frames carry the camera's own capture
+    // timestamp (microseconds, u32, wraps ~every 71 min); we rebase it to a
+    // monotonic PTS. Audio carries no timestamp, so it rides a content-clock
+    // (+frame duration) anchored to the video camera-clock on the first audio frame.
+    vid_cam_last: Option<u32>,
+    vid_pts_us: u64,
+    last_vid_pts_us: u64,
+    aud_anchored: bool,
 }
 
 impl StreamStats {
@@ -1720,7 +1749,10 @@ impl StreamStats {
             aud_gap_max_us: 0,
 
             vid_gap_last_instant: None,
-            media_base_instant: None,
+            vid_cam_last: None,
+            vid_pts_us: 0,
+            last_vid_pts_us: 0,
+            aud_anchored: false,
         }
     }
 
@@ -1767,28 +1799,24 @@ impl StreamStats {
         None
     }
 
-    fn audio_ts_from_recv(&mut self, recv_at: std::time::Instant, current_ts: u64) -> u64 {
-        let base = self
-            .media_base_instant
-            .get_or_insert_with(|| {
-                recv_at
-                    .checked_sub(std::time::Duration::from_micros(current_ts))
-                    .unwrap_or(recv_at)
-            });
-        let ts_us = recv_at.duration_since(*base).as_micros() as u64;
-        ts_us.max(current_ts)
-    }
-
-    fn video_ts_from_recv(&mut self, recv_at: std::time::Instant, current_ts: u64) -> u64 {
-        let base = self
-            .media_base_instant
-            .get_or_insert_with(|| {
-                recv_at
-                    .checked_sub(std::time::Duration::from_micros(current_ts))
-                    .unwrap_or(recv_at)
-            });
-        let ts_us = recv_at.duration_since(*base).as_micros() as u64;
-        ts_us.max(current_ts)
+    /// Convert the camera's per-frame microsecond timestamp into a monotonic PTS
+    /// rebased so the first video frame is 0. The camera value is a `u32` that wraps
+    /// (~every 71 min), so we accumulate per-frame deltas (wrap-safe via
+    /// `wrapping_sub`) rather than subtracting an absolute base. Implausibly large
+    /// deltas (> 10 s) are treated as a camera clock reset and skipped, holding the
+    /// PTS steady rather than jumping. Also records the value as the anchor point for
+    /// the audio content-clock.
+    fn video_ts_from_camera(&mut self, micros: u32) -> u64 {
+        if let Some(last) = self.vid_cam_last {
+            let delta = micros.wrapping_sub(last) as u64;
+            if delta < 10_000_000 {
+                self.vid_pts_us = self.vid_pts_us.saturating_add(delta);
+            }
+            // else: implausible jump/reset -> hold PTS, just re-sync the reference below
+        }
+        self.vid_cam_last = Some(micros);
+        self.last_vid_pts_us = self.vid_pts_us;
+        self.vid_pts_us
     }
 
     fn aud_stats_snapshot(&self) -> AudStatsSnapshot {
