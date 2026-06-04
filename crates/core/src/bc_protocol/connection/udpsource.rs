@@ -283,6 +283,15 @@ struct UdpPayloadInner {
     stat_bytes_in: u64,
     stat_delivered: u64,
     stat_resends: u64,
+    // reorder/false-loss diagnostics: packets arriving ahead of the contiguous
+    // point force the selective-ACK to report "holes" the camera may read as loss
+    stat_reorder_events: u64,
+    stat_max_reorder_depth: u32,
+    stat_max_pending: u32,
+    // Receiver delivery-rate fed back to the camera in the ACK `maybe_latency`
+    // field: bytes received in the trailing ~1s, latched once per second. The
+    // camera's CUBIC sender uses it as its bandwidth estimate (see build_send_ack).
+    ack_recv_rate: u32,
     /// Offical Client does ack every 10ms if we don't also do this the camera
     /// seems to think we have a poor connection and will abort
     /// This `ack_interval` controls how ofen we do this
@@ -489,6 +498,10 @@ impl UdpPayloadInner {
             stat_bytes_in: 0,
             stat_delivered: 0,
             stat_resends: 0,
+            stat_reorder_events: 0,
+            stat_max_reorder_depth: 0,
+            stat_max_pending: 0,
+            ack_recv_rate: 0,
             resend_interval: interval(Duration::from_millis(500)), // Offical Client does resend every 500ms
             ack_latency: Default::default(),
             cancel,
@@ -559,7 +572,20 @@ impl UdpPayloadInner {
                                 self.stat_bytes_in += data.payload.len() as u64;
                                 if packet_id >= self.packets_want {
                                     // error!("packets_want: {}", this.packets_want);
+                                    // A packet arriving ahead of the contiguous point means
+                                    // earlier packets haven't arrived yet (reorder or loss),
+                                    // so the next selective-ACK will mark those as missing.
+                                    if packet_id > self.packets_want {
+                                        self.stat_reorder_events += 1;
+                                        let depth = packet_id - self.packets_want;
+                                        if depth > self.stat_max_reorder_depth {
+                                            self.stat_max_reorder_depth = depth;
+                                        }
+                                    }
                                     self.recieved.insert(packet_id, data.payload);
+                                    if self.recieved.len() as u32 > self.stat_max_pending {
+                                        self.stat_max_pending = self.recieved.len() as u32;
+                                    }
                                     self.ack_tx.send_replace(self.build_send_ack());
                                 }
                             }
@@ -603,8 +629,11 @@ impl UdpPayloadInner {
         if self.stat_last_report.elapsed() >= Duration::from_secs(1) {
             let win = self.stat_last_report.elapsed();
             let kbps = (self.stat_bytes_in as f64 * 8.0 / 1000.0) / win.as_secs_f64().max(0.001);
+            // Latch the trailing ~1s received-byte count as the delivery-rate we report
+            // to the camera in every ACK's `maybe_latency` field (bytes/second).
+            self.ack_recv_rate = self.stat_bytes_in.min(u32::MAX as u64) as u32;
             log::debug!(
-                "UDP HB: in_pkts={} in_kbps={:.0} delivered={} resends={} packets_want={} sent_unacked={} recieved_pending={} ack_latency_us={} since_delivery={:?} win={:?}",
+                "UDP HB: in_pkts={} in_kbps={:.0} delivered={} resends={} packets_want={} sent_unacked={} recieved_pending={} reorder_events={} max_reorder_depth={} max_pending={} ack_recv_rate={} ack_latency_us={} since_delivery={:?} win={:?}",
                 self.stat_pkts_in,
                 kbps,
                 self.stat_delivered,
@@ -612,6 +641,10 @@ impl UdpPayloadInner {
                 self.packets_want,
                 self.sent.len(),
                 self.recieved.len(),
+                self.stat_reorder_events,
+                self.stat_max_reorder_depth,
+                self.stat_max_pending,
+                self.ack_recv_rate,
                 self.ack_latency.get_value(),
                 self.last_delivery_at.elapsed(),
                 win,
@@ -620,6 +653,9 @@ impl UdpPayloadInner {
             self.stat_bytes_in = 0;
             self.stat_delivered = 0;
             self.stat_resends = 0;
+            self.stat_reorder_events = 0;
+            self.stat_max_reorder_depth = 0;
+            self.stat_max_pending = 0;
             self.stat_last_report = Instant::now();
         }
         log::trace!("recieved: {}", self.recieved.len());
@@ -658,24 +694,23 @@ impl UdpPayloadInner {
                 connection_id: self.camera_id,
                 packet_id: first_missing - 1, // Last we actually have is first_missing - 1
                 group_id: 0,
-                // Report zero latency to the camera.
+                // Receiver delivery-rate feedback (this field is NOT latency).
                 //
-                // This field feeds the camera's adaptive-bitrate / congestion control.
-                // A non-zero value makes the camera treat the link as poor and downshift
-                // to a low "fluent" floor (~340 kbps even on a 4 Mbps main stream over a
-                // healthy direct-P2P connection). The previous `AckLatency` value was also
-                // computed incorrectly: it measured the inter-arrival gap between the
-                // camera's Acks (i.e. how often the camera acks our near-zero uplink), not
-                // real link latency, producing a steady ~21 ms that permanently pinned the
-                // bitrate. Reporting 0 ("healthy link") lets the camera serve full bitrate.
-                // Genuine packet loss is still handled by the reliable-UDP layer (resend +
-                // gap-skip), so always-0 is safe on good links.
-                //
-                // TODO(adaptive): on genuinely lossy links a smarter signal could be fed
-                // here (e.g. raise it only when `recieved`/gap-skips indicate real
-                // congestion) instead of a constant 0. `AckLatency` is kept and logged in
-                // the UDP heartbeat (`ack_latency_us=`) for exactly that future use.
-                maybe_latency: 0,
+                // Proven from a packet capture of the official client: this carries the
+                // receiver's measured throughput = bytes received in the trailing ~1s,
+                // latched ~once per second. The camera's CUBIC rate controller uses it as
+                // its bandwidth estimate:
+                //   * 0                    -> no estimate; camera free-runs a conservative
+                //                             default (~1.9 Mbps on some models)
+                //   * a small/fixed value  -> camera believes the path is that slow and
+                //                             paces down to it (~340 kbps)
+                //   * the real measured rate -> estimate tracks reality and CUBIC ramps to
+                //                             full bitrate (the official app sends
+                //                             ~525 KB/s and sustains 4.2 Mbps)
+                // An earlier attempt sent bytes-per-100ms here (10x too small), which the
+                // camera read as a slow path and throttled — the unit must be bytes/SECOND.
+                // We report our own measured received-bytes/s (`ack_recv_rate`).
+                maybe_latency: self.ack_recv_rate,
                 payload: missing_ids,
             }
         } else {

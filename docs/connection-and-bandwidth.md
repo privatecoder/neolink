@@ -66,18 +66,68 @@ fallback used to look identical in the logs.
   forwards your media through Reolink's infrastructure. Its throughput depends on
   those servers and is outside Neolink's control; prefer P2P where possible.
 
-### The latency-feedback throttle (fixed in 0.6.4-beta.12)
+### `maybe_latency` is the bitrate lever (receiver-rate feedback)
 
-Every UDP ACK Neolink sends the camera carries a `maybe_latency` field that feeds
-the camera's adaptive-bitrate / congestion control. Neolink had been computing it
-from the inter-arrival gap between the camera's own ACKs (essentially "how often
-the camera acks our near-idle uplink"), not real link latency — yielding a steady
-~21 ms that the camera interpreted as a poor link and responded to by downshifting
-to a ~340 kbps floor. Neolink now reports `0` ("healthy link"), and the camera
-serves full bitrate. Real packet loss is still recovered by the reliable-UDP layer
-(retransmit + gap-skip), so this is safe on healthy links. On a genuinely lossy
-link a future refinement could report a real congestion signal instead of a
-constant `0`.
+Every UDP ACK Neolink sends carries a `maybe_latency` field. Despite the name it is
+**not latency** — it is the **receiver's measured throughput in bytes/second**, which
+the camera's CUBIC rate-controller consumes as its bandwidth estimate. Getting this
+field right is the whole difference between a stalling stream and a full-rate one,
+and its history is the P2P-bitrate investigation in three acts:
+
+- **Pre-`beta.12`:** Neolink computed it from the inter-arrival gap between the
+  camera's ACKs (a steady ~21 ms), which the camera read as a near-zero delivery
+  rate and pinned the stream to a **~340 kbps floor**.
+- **`beta.12`:** set it to a constant `0`. That cleared the 340 kbps floor, but `0`
+  gives the camera *no* rate estimate, so it free-runs a **conservative default** —
+  full rate on some camera models, but on others (and on higher-RTT/remote paths)
+  it capped a 4 Mbit/s main stream at **~2 Mbit/s** (real-time ratio ~0.4 →
+  constant buffering), even though the official app pulled the full ~4.2 Mbit/s from
+  the *same* camera over a single connection.
+- **`beta.15` (fix):** Neolink now reports its **actual received bytes over the
+  trailing ~1 s**, latched ~once per second (`ack_recv_rate` in the heartbeat). The
+  camera's estimate tracks the real link and CUBIC ramps to full rate — a positive
+  feedback loop (more received → higher reported rate → camera sends faster). An
+  affected camera went from 1.9 Mbit/s / 0.38× to ~4.7 Mbit/s / 0.93×; an
+  already-fine camera is unchanged (no regression).
+
+Confirmed against a **packet capture of the official client**: its `maybe_latency`
+equals its measured receive rate at ratio ≈ 1.0 across the session, and freezes at
+the last 1-second sample when the stream stops (proving the ~1 Hz latch). The **unit
+matters** — an interim attempt reported bytes-per-**100 ms** (10× too small), which
+the camera read as a slow path and throttled; it must be bytes-per-**second**.
+
+How the camera's rate-controller reads the field:
+
+| reported `maybe_latency` | camera behaviour |
+|---|---|
+| `0` | no estimate → conservative default (full on some models, ~2 Mbit/s on others) |
+| a small/fixed value | believes the path is that slow → paces down to it (~340 kbps) |
+| **real measured bytes/s** | estimate tracks reality → ramps to full bitrate ✅ |
+
+Other facts established about this ACK (official-client disassembly + capture), none
+of which were the lever — recorded so they aren't re-investigated:
+
+- **`group_id` + `packet_id` are one 64-bit cumulative-ACK sequence**
+  (`full_seq = group_id·2³⁰ + packet_id`, base `0x40000000`;
+  `0xffffffff/0xffffffff` = "nothing acked yet"). Neolink hardcodes `group_id=0`,
+  correct only below ~1.07e9 packets (~31 days at 400 pps) — a latent correctness
+  bug to fix separately.
+- The **selective-ACK payload** is the same truth-map Neolink already sends (empty
+  in steady state — no loss). The `0x2a87cf3a` block once suspected as an ACK
+  extension is actually a **standalone encrypted auth/handshake** packet at session
+  start, not flow control. **ACK cadence** (~12 ms in the official client) is not the
+  lever either — event-driven per-packet ACKs changed nothing.
+- Also ruled out by measurement: camera uplink ceiling (app gets 4.2), path (same on
+  direct P2P *and* relay), a receiver window (no such field on this wire),
+  reordering/loss (`reorder_events=0`, in-order, lossless).
+
+`UdpAck` wire format (`crates/core/src/bcudp/{ser,de}.rs`):
+
+```
+magic 0x2a87cf20 | connection_id i32 | unknown_a u32 (0) |
+group_id u32 (hi 30 bits of seq) | packet_id u32 (lo 30 bits of seq) |
+maybe_latency u32 (receiver bytes/sec) | payload_size u32 | payload (selective-ACK bitmap)
+```
 
 ## Diagnostics
 
@@ -88,8 +138,9 @@ RUST_LOG='info,neolink_core::bc_protocol::connection::udpsource=debug'
 ```
 
 ```
-UDP HB: in_pkts=410 in_kbps=4086 delivered=410 resends=0 packets_want=1702 \
-        sent_unacked=0 recieved_pending=0 ack_latency_us=22776 since_delivery=21ms win=1.00s
+UDP HB: in_pkts=485 in_kbps=4817 delivered=485 resends=0 packets_want=10846 \
+        sent_unacked=0 recieved_pending=0 reorder_events=0 max_reorder_depth=0 \
+        max_pending=1 ack_recv_rate=606755 ack_latency_us=22776 since_delivery=21ms win=1.00s
 ```
 
 | Field | Meaning |
@@ -100,7 +151,17 @@ UDP HB: in_pkts=410 in_kbps=4086 delivered=410 resends=0 packets_want=1702 \
 | `packets_want` | Next contiguous packet id awaited. Frozen = stalled awaiting a packet. |
 | `sent_unacked` | Our outbound packets the camera hasn't acked. |
 | `recieved_pending` | Packets buffered ahead of a gap (non-zero ⇒ a missing packet is blocking delivery). |
-| `ack_latency_us` | The (legacy) computed latency value — **logged only**; Neolink now sends `0` to the camera. |
+| `reorder_events` | Packets that arrived ahead of the contiguous point this second (would force selective-ACK holes). `0` = perfectly in-order. |
+| `max_reorder_depth` | Largest gap (in packets) between an out-of-order arrival and `packets_want`. |
+| `max_pending` | Peak depth of the reassembly buffer this second. `1` = each packet delivered immediately (in-order). |
+| `ack_recv_rate` | Bytes received in the trailing ~1 s — the value reported to the camera in `maybe_latency` (its bitrate ramps to track this). |
+| `ack_latency_us` | The (legacy) computed latency value — **logged only**, NOT sent to the camera (`maybe_latency` carries `ack_recv_rate` instead). |
+
+> **Reading throughput problems:** if `in_kbps` is stuck below the stream's
+> configured bitrate while `resends=0`, `recieved_pending=0`, and `reorder_events=0`
+> (clean, in-order, lossless), check that `ack_recv_rate` is tracking the real
+> receive rate (and not stuck near 0) — a low/zero value tells the camera to throttle
+> (see "`maybe_latency` is the bitrate lever" above).
 
 ## Tuning for jitter / loss
 

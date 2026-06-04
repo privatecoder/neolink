@@ -129,13 +129,22 @@ transport diagnostics.
 These bit hard during the P2P-bitrate investigation; keep them in mind when
 touching `crates/core/src/bc_protocol/connection/udpsource.rs`:
 
-- **`maybe_latency` drives the camera's adaptive bitrate.** Every UDP ACK Neolink
-  sends carries a `maybe_latency` field the camera reads as a link-quality signal.
-  A non-zero value makes the camera downshift hard (a 4 Mbit/s stream collapses to
-  ~340 kbps even over a loss-free direct-P2P link). Neolink reports `0`
-  ("healthy"); do not "restore" a computed value here without understanding this.
-  The legacy `AckLatency` was computed wrong (ACK inter-arrival, not RTT) and is
-  retained only for the heartbeat log / a future loss-aware signal.
+- **`maybe_latency` is the camera's bitrate lever — report your measured
+  received-bytes/second there, not `0`.** Despite the name it is NOT latency: it is
+  the receiver's measured throughput (bytes/s) that the camera's CUBIC uses as its
+  bandwidth estimate. History: a miscomputed ACK-inter-arrival value pinned the
+  bitrate to ~340 kbps (pre-beta.12); beta.12 set it to `0`, which cleared that
+  floor but left the camera on a conservative default that capped some models /
+  remote paths at ~2 Mbit/s of a 4 Mbit/s feed; **beta.15 reports the real
+  received-bytes-per-~1s** (`ack_recv_rate`, latched ~1 Hz in `build_send_ack`),
+  letting CUBIC ramp to full rate (an affected camera: 1.9→4.7 Mbit/s; others
+  unchanged). Pitfalls if you touch this: the unit is bytes/**second** (a
+  bytes/100 ms value is 10× too small and throttles); `0` or any constant
+  under-reports and caps the rate; verified against an official-client packet
+  capture (ratio ≈ 1.0). The legacy `AckLatency` (ACK inter-arrival, not RTT) is now
+  heartbeat-log-only. Full writeup: `docs/connection-and-bandwidth.md`
+  "`maybe_latency` is the bitrate lever" and `docs/reolink.md` "RDT / p2p_udt flow
+  control".
 - **`release_max_level_debug`** (in root `Cargo.toml`'s `log` dependency) compiles
   **all `log::trace!` out of release builds** — including Docker. Diagnostics that
   must survive release use `log::debug!`. The per-second `UDP HB:` heartbeat in

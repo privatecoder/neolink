@@ -58,11 +58,45 @@
 - No native calls matching `SetEnc*` / `IFramePreview*` observed in logs.
 
 ## Transport / Buffer Hints
-- No recv window / buffer / queue hints were surfaced by SDK logs during runs.
+- High-level SDK JS logs surface no recv window / buffer / queue hints; the flow
+  control lives in `libBCSDKWrapper.dylib`.
 - Fragmentation fields in DATA_FRAME_DESC were not exposed (`fragFields=NA`).
+
+## RDT / p2p_udt flow control (the throughput governor — solved)
+The camera is the reliable-transport **sender** running **CUBIC**; its rate ramps
+off receiver feedback in the **p2p_udt ACK** (same packet as Neolink's `UdpAck`,
+magic `0x2a87cf20`). Established from the official client's disassembly + a packet
+capture:
+
+- **`maybe_latency` (off 0x14) is the bitrate lever — it is the receiver's measured
+  throughput in BYTES/SECOND, not latency.** The camera's CUBIC uses it as its
+  bandwidth estimate. Capture proof: in the official client this field tracks the
+  measured receive rate at ratio ≈ 1.0 (~525 KB/s at full 4.2 Mbit/s) and freezes at
+  the last 1-second sample when the stream stops (a ~1 Hz latch).
+  - `0` → no estimate → conservative default (full on some models, ~2 Mbit/s on
+    others); a small constant → camera paces down to it (~340 kbps); the **real
+    measured bytes/s** → CUBIC ramps to full rate. **Neolink reports its own
+    received-bytes-per-~1s** (fixed in 0.6.4-beta.15). Unit is bytes/**second** — a
+    bytes/100 ms value is 10× too small and throttles.
+- **Cumulative ACK** = `group_id·2³⁰ + packet_id` (64-bit seq, base `0x40000000`;
+  `0xffffffff/0xffffffff` = nothing acked). **Selective ACK** = the payload truth-map
+  (same as Neolink sends; empty when lossless).
+- `RDT_Set_Max_Pending_ACK_Number` exists in the SDK but lives in a *different*
+  module and is **not** on this p2p_udt ACK wire — there is no window field here.
+- The `0x2a87cf3a` packet is a **standalone encrypted auth/handshake** at session
+  start (not an ACK extension, not flow control). ACK cadence (~12 ms) is not a
+  lever.
+
+Full writeup, the three-act history, and the ruled-out hypotheses are in
+[connection-and-bandwidth.md](connection-and-bandwidth.md) → "`maybe_latency` is the
+bitrate lever".
 
 ## Practical Implications for Rust P2P Implementation
 - **Main stream is bursty** with very large I-frame bursts (200-ish packets). Reassembly limits must accommodate ~240 KB frames.
 - **Sub stream is mostly tiny** with periodic larger frames (~17 KB). Easier to reassemble.
 - Ensure relay map / DMAP phase succeeds ("Q ok" to relay server), but do not assume relay path is used; direct P2P may carry the stream.
 - Use SongP2P detail/debug to match relay servers and direct peer addresses.
+- **Report your measured received-bytes/second in ACK `maybe_latency`** (latched ~1
+  Hz), not `0` and not a constant — that is what lets the camera's CUBIC ramp a
+  high-bitrate stream to full rate. It is the receiver's job to feed the sender a
+  truthful delivery-rate estimate.
