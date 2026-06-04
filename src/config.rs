@@ -100,51 +100,6 @@ pub(crate) enum StreamConfig {
     Extern,
 }
 
-#[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq, Default)]
-pub(crate) struct StreamTuningConfig {
-    #[validate(nested)]
-    #[serde(default)]
-    pub(crate) main: Option<StreamTuning>,
-    #[validate(nested)]
-    #[serde(default)]
-    pub(crate) sub: Option<StreamTuning>,
-    #[validate(nested)]
-    #[serde(default)]
-    pub(crate) extern_stream: Option<StreamTuning>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq)]
-pub(crate) struct StreamTuning {
-    #[validate(range(
-        min = 1,
-        max = 100000,
-        message = "Invalid stream bitrate (kbps)",
-        code = "stream_bitrate_kbps"
-    ))]
-    #[serde(default)]
-    pub(crate) bitrate_kbps: Option<u32>,
-
-    #[validate(range(
-        min = 1,
-        max = 4,
-        message = "Invalid interframe speed (1-4)",
-        code = "interframe_speed"
-    ))]
-    #[serde(default)]
-    pub(crate) interframe_speed: Option<u8>,
-}
-
-#[cfg(feature = "gstreamer")]
-impl StreamTuningConfig {
-    pub(crate) fn for_stream(&self, stream: StreamKind) -> Option<&StreamTuning> {
-        match stream {
-            StreamKind::Main => self.main.as_ref(),
-            StreamKind::Sub => self.sub.as_ref(),
-            StreamKind::Extern => self.extern_stream.as_ref(),
-        }
-    }
-}
-
 impl StreamConfig {
     #[cfg(feature = "gstreamer")]
     pub(crate) fn as_stream_kinds(&self) -> Vec<StreamKind> {
@@ -236,10 +191,6 @@ pub(crate) struct CameraConfig {
     /// How long to wait for missing UDP packets before skipping (ms).
     #[serde(default, alias = "udp_gap_skip_ms")]
     pub(crate) udp_gap_skip_ms: Option<u64>,
-
-    #[validate(nested)]
-    #[serde(default)]
-    pub(crate) stream_tuning: StreamTuningConfig,
 
     #[validate(range(
         min = 0,

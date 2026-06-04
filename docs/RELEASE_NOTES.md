@@ -21,6 +21,11 @@ keep working unchanged; set `connect_mode = "on_demand"` on the cameras you want
 to behave the old way. All the stream/bitrate/caching fixes from recent releases
 apply to both modes. See the README "Connection Modes" section.
 
+Also removed the `stream_tuning` (`bitrate_kbps` / `interframe_speed`) settings:
+they only resized neolink's internal video buffer (not the camera's encode, and
+they did not skip stream detection), and `buffer_duration` already covers buffer
+sizing. Configs that still contain `stream_tuning` are simply ignored.
+
 ## 0.6.4-beta.13
 
 ### Highlight: audio/video sync

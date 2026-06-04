@@ -17,12 +17,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
-use crate::{
-    common::NeoInstance,
-    config::StreamTuning,
-    rtsp::gst::NeoMediaFactory,
-    AnyResult,
-};
+use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, TrySendError};
@@ -69,14 +64,12 @@ struct StreamConfig {
     vid_type: Option<VideoType>,
     aud_type: Option<AudioType>,
     buffer_duration_ms: u64,
-    interframe_speed: u8,
 }
 impl StreamConfig {
     async fn new(
         instance: &NeoInstance,
         name: StreamKind,
         buffer_duration_ms: u64,
-        tuning: Option<&StreamTuning>,
     ) -> AnyResult<Self> {
         let (resolution, bitrate, fps, fps_table, bitrate_table) = instance
             .run_passive_task(|cam| {
@@ -129,17 +122,6 @@ impl StreamConfig {
             })
             .await?;
 
-        let mut bitrate = bitrate;
-        let mut interframe_speed = 1u8;
-        if let Some(tuning) = tuning {
-            if let Some(override_kbps) = tuning.bitrate_kbps {
-                bitrate = override_kbps.saturating_mul(1024);
-            }
-            if let Some(speed) = tuning.interframe_speed {
-                interframe_speed = speed.clamp(1, 4);
-            }
-        }
-
         Ok(StreamConfig {
             resolution,
             bitrate,
@@ -149,7 +131,6 @@ impl StreamConfig {
             vid_type: None,
             aud_type: None,
             buffer_duration_ms,
-            interframe_speed,
         })
     }
 
@@ -265,23 +246,8 @@ pub(super) async fn make_factory(
                             stream,
                         };
 
-                        let tuning = config.stream_tuning.for_stream(stream);
-                        let mut stream_config = StreamConfig::new(
-                            &camera,
-                            stream,
-                            config.buffer_duration,
-                            tuning,
-                        )
-                        .await?;
-                        if let Some(tuning) = tuning {
-                            if tuning.bitrate_kbps.is_some() || tuning.interframe_speed.is_some() {
-                                log::info!(
-                                    "{name}::{stream}: Stream tuning overrides: bitrate_kbps={:?}, interframe_speed={:?}",
-                                    tuning.bitrate_kbps,
-                                    tuning.interframe_speed
-                                );
-                            }
-                        }
+                        let mut stream_config =
+                            StreamConfig::new(&camera, stream, config.buffer_duration).await?;
                         if let Some(cached) = cached_stream_types(&cache_key).await {
                             if cached.vid_type.is_some() || cached.aud_type.is_some() {
                                 log::info!(
@@ -374,11 +340,10 @@ pub(super) async fn make_factory(
 
                         let sizing_bytes = buffer_size_bytes(&stream_config);
                         log::info!(
-                            "{name}::{stream}: Stream sizing: bitrate={}bps fps={} buffer_ms={} interframe_speed={} -> buffer_bytes={}",
+                            "{name}::{stream}: Stream sizing: bitrate={}bps fps={} buffer_ms={} -> buffer_bytes={}",
                             stream_config.bitrate,
                             stream_config.fps,
                             stream_config.buffer_duration_ms,
-                            stream_config.interframe_speed,
                             sizing_bytes
                         );
                         log::trace!("{name}::{stream}: Building the pipeline");
@@ -1951,20 +1916,16 @@ fn buffer_size_bytes(stream_config: &StreamConfig) -> u32 {
     let bytes_per_sec = (bitrate + 7) / 8;
     let buffer_ms = stream_config.buffer_duration_ms.max(1000);
     let base = bytes_per_sec.saturating_mul(buffer_ms) / 1000;
-    let max_frame_guess = max_frame_guess_bytes(stream_config, bytes_per_sec, fps);
+    let max_frame_guess = max_frame_guess_bytes(bytes_per_sec, fps);
     let target = base.max(max_frame_guess.saturating_mul(4)).max(128 * 1024);
     target.min(u32::MAX as u64) as u32
 }
 
-fn max_frame_guess_bytes(
-    stream_config: &StreamConfig,
-    bytes_per_sec: u64,
-    fps: u64,
-) -> u64 {
+fn max_frame_guess_bytes(bytes_per_sec: u64, fps: u64) -> u64 {
     let avg_frame = bytes_per_sec / fps.max(1);
-    let speed = stream_config.interframe_speed.max(1) as u64;
-    let factor = 6 + (speed.saturating_sub(1) * 2);
-    avg_frame.saturating_mul(factor)
+    // Headroom for bursty I-frames (~6x the average frame size).
+    const FACTOR: u64 = 6;
+    avg_frame.saturating_mul(FACTOR)
 }
 
 fn media_queue_capacity(stream_config: &StreamConfig) -> usize {

@@ -20,6 +20,15 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
   per camera for the old behaviour. The removed `idle_disconnect` flag is superseded
   by `connect_mode` + `idle_timeout_secs`.
 
+### Removed
+
+- **`stream_tuning` (`bitrate_kbps` / `interframe_speed`)** — these only resized
+  the internal video buffer and didn't change the camera's encode or skip stream
+  detection; `buffer_duration` already covers buffer sizing more directly. Removed
+  to cut config surface and a footgun (it was a per-camera key often mistakenly
+  placed at the document root, where it was silently ignored). Existing configs
+  that still contain it are simply ignored — no change needed.
+
 ## [0.6.4-beta.13] - 2026-06-04
 
 ### Fixed
