@@ -335,6 +335,43 @@ ssue a user had)
 - **print_format:** Used for adjusting printing of some values mostly, battery
 messages
 
+### Camera Configuration Reference
+
+All per-camera options (under `[[cameras]]`), with defaults. Sub-tables
+(`[cameras.mqtt]`, `[cameras.pause]`) are documented in their own sections.
+
+| Option | Default | Description |
+|---|---|---|
+| `name` | *(required)* | Camera name; used in the RTSP path and logs. |
+| `uid` | – | Camera UID (for relay/P2P discovery). One of `uid`/`address` is required. |
+| `address` | – | Camera `ip[:port]` for direct/LAN connections. |
+| `username` | *(required)* | Camera login user. |
+| `password` (alias `pass`) | – | Camera login password. |
+| `stream` | `All` | Streams to serve: `Main`, `Sub`, `Both`, `All`, `Extern`, `None`. |
+| `channel_id` (alias `channel`) | `0` | Channel on an NVR; `0` for a standalone camera. |
+| `permitted_users` | *(all)* | List of `[[users]]` names allowed to view this camera. |
+| `discovery` | `relay` | How to find/connect the camera — see [Connection / Discovery Methods](#connection--discovery-methods). |
+| `relay_server_region` (alias `relay_region`) | – | Reolink lookup region, e.g. `"Europe (France)"`. |
+| `connect_mode` (alias `connect`) | `always` | `always` or `on_demand` — see [Connection Modes](#connection-modes). |
+| `idle_timeout_secs` (alias `idle_timeout`) | `0` | In `always` mode: disconnect after N s idle (`0` = never). Ignored in `on_demand`. |
+| `relay_warm_seconds` (alias `relay_warm`) | `60` | In `on_demand` mode: keep the connection warm N s after the last client (`0` = disconnect immediately). Ignored in `always`. |
+| `udp_gap_skip_ms` | `120` | Reliable-UDP: how long to wait for a missing packet before skipping it. Raise on lossy links (favours completeness over latency); on a clean link it rarely triggers. |
+| `buffer_duration` (aliases `buffer`, `duration`) | `3000` | Size of Neolink's internal video buffer, expressed as ms of stream. Larger absorbs network jitter/bursts (smoother, more latency); smaller = lower latency, less burst tolerance. |
+| `max_encryption` | `Aes` | `none`, `bcencrypt`, or `aes`. |
+| `strict` | `false` | Error the media stream on unexpected packets instead of tolerating them. |
+| `max_discovery_retries` (alias `retries`) | `10` | Discovery attempts before giving up. |
+| `update_time` (alias `time`) | `false` | Force-set the camera clock to "now" on connect. |
+| `print_format` (alias `print`) | `None` | Log formatting for some values: `None`, `Human`, `Xml`. |
+| `debug` (alias `verbose`) | `false` | Dump decrypted XML from the camera (noisy; troubleshooting only). |
+| `enabled` (alias `enable`) | `true` | Set `false` to disable a camera without deleting it. |
+| `use_splash` (alias `splash`) | `true` | Serve a placeholder pattern over RTSP while the real stream isn't ready (camera connecting, on-demand wake, or paused) so clients show something instead of erroring/timing out. Most useful with `connect_mode = "on_demand"`. |
+| `splash_pattern` (alias `pattern`) | `Snow` | Placeholder look: `Snow`, `Smpte`, `Black`, `White`, `Red`, `Green`, … |
+| `push_notifications` (aliases `push`, `push_noti`) | `true` | **No-op.** The FCM wake-on-motion API was removed by Google, and the `pushnoti` build feature is off by default — so this setting currently does nothing regardless of value. |
+
+Global (top-level) options: `bind` (default `0.0.0.0`), the RTSP port (default
+`8554`, or via `NEO_LINK_PORT` / the `--config` command), `[mqtt]` (broker), and
+`[[users]]` (RTSP auth) — see the relevant sections above.
+
 ### Pause
 
 To use the pause feature you will need to adjust your config file as such:

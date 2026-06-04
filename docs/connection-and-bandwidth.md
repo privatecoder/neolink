@@ -102,6 +102,17 @@ UDP HB: in_pkts=410 in_kbps=4086 delivered=410 resends=0 packets_want=1702 \
 | `recieved_pending` | Packets buffered ahead of a gap (non-zero ⇒ a missing packet is blocking delivery). |
 | `ack_latency_us` | The (legacy) computed latency value — **logged only**; Neolink now sends `0` to the camera. |
 
-`udp_gap_skip_ms` controls how long the reassembler waits for a missing packet
-before skipping it (default 120 ms; raise it on lossy links to favour completeness
-over latency).
+## Tuning for jitter / loss
+
+- **`udp_gap_skip_ms`** (default `120`) — how long the reassembler waits for a
+  missing packet before skipping it. Raise on lossy links to favour completeness
+  over latency; on a clean link it rarely triggers.
+- **`buffer_duration`** (default `3000`, ms; aliases `buffer`, `duration`) — the
+  size of Neolink's internal video buffer, expressed as ms of stream
+  (`≈ bitrate/8 × buffer_duration`). Larger absorbs bursty/jittery delivery
+  (smoother playback, more latency); smaller lowers latency at the cost of burst
+  tolerance. This is the primary buffer-sizing knob (the removed `stream_tuning`
+  settings only nudged the same buffer and have been dropped).
+
+The full per-camera option list with defaults is in the README's
+"Camera Configuration Reference".
