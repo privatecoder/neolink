@@ -17,7 +17,6 @@ stability and on-demand connection behavior.
 
 ```bash
 cargo build --release                 # default build (includes `gstreamer` feature)
-cargo build --features pushnoti       # add FCM push-notification listener
 cargo build --no-default-features     # core/CLI only, no RTSP/gstreamer/talk/image
 
 cargo test                            # whole workspace; most tests live in crates/core
@@ -51,14 +50,14 @@ cargo run -- mqtt-rtsp --config=neolink.toml     # RTSP + MQTT control together
   per-camera orchestration layer (`src/common/`).
 - `crates/core` (`neolink_core`) — the reverse-engineered BC protocol library. The
   `BcCamera` type and all camera operations live here; everything else depends on it.
-- `crates/decoder`, `crates/mailnoti`, `crates/pushnoti` — supporting crates (media
-  decoding, email-based and FCM push notification handling).
+- `crates/decoder`, `crates/mailnoti` — supporting crates (media decoding,
+  email-based notifications). (FCM push notifications were removed — the API is dead.)
 - `dissector/` — Wireshark Lua dissector for the BC protocol (debugging aid, not built).
 
 ## Architecture: the camera ownership model
 
 The central design is a **channel-actor pattern** with a clonable handle, so many
-subsystems (RTSP, MQTT, motion detection, push notifications) can share one camera
+subsystems (RTSP, MQTT, motion detection) can share one camera
 connection without locking. Understanding this requires reading several files in
 `src/common/`:
 

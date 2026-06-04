@@ -22,6 +22,13 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Removed
 
+- **Push notifications (FCM) — removed entirely.** Google shut down the API this
+  relied on, so it had been dead. Removed the `pushnoti` cargo feature and its
+  `fcm-push-listener` / `dirs` / `md5` dependencies, the standalone `crates/pushnoti`
+  tool, all the in-binary push plumbing, and the `push_notifications` config option.
+  Configs that still set `push_notifications` are simply ignored. To wake a
+  fully-disconnected `on_demand` camera, use an external trigger (an RTSP client,
+  an MQTT command, or `/control/wakeup`).
 - **`stream_tuning` (`bitrate_kbps` / `interframe_speed`)** — these only resized
   the internal video buffer and didn't change the camera's encode or skip stream
   detection; `buffer_duration` already covers buffer sizing more directly. Removed

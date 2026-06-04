@@ -5,9 +5,6 @@ use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use neolink_core::{bc_protocol::StreamKind, bcmedia::model::BcMedia};
 use tokio::sync::mpsc::Receiver as MpscReceiver;
 
-#[cfg(feature = "pushnoti")]
-use crate::common::PushNoti;
-
 impl NeoInstance {
     /// Streams a camera source while not paused
     pub(crate) async fn stream_while_live(
@@ -84,44 +81,6 @@ impl NeoInstance {
                     e
                 }),
             ));
-
-            #[cfg(feature = "pushnoti")]
-            {
-                // Creates a permit for controlling based on the PN
-                let pn_permit = counter.create_deactivated().await?;
-                let mut pn = self.push_notifications().await?;
-                pn.borrow_and_update(); // Ignore any PNs that have already been sent before this
-                let thread_name = name.clone();
-                tasks.push(tokio::spawn(
-                    async move {
-                        loop {
-                            let noti: Option<PushNoti> = pn.borrow_and_update().clone();
-                            if let Some(noti) = noti {
-                                if noti.message.contains("Motion Alert from") {
-                                    log::info!(
-                                        "{thread_name}::{stream:?}: Push Notification Recieved"
-                                    );
-                                    let mut new_pn_permit = pn_permit.subscribe();
-                                    new_pn_permit.activate().await?;
-                                    tokio::spawn(async move {
-                                        tokio::time::sleep(tokio::time::Duration::from_secs(30))
-                                            .await;
-                                        drop(new_pn_permit);
-                                    });
-                                }
-                            }
-                            if let Err(e) = pn.changed().await {
-                                break Err(e);
-                            }
-                        }?;
-                        AnyResult::Ok(())
-                    }
-                    .map(|e| {
-                        log::debug!("PN thread stopped {e:?}");
-                        e
-                    }),
-                ));
-            }
 
             // Send the camera when the permit is active
             let camera_permit = counter.create_deactivated().await?;

@@ -366,7 +366,6 @@ All per-camera options (under `[[cameras]]`), with defaults. Sub-tables
 | `enabled` (alias `enable`) | `true` | Set `false` to disable a camera without deleting it. |
 | `use_splash` (alias `splash`) | `true` | Show the `splash_pattern` ("Stream not Ready") instead of a **404** in the brief window before the real stream factory is mounted (helps clients like Blue Iris that give up forever on a 404), and as a fallback if the video codec can't be determined. **Not** a live "connecting" placeholder — it does not play during a connect and transition to the real stream. |
 | `splash_pattern` (alias `pattern`) | `Snow` | Splash look: `Snow`, `Smpte`, `Black`, `White`, `Red`, `Green`, … |
-| `push_notifications` (aliases `push`, `push_noti`) | `true` | **No-op.** The FCM wake-on-motion API was removed by Google, and the `pushnoti` build feature is off by default — so this setting currently does nothing regardless of value. |
 
 Global (top-level) options: `bind` (default `0.0.0.0`), the RTSP port (default
 `8554`, or via `NEO_LINK_PORT` / the `--config` command), `[mqtt]` (broker), and
@@ -455,13 +454,11 @@ You can make neolink stop active streams when there are no rtsp clients using
 ```
 
 Once in the disconnected state. Neolink will stay disconnected until there is a
-new requested activation such as a client connecting or an mqtt command
+new requested activation such as a client connecting or an mqtt command.
 
-~Neolink will also wake up on push notifications from the camera. These are usually
-sent by the camera on motion or PIR alarms. To disable this you can set
-`push_notifications = false` in the `[[cameras]]` config~
-
-[Google removed the apis we were using for push notifications]
+> Push-notification wake-ups (FCM) were removed — Google shut down the API they
+> relied on — so a fully-disconnected camera can't be woken by motion on its own;
+> use an external trigger (a client, an MQTT command, or `/control/wakeup`).
 
 ### Docker
 

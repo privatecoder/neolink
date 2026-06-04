@@ -22,9 +22,6 @@ use neolink_core::bc_protocol::BcCamera;
 #[cfg(feature = "gstreamer")]
 mod gst;
 
-#[cfg(feature = "pushnoti")]
-mod pushnoti;
-
 /// This instance is the primary interface used throughout the app
 ///
 /// It uses channels to run all tasks on the actual shared `[NeoCam]`

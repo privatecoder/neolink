@@ -23,8 +23,6 @@ use super::{
     MdRequest, MdState, NeoCamMdThread, NeoCamThread, NeoCamThreadState, NeoInstance, Permit,
     UseCounter,
 };
-#[cfg(feature = "pushnoti")]
-use super::{PnRequest, PushNoti};
 use crate::{
     config::{CameraConfig, ConnectMode},
     AnyResult, Result,
@@ -41,8 +39,6 @@ pub(crate) enum NeoCamCommand {
     Connect(OneshotSender<()>),
     State(OneshotSender<NeoCamThreadState>),
     GetPermit(OneshotSender<Permit>),
-    #[cfg(feature = "pushnoti")]
-    PushNoti(OneshotSender<WatchReceiver<Option<PushNoti>>>),
     GetUid(OneshotSender<String>),
 }
 /// The underlying camera binding
@@ -55,10 +51,7 @@ pub(crate) struct NeoCam {
 }
 
 impl NeoCam {
-    pub(crate) async fn new(
-        config: CameraConfig,
-        #[cfg(feature = "pushnoti")] pn_request_tx: MpscSender<PnRequest>,
-    ) -> Result<NeoCam> {
+    pub(crate) async fn new(config: CameraConfig) -> Result<NeoCam> {
         let (commander_tx, commander_rx) = mpsc(100);
         let (watch_config_tx, watch_config_rx) = watch(config.clone());
         let (camera_watch_tx, camera_watch_rx) = watch(Weak::new());
@@ -87,8 +80,6 @@ impl NeoCam {
         let mut commander_rx = ReceiverStream::new(commander_rx);
         let thread_commander_tx = commander_tx.clone();
         let thread_watch_config_rx = watch_config_rx.clone();
-        #[cfg(feature = "pushnoti")]
-        let thread_pn_request_tx = pn_request_tx.clone();
 
         me.set.spawn(async move {
             let thread_cancel = sender_cancel.clone();
@@ -139,14 +130,6 @@ impl NeoCam {
                             NeoCamCommand::GetPermit(sender) => {
                                 let _ = sender.send(users.create_activated().await?);
                             }
-                            #[cfg(feature = "pushnoti")]
-                            NeoCamCommand::PushNoti(sender) => {
-                                thread_pn_request_tx.send(
-                                    PnRequest::Get {
-                                        sender,
-                                    }
-                                ).await?;
-                            },
                             NeoCamCommand::GetUid(sender) => {
                                 let mut uid_rx = uid_rx.clone();
                                 tokio::task::spawn(async move {
@@ -204,59 +187,6 @@ impl NeoCam {
         let _report_instance = instance.subscribe().await?;
         let _uid_instance = instance.clone();
         let _uid_tx = uid_tx;
-
-        // Handles push notifications
-        #[cfg(feature = "pushnoti")]
-        {
-            let pn_root_instance = instance.subscribe().await?;
-            let pn_cancel = me.cancel.clone();
-            let thread_pn_request_tx = pn_request_tx.clone();
-            me.set.spawn(async move {
-                tokio::select!{
-                    _ = pn_cancel.cancelled() => {
-                        AnyResult::Ok(())
-                    },
-                    v = async {
-                        let mut config_rx = pn_root_instance.config().await?;
-                        loop {
-                            // Wait for the green light
-                            config_rx.wait_for(|config| config.push_notifications).await?;
-
-                            // Activate it
-                            let pn_instance = pn_root_instance.subscribe().await?;
-                            let (tx, rx) = oneshot();
-                            thread_pn_request_tx.send(PnRequest::Activate{sender: tx, instance: pn_instance}).await?;
-                            rx.await??;
-
-                            let pn_permit_instance = pn_root_instance.subscribe().await?;
-                            let r = tokio::select! {
-                                // Push notification permits
-                                v = async {
-                                    let mut prev_noti = None;
-                                    let mut pn = pn_permit_instance.push_notifications().await?;
-                                    loop{
-                                        prev_noti = pn.wait_for(|noti| noti != &prev_noti && noti.is_some()).await.map(|noti| noti.clone())?;
-                                        let _permit = pn_permit_instance.permit().await?;
-                                        sleep(Duration::from_secs(30)).await; // Push notification will wake us up for 30s
-                                    }
-                                } => v,
-                                // Continue loop on Red light
-                                v = config_rx.wait_for(|config| !config.push_notifications).map_ok(|_| ()) => {
-                                    v?;
-                                    AnyResult::Ok(())
-                                },
-                            };
-                            if r.is_err() {
-                                break r;
-                            }
-                        }?;
-                        AnyResult::Ok(())
-                    } => {
-                        v
-                    },
-                }
-            });
-        }
 
         // MD permits
         let md_permit_instance = instance.subscribe().await?;
