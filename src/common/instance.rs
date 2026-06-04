@@ -15,7 +15,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{MdState, NeoCamCommand, NeoCamThreadState, Permit};
+use super::{MdState, NeoCamCommand, Permit};
 use crate::{config::CameraConfig, AnyResult, Result};
 use neolink_core::bc_protocol::BcCamera;
 
@@ -259,15 +259,6 @@ impl NeoInstance {
         let (instance_tx, instance_rx) = oneshot();
         self.camera_control
             .send(NeoCamCommand::Disconnect(instance_tx))
-            .await?;
-        Ok(instance_rx.await?)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn get_state(&self) -> Result<NeoCamThreadState> {
-        let (instance_tx, instance_rx) = oneshot();
-        self.camera_control
-            .send(NeoCamCommand::State(instance_tx))
             .await?;
         Ok(instance_rx.await?)
     }

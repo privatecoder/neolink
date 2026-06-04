@@ -33,9 +33,10 @@ Download from the
 
 To use `neolink` you need a config file.
 
-There's a more complete example
-[here](https://github.com/QuantumEntangledAndy/neolink/blob/master/sample_config.toml),
-but the following should work as a minimal example.
+There's a more complete example in this repo's
+[`sample_config.toml`](sample_config.toml), and the full per-camera option list is
+in the [Camera Configuration Reference](#camera-configuration-reference) below, but
+the following should work as a minimal example.
 
 ```toml
 bind = "0.0.0.0"
@@ -318,7 +319,6 @@ uid = "ABCDEF0123456789"
 debug = false # Displays Debug XML messages from camera
 enabled = true # Enable or Disable the camera
 update_time = false # When camera connects, force the setting of the camera date/time to now. The default is false
-print_format = "None"  # Type of format that logs are displayed in (None, Human, Xml). The default is None
 ```
 
 - **Debug:** Will dump the various XMLs from the camera as they are recieved
@@ -331,9 +331,6 @@ it from the config
 if it is needed but this
 will force it regardless. (Mostly this was introduced to address a specific
 ssue a user had)
-
-- **print_format:** Used for adjusting printing of some values mostly, battery
-messages
 
 ### Camera Configuration Reference
 
@@ -361,7 +358,6 @@ All per-camera options (under `[[cameras]]`), with defaults. Sub-tables
 | `strict` | `false` | Error the media stream on unexpected packets instead of tolerating them. |
 | `max_discovery_retries` (alias `retries`) | `10` | Discovery attempts before giving up. |
 | `update_time` (alias `time`) | `false` | Force-set the camera clock to "now" on connect. |
-| `print_format` (alias `print`) | `None` | Log formatting for some values: `None`, `Human`, `Xml`. |
 | `debug` (alias `verbose`) | `false` | Dump decrypted XML from the camera (noisy; troubleshooting only). |
 | `enabled` (alias `enable`) | `true` | Set `false` to disable a camera without deleting it. |
 | `use_splash` (alias `splash`) | `true` | Show the `splash_pattern` ("Stream not Ready") instead of a **404** in the brief window before the real stream factory is mounted (helps clients like Blue Iris that give up forever on a 404), and as a fallback if the video codec can't be determined. **Not** a live "connecting" placeholder — it does not play during a connect and transition to the real stream. |

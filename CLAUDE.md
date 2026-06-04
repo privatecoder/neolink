@@ -7,8 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Neolink is a proxy/bridge between Reolink IP cameras (which speak a proprietary
 reverse-engineered "Baichuan" / BC protocol over port 9000 instead of ONVIF/RTSP)
 and standard clients. Its primary mode runs an RTSP server so NVR software (Blue
-Iris, Shinobi) can consume the camera streams; it also exposes MQTT control,
-push-notification wakeups, and one-shot CLI commands (image, battery, ptz, talk, etc.).
+Iris, Shinobi) can consume the camera streams; it also exposes MQTT control and
+one-shot CLI commands (image, battery, ptz, talk, etc.).
 
 This is the `privatecoder` fork of `QuantumEntangledAndy/neolink`, focused on
 stability and on-demand connection behavior.
@@ -69,7 +69,7 @@ connection without locking. Understanding this requires reading several files in
 
 - **`NeoCam`** (`neocam.rs`) — owns one physical camera. Spawns a `JoinSet` of long-lived
   tasks: a command dispatcher, the connection loop (`NeoCamThread`), the motion-detection
-  loop (`NeoCamMdThread`), motion/push-notification permit watchers, and the **on-demand
+  loop (`NeoCamMdThread`), the motion permit watcher, and the **on-demand
   connect loop**. Communicates outward only by handing out `NeoInstance`s.
 
 - **`NeoInstance`** (`instance.rs`) — the cheap, `Clone`able handle every subsystem holds.

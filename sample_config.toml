@@ -72,17 +72,18 @@ address = "192.168.1.187:9000"
 #
 # discovery = "relay"
 
-# Certain types of camera emit status messages (such as battery levels)
+# Connection mode: how this camera maintains its connection.
+# - "always" (default): connect at startup and stay connected, reconnecting on drops.
+#     Optionally set idle_timeout_secs to disconnect after that many seconds idle
+#     (0 = never disconnect, the default).
+# - "on_demand": connect only when needed (a client connects, an MQTT command runs,
+#     or motion is active) and disconnect when idle. Good for battery cameras.
+#     relay_warm_seconds keeps the connection warm after the last client leaves
+#     (default 60, 0 = disconnect immediately).
 #
-# By default we hide these status messages from the user but you can instead requst that
-# they be printed to stdout using print_format
-#
-# Valid values are:
-# - None
-# - Human
-# - Xml
-#
-# print_format = "None"
+# connect_mode = "always"
+# idle_timeout_secs = 0
+# relay_warm_seconds = 60
 
 
 [[cameras]]

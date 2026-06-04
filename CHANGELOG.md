@@ -29,6 +29,12 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
   Configs that still set `push_notifications` are simply ignored. To wake a
   fully-disconnected `on_demand` camera, use an external trigger (an RTSP client,
   an MQTT command, or `/control/wakeup`).
+- **Dead config options `print_format` and `tokio_console`** — both were
+  deserialized but never read by any logic. Removed; configs that still set them
+  are ignored.
+- **Internal dead code cleanup** — removed an orphaned (never-compiled) `adpcm.rs`
+  module, a commented-out experimental `build_mpegts` pipeline and its unused
+  helpers, and several unused functions/fields/commands in the binary.
 - **`stream_tuning` (`bitrate_kbps` / `interframe_speed`)** — these only resized
   the internal video buffer and didn't change the camera's encode or skip stream
   detection; `buffer_duration` already covers buffer sizing more directly. Removed

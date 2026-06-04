@@ -2,7 +2,7 @@ use gstreamer::ClockTime;
 use std::{collections::HashMap, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
-use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory, GhostPad};
+use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory};
 use gstreamer_app::{AppSrc, AppSrcCallbacks, AppStreamType};
 use neolink_core::{
     bc_protocol::StreamKind,
@@ -59,7 +59,6 @@ struct StreamConfig {
     resolution: [u32; 2],
     bitrate: u32,
     fps: u32,
-    bitrate_table: Vec<u32>,
     fps_table: Vec<u32>,
     vid_type: Option<VideoType>,
     aud_type: Option<AudioType>,
@@ -71,7 +70,7 @@ impl StreamConfig {
         name: StreamKind,
         buffer_duration_ms: u64,
     ) -> AnyResult<Self> {
-        let (resolution, bitrate, fps, fps_table, bitrate_table) = instance
+        let (resolution, bitrate, fps, fps_table) = instance
             .run_passive_task(|cam| {
                 Box::pin(async move {
                     let infos = cam
@@ -113,10 +112,9 @@ impl StreamConfig {
                                 .copied()
                                 .unwrap_or(encode.default_framerate),
                             framerate_table.clone(),
-                            bitrate_table.clone(),
                         ))
                     } else {
-                        Ok(([0, 0], 0, 0, vec![], vec![]))
+                        Ok(([0, 0], 0, 0, vec![]))
                     }
                 })
             })
@@ -127,7 +125,6 @@ impl StreamConfig {
             bitrate,
             fps,
             fps_table,
-            bitrate_table,
             vid_type: None,
             aud_type: None,
             buffer_duration_ms,
@@ -137,15 +134,6 @@ impl StreamConfig {
     fn update_fps(&mut self, fps: u32) {
         let new_fps = self.fps_table.get(fps as usize).copied().unwrap_or(fps);
         self.fps = new_fps;
-    }
-    #[allow(dead_code)]
-    fn update_bitrate(&mut self, bitrate: u32) {
-        let new_bitrate = self
-            .bitrate_table
-            .get(bitrate as usize)
-            .copied()
-            .unwrap_or(bitrate);
-        self.bitrate = new_bitrate;
     }
 
     fn update_from_media(&mut self, media: &BcMedia) {
@@ -1503,103 +1491,6 @@ fn build_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> 
     Ok(linked.appsrc)
 }
 
-#[allow(dead_code)]
-fn pipe_silence(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
-    // Audio seems to run at about 800kbs
-    let buffer_size = 512 * 1416;
-    let bin = bin
-        .clone()
-        .dynamic_cast::<Bin>()
-        .map_err(|_| anyhow!("Media source's element should be a bin"))?;
-    log::debug!("Building Silence pipeline");
-    let source = make_element("appsrc", "audsrc")?
-        .dynamic_cast::<AppSrc>()
-        .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
-
-    source.set_is_live(true);
-    source.set_property("format", &gstreamer::Format::Time);
-    source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
-    source.set_property("emit-signals", false);
-    source.set_do_timestamp(false);
-    source.set_stream_type(AppStreamType::Stream);
-    source.set_max_bytes(buffer_size as u64);
-
-    let source = source
-        .dynamic_cast::<Element>()
-        .map_err(|_| anyhow!("Cannot cast back"))?;
-
-    let sink_queue = make_queue("audsinkqueue", buffer_size)?;
-    let sink = make_element("fakesink", "silence_sink")?;
-
-    let silence = make_element("audiotestsrc", "audsilence")?;
-    silence.set_property_from_str("wave", "silence");
-    let src_queue = make_queue("audsinkqueue", buffer_size)?;
-    let encoder = make_element("audioconvert", "audencoder")?;
-
-    bin.add_many([&source, &sink_queue, &sink, &silence, &src_queue, &encoder])?;
-
-    Element::link_many([&source, &sink_queue, &sink])?;
-
-    Element::link_many([&silence, &src_queue, &encoder])?;
-
-    let source = source
-        .dynamic_cast::<AppSrc>()
-        .map_err(|_| anyhow!("Cannot convert appsrc"))?;
-    Ok(Linked {
-        appsrc: source,
-        output: encoder,
-    })
-}
-
-#[allow(dead_code)]
-struct AppSrcPair {
-    vid: AppSrc,
-    aud: Option<AppSrc>,
-}
-
-// #[allow(dead_code)]
-// /// Experimental build a stream of MPEGTS
-// fn build_mpegts(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrcPair> {
-//     let buffer_size = buffer_size(stream_config.bitrate);
-//     log::debug!(
-//         "buffer_size: {buffer_size}, bitrate: {}",
-//         stream_config.bitrate
-//     );
-
-//     // VID
-//     let vid_link = match stream_config.vid_format {
-//         VidFormat::H264 => pipe_h264(bin, stream_config)?,
-//         VidFormat::H265 => pipe_h265(bin, stream_config)?,
-//         VidFormat::None => unreachable!(),
-//     };
-
-//     // AUD
-//     let aud_link = match stream_config.aud_format {
-//         AudFormat::Aac => pipe_aac(bin, stream_config)?,
-//         AudFormat::Adpcm(block) => pipe_adpcm(bin, block, stream_config)?,
-//         AudFormat::None => pipe_silence(bin, stream_config)?,
-//     };
-
-//     let bin = bin
-//         .clone()
-//         .dynamic_cast::<Bin>()
-//         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
-
-//     // MUX
-//     let muxer = make_element("mpegtsmux", "mpeg_muxer")?;
-//     let rtp = make_element("rtpmp2tpay", "pay0")?;
-
-//     bin.add_many([&muxer, &rtp])?;
-//     Element::link_many([&vid_link.output, &muxer, &rtp])?;
-//     Element::link_many([&aud_link.output, &muxer])?;
-
-//     Ok(AppSrcPair {
-//         vid: vid_link.appsrc,
-//         aud: Some(aud_link.appsrc),
-//     })
-// }
-
 // Convenice funcion to make an element or provide a message
 // about what plugin is missing
 fn make_element(kind: &str, name: &str) -> AnyResult<Element> {
@@ -1855,45 +1746,6 @@ impl AudStatsSnapshot {
             gap_max_us: 0,
         }
     }
-}
-
-#[allow(dead_code)]
-fn make_dbl_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
-    let queue = make_element("queue", &format!("queue1_{}", name))?;
-    queue.set_property("max-size-bytes", buffer_size);
-    queue.set_property("max-size-buffers", 0u32);
-    queue.set_property("max-size-time", 0u64);
-    //queue.set_property_from_str("leaky", "downstream");
-
-    let queue2 = make_element("queue2", &format!("queue2_{}", name))?;
-    queue2.set_property("max-size-bytes", buffer_size * 2u32 / 3u32);
-    queue2.set_property("max-size-buffers", 0u32);
-    queue2.set_property("max-size-time", 0u64);
-    queue2.set_property("use-buffering", false);
-    //queue2.set_property_from_str("leaky", "downstream");
-
-    let bin = gstreamer::Bin::builder().name(name).build();
-    bin.add_many([&queue, &queue2])?;
-    Element::link_many([&queue, &queue2])?;
-
-    let pad = queue
-        .static_pad("sink")
-        .expect("Failed to get a static pad from queue.");
-    let ghost_pad = GhostPad::builder_with_target(&pad).unwrap().build();
-    ghost_pad.set_active(true)?;
-    bin.add_pad(&ghost_pad)?;
-
-    let pad = queue2
-        .static_pad("src")
-        .expect("Failed to get a static pad from queue2.");
-    let ghost_pad = GhostPad::builder_with_target(&pad).unwrap().build();
-    ghost_pad.set_active(true)?;
-    bin.add_pad(&ghost_pad)?;
-
-    let bin = bin
-        .dynamic_cast::<Element>()
-        .map_err(|_| anyhow!("Cannot convert bin"))?;
-    Ok(bin)
 }
 
 fn make_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {

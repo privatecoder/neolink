@@ -89,16 +89,6 @@ pub(crate) struct Permit {
 }
 
 impl Permit {
-    #[cfg(feature = "gstreamer")]
-    #[allow(dead_code)]
-    pub(crate) fn subscribe(&self) -> Self {
-        Self {
-            is_active: false,
-            value: self.value.clone(),
-            notifier: self.notifier.clone(),
-        }
-    }
-
     fn new(source: &UseCounter) -> Self {
         Self {
             is_active: false,
@@ -143,12 +133,6 @@ impl Permit {
             })
             .await?;
         Ok(())
-    }
-
-    #[cfg(feature = "gstreamer")]
-    #[allow(dead_code)]
-    pub(crate) fn get_counter(&self) -> WatchReceiver<u32> {
-        self.value.clone()
     }
 }
 

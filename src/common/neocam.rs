@@ -37,7 +37,6 @@ pub(crate) enum NeoCamCommand {
     Config(OneshotSender<WatchReceiver<CameraConfig>>),
     Disconnect(OneshotSender<()>),
     Connect(OneshotSender<()>),
-    State(OneshotSender<NeoCamThreadState>),
     GetPermit(OneshotSender<Permit>),
     GetUid(OneshotSender<String>),
 }
@@ -123,9 +122,6 @@ impl NeoCam {
                                     state_tx.send_replace(NeoCamThreadState::Disconnected);
                                 }
                                 let _ = sender.send(());
-                            }
-                            NeoCamCommand::State(sender) => {
-                                let _ = sender.send(*state_tx.borrow());
                             }
                             NeoCamCommand::GetPermit(sender) => {
                                 let _ = sender.send(users.create_activated().await?);

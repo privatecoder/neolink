@@ -1,7 +1,7 @@
 use crate::mqtt::Discoveries;
 #[cfg(feature = "gstreamer")]
 use neolink_core::bc_protocol::StreamKind;
-use neolink_core::bc_protocol::{DiscoveryMethods, PrintFormat};
+use neolink_core::bc_protocol::DiscoveryMethods;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -28,9 +28,6 @@ pub(crate) struct Config {
     #[validate(range(min = 0, max = 65535, message = "Invalid port", code = "bind_port"))]
     #[serde(default = "default_bind_port")]
     pub(crate) bind_port: u16,
-
-    #[serde(default = "default_tokio_console")]
-    pub(crate) tokio_console: bool,
 
     #[serde(default = "default_certificate")]
     pub(crate) certificate: Option<String>,
@@ -236,9 +233,6 @@ pub(crate) struct CameraConfig {
     /// If strict then the media stream will error in the event that the media packets are not as expected
     pub(crate) strict: bool,
 
-    #[serde(default = "default_print", alias = "print")]
-    pub(crate) print_format: PrintFormat,
-
     #[serde(default = "default_update_time", alias = "time")]
     pub(crate) update_time: bool,
 
@@ -371,9 +365,6 @@ fn default_mqtt() -> MqttConfig {
     }
 }
 
-fn default_print() -> PrintFormat {
-    PrintFormat::None
-}
 
 fn default_discovery() -> DiscoveryMethods {
     DiscoveryMethods::Relay
@@ -518,9 +509,6 @@ fn default_tls_client_auth() -> String {
     "none".to_string()
 }
 
-fn default_tokio_console() -> bool {
-    false
-}
 
 fn default_channel_id() -> u8 {
     0
