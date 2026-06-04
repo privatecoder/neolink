@@ -17,7 +17,12 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
-use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
+use crate::{
+    common::NeoInstance,
+    config::StreamTuning,
+    rtsp::gst::NeoMediaFactory,
+    AnyResult,
+};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, TrySendError};
@@ -63,9 +68,16 @@ struct StreamConfig {
     fps_table: Vec<u32>,
     vid_type: Option<VideoType>,
     aud_type: Option<AudioType>,
+    buffer_duration_ms: u64,
+    interframe_speed: u8,
 }
 impl StreamConfig {
-    async fn new(instance: &NeoInstance, name: StreamKind) -> AnyResult<Self> {
+    async fn new(
+        instance: &NeoInstance,
+        name: StreamKind,
+        buffer_duration_ms: u64,
+        tuning: Option<&StreamTuning>,
+    ) -> AnyResult<Self> {
         let (resolution, bitrate, fps, fps_table, bitrate_table) = instance
             .run_passive_task(|cam| {
                 Box::pin(async move {
@@ -117,6 +129,17 @@ impl StreamConfig {
             })
             .await?;
 
+        let mut bitrate = bitrate;
+        let mut interframe_speed = 1u8;
+        if let Some(tuning) = tuning {
+            if let Some(override_kbps) = tuning.bitrate_kbps {
+                bitrate = override_kbps.saturating_mul(1024);
+            }
+            if let Some(speed) = tuning.interframe_speed {
+                interframe_speed = speed.clamp(1, 4);
+            }
+        }
+
         Ok(StreamConfig {
             resolution,
             bitrate,
@@ -125,6 +148,8 @@ impl StreamConfig {
             bitrate_table,
             vid_type: None,
             aud_type: None,
+            buffer_duration_ms,
+            interframe_speed,
         })
     }
 
@@ -240,7 +265,23 @@ pub(super) async fn make_factory(
                             stream,
                         };
 
-                        let mut stream_config = StreamConfig::new(&camera, stream).await?;
+                        let tuning = config.stream_tuning.for_stream(stream);
+                        let mut stream_config = StreamConfig::new(
+                            &camera,
+                            stream,
+                            config.buffer_duration,
+                            tuning,
+                        )
+                        .await?;
+                        if let Some(tuning) = tuning {
+                            if tuning.bitrate_kbps.is_some() || tuning.interframe_speed.is_some() {
+                                log::info!(
+                                    "{name}::{stream}: Stream tuning overrides: bitrate_kbps={:?}, interframe_speed={:?}",
+                                    tuning.bitrate_kbps,
+                                    tuning.interframe_speed
+                                );
+                            }
+                        }
                         if let Some(cached) = cached_stream_types(&cache_key).await {
                             if cached.vid_type.is_some() || cached.aud_type.is_some() {
                                 log::info!(
@@ -273,7 +314,7 @@ pub(super) async fn make_factory(
 
                         log::info!("{name}::{stream}: Waiting for media frames from camera");
                         if let Some(timeout) = learn_timeout {
-                            let mut deadline = tokio::time::sleep(timeout);
+                            let deadline = tokio::time::sleep(timeout);
                             tokio::pin!(deadline);
                             loop {
                                 tokio::select! {
@@ -331,6 +372,15 @@ pub(super) async fn make_factory(
                             .await;
                         }
 
+                        let sizing_bytes = buffer_size_bytes(&stream_config);
+                        log::info!(
+                            "{name}::{stream}: Stream sizing: bitrate={}bps fps={} buffer_ms={} interframe_speed={} -> buffer_bytes={}",
+                            stream_config.bitrate,
+                            stream_config.fps,
+                            stream_config.buffer_duration_ms,
+                            stream_config.interframe_speed,
+                            sizing_bytes
+                        );
                         log::trace!("{name}::{stream}: Building the pipeline");
                         // Build the right video pipeline
                         let vid_src = match stream_config.vid_type.as_ref() {
@@ -383,10 +433,13 @@ pub(super) async fn make_factory(
 
 
                         // ---- Clean fix: keep tokio receiver async; forward into bounded std channel ----
+                        let queue_capacity = media_queue_capacity(&stream_config);
+                        let stream_label = format!("{name}::{stream}");
+                        log::info!("{stream_label}: Media queue capacity set to {}", queue_capacity);
                         let (std_tx, std_rx): (
                             std_mpsc::SyncSender<TimedMedia>,
                             std_mpsc::Receiver<TimedMedia>,
-                        ) = std_mpsc::sync_channel(200);
+                        ) = std_mpsc::sync_channel(queue_capacity);
 
                         let in_audio = std::sync::Arc::new(AtomicU64::new(0));
                         let in_video = std::sync::Arc::new(AtomicU64::new(0));
@@ -401,9 +454,12 @@ pub(super) async fn make_factory(
                         let drop_audio_fwd = drop_audio.clone();
                         let drop_video_fwd = drop_video.clone();
                         let drop_other_fwd = drop_other.clone();
+                        let label_fwd = stream_label.clone();
 
                         // Forwarder task: runs on tokio, owns media_rx
                         tokio::spawn(async move {
+                            let mut last_drop_log = std::time::Instant::now();
+                            let mut dropped = 0u64;
                             while let Some(m) = media_rx.recv().await {
                                 let kind = match &m {
                                     BcMedia::Aac(_) | BcMedia::Adpcm(_) => 0,
@@ -428,6 +484,19 @@ pub(super) async fn make_factory(
                                             1 => drop_video_fwd.fetch_add(1, Ordering::Relaxed),
                                             _ => drop_other_fwd.fetch_add(1, Ordering::Relaxed),
                                         };
+                                        dropped += 1;
+                                        let now = std::time::Instant::now();
+                                        if now.duration_since(last_drop_log)
+                                            >= Duration::from_secs(1)
+                                        {
+                                            log::warn!(
+                                                "{label_fwd}: Media queue full; dropped {} frames in last {:?}",
+                                                dropped,
+                                                now.duration_since(last_drop_log)
+                                            );
+                                            dropped = 0;
+                                            last_drop_log = now;
+                                        }
                                     }
                                     Err(TrySendError::Disconnected(_)) => break,
                                 }
@@ -474,17 +543,35 @@ pub(super) async fn make_factory(
                             };
 
                             let mut drop_until_keyframe: bool = false;
-                            let lag_enter_threshold = Duration::from_millis(500);
-                            let lag_exit_threshold  = Duration::from_millis(150);
+                            let high_bitrate = stream_config.bitrate >= 2_000_000;
+                            let backpressure_threshold = if high_bitrate { 0.92 } else { 0.85 };
+                            let lag_enter_threshold = if high_bitrate {
+                                Duration::from_millis(900)
+                            } else {
+                                Duration::from_millis(500)
+                            };
+                            let lag_exit_threshold = if high_bitrate {
+                                Duration::from_millis(300)
+                            } else {
+                                Duration::from_millis(150)
+                            };
+                            log::info!(
+                                "{stream_label}: Backpressure thresholds: fill>{:.2}, lag_enter={:?}, lag_exit={:?}",
+                                backpressure_threshold,
+                                lag_enter_threshold,
+                                lag_exit_threshold
+                            );
                             let mut client_active = false;
                             let mut last_linked = Instant::now();
                             let client_active_deadline = Instant::now() + Duration::from_secs(10);
                             let disconnect_grace = Duration::from_secs(2);
+                            let mut play_logged = false;
 
                             // Send buffered frames (no pacing)
                             for buffered in buffer.drain(..) {
                                 if let Err(e) = send_to_sources(
                                     buffered,
+                                    &stream_label,
                                     &mut pools,
                                     &vid_src,
                                     &aud_src,
@@ -498,7 +585,7 @@ pub(super) async fn make_factory(
                                     None,
                                 ) {
                                     if e.to_string().contains("App source is closed") {
-                                        log::info!("{name}::{stream}: Client disconnected, stopping camera relay");
+                                        log::info!("{stream_label}: Client disconnected, stopping camera relay");
                                         return AnyResult::Ok(());
                                     }
                                     return Err(e);
@@ -513,23 +600,35 @@ pub(super) async fn make_factory(
                                 let aud_linked = aud_src.as_ref().map(|s| is_linked(s)).unwrap_or(false);
 
                                 if vid_linked || aud_linked {
+                                    if !play_logged {
+                                        log::info!(
+                                            "{stream_label}: RTSP PLAY reached after {:?} (vid_linked={}, aud_linked={})",
+                                            start.elapsed(),
+                                            vid_linked,
+                                            aud_linked
+                                        );
+                                        play_logged = true;
+                                    }
                                     client_active = true;
                                     last_linked = Instant::now();
                                 }
 
                                 if client_active {
                                     if vid_closed && aud_closed {
-                                        log::info!("{name}::{stream}: Client disconnected, stopping camera relay");
+                                        log::info!("{stream_label}: Client disconnected, stopping camera relay");
                                         break;
                                     }
                                     if !(vid_linked || aud_linked)
                                         && Instant::now().duration_since(last_linked) >= disconnect_grace
                                     {
-                                        log::info!("{name}::{stream}: Client disconnected, stopping camera relay");
+                                        log::info!("{stream_label}: Client disconnected, stopping camera relay");
                                         break;
                                     }
                                 } else if Instant::now() >= client_active_deadline {
-                                    log::info!("{name}::{stream}: Client never reached PLAY, stopping camera relay");
+                                    log::info!(
+                                        "{stream_label}: Client never reached PLAY after {:?}, stopping camera relay",
+                                        start.elapsed()
+                                    );
                                     break;
                                 }
 
@@ -560,7 +659,7 @@ pub(super) async fn make_factory(
                                     let drop_other = drop_other.swap(0, Ordering::Relaxed);
 
                                     log::info!(
-                                        "{name}::{stream}: HB elapsed={:?} vid_ts={:?} aud_ts={:?} \
+                                        "{stream_label}: HB elapsed={:?} vid_ts={:?} aud_ts={:?} \
                                         vid_buf={}/{} aud_buf={}/{} last_media={:?} \
                                         vid_push={} aud_push={} dropP_pressure={} dropP_backpressure={} \
                                         fps={} frame_us={} av_drift_ms={} \
@@ -622,7 +721,7 @@ pub(super) async fn make_factory(
                                         continue;
                                     }
                                     Err(RecvTimeoutError::Disconnected) => {
-                                        log::info!("{name}::{stream}: Camera stream ended, stopping relay");
+                                        log::info!("{stream_label}: Camera stream ended, stopping relay");
                                         break;
                                     }
                                 };
@@ -636,19 +735,19 @@ pub(super) async fn make_factory(
                                     .map(|s| s.current_level_bytes() as f32 / s.max_bytes().max(1) as f32)
                                     .unwrap_or(0.0);
 
-                                let in_backpressure = vid_fill > 0.85;
+                                let in_backpressure = vid_fill > backpressure_threshold;
 
                                 let elapsed = start.elapsed();
                                 let vid_ts_dur = Duration::from_micros(vid_ts);
                                 let lag = elapsed.checked_sub(vid_ts_dur).unwrap_or(Duration::ZERO);
 
                                 if in_backpressure && lag >= lag_enter_threshold && !drop_until_keyframe {
-                                    log::warn!("{name}::{stream}: CATCHUP enter (lag={:?}), drop until keyframe", lag);
+                                    log::warn!("{stream_label}: CATCHUP enter (lag={:?}), drop until keyframe", lag);
                                     drop_until_keyframe = true;
                                 }
 
                                 if drop_until_keyframe && lag <= lag_exit_threshold && !in_backpressure {
-                                    log::warn!("{name}::{stream}: CATCHUP exit (lag={:?})", lag);
+                                    log::warn!("{stream_label}: CATCHUP exit (lag={:?})", lag);
                                     drop_until_keyframe = false;
                                 }
 
@@ -671,6 +770,7 @@ pub(super) async fn make_factory(
 
                                 if let Err(e) = send_to_sources(
                                     timed.media,
+                                    &stream_label,
                                     &mut pools,
                                     &vid_src,
                                     &aud_src,
@@ -686,7 +786,7 @@ pub(super) async fn make_factory(
                                     if e.to_string().contains("App source is closed")
                                         || e.to_string().contains("App source is not linked")
                                     {
-                                        log::info!("{name}::{stream}: Client disconnected, stopping camera relay");
+                                        log::info!("{stream_label}: Client disconnected, stopping camera relay");
                                         break;
                                     }
                                     log::warn!("Failed to send to source: {e:?}");
@@ -694,7 +794,7 @@ pub(super) async fn make_factory(
                                 }
                             }
 
-                            log::info!("{name}::{stream}: Camera relay disconnected");
+                            log::info!("{stream_label}: Camera relay disconnected");
                             AnyResult::Ok(())
                         });
                         AnyResult::Ok(())
@@ -747,6 +847,7 @@ fn is_video(m: &BcMedia) -> bool {
 
 fn send_to_sources(
     data: BcMedia,
+    stream_label: &str,
     pools: &mut HashMap<usize, gstreamer::BufferPool>,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
@@ -777,6 +878,7 @@ fn send_to_sources(
                 log::debug!("Sending AAC: {:?}", Duration::from_micros(ts_us));
                 send_to_appsrc(
                     aud_src,
+                    stream_label,
                     aac.data,
                     Duration::from_micros(ts_us),
                     Some(dur),
@@ -801,6 +903,7 @@ fn send_to_sources(
                 log::trace!("Sending ADPCM: {:?}", Duration::from_micros(ts_us));
                 send_to_appsrc(
                     aud_src,
+                    stream_label,
                     adpcm.data,
                     Duration::from_micros(ts_us),
                     Some(dur),
@@ -826,6 +929,7 @@ fn send_to_sources(
                 log::trace!("Sending I-frame: {:?}", Duration::from_micros(ts_us));
                 send_to_appsrc(
                     vid_src,
+                    stream_label,
                     data,
                     Duration::from_micros(ts_us),
                     Some(frame_dur),
@@ -865,6 +969,7 @@ fn send_to_sources(
                     log::trace!("Sending P-frame: {:?}", Duration::from_micros(ts_us));
                     send_to_appsrc(
                         vid_src,
+                        stream_label,
                         data,
                         Duration::from_micros(ts_us),
                         Some(frame_dur),
@@ -949,6 +1054,7 @@ fn acquire_pooled_buffer(
 
 fn send_to_appsrc(
     appsrc: &gstreamer_app::AppSrc,
+    stream_label: &str,
     data: Vec<u8>,
     ts: std::time::Duration,
     duration: Option<std::time::Duration>,
@@ -984,14 +1090,40 @@ fn send_to_appsrc(
         }
     }
 
-    match appsrc.push_buffer(buf) {
+    let push_start = std::time::Instant::now();
+    let result = appsrc.push_buffer(buf);
+    let push_elapsed = push_start.elapsed();
+    if push_elapsed >= Duration::from_millis(20) {
+        let level = appsrc.current_level_bytes();
+        let max = appsrc.max_bytes();
+        let app_name = appsrc.name();
+        if push_elapsed >= Duration::from_millis(100) {
+            log::warn!(
+                "{stream_label}: appsrc {} push_buffer took {:?} (level {}/{} bytes)",
+                app_name,
+                push_elapsed,
+                level,
+                max
+            );
+        } else {
+            log::debug!(
+                "{stream_label}: appsrc {} push_buffer took {:?} (level {}/{} bytes)",
+                app_name,
+                push_elapsed,
+                level,
+                max
+            );
+        }
+    }
+
+    match result {
         Ok(_) => Ok(()),
         Err(gstreamer::FlowError::Flushing) => {
-            log::debug!("push_buffer => FLUSHING");
+            log::debug!("{stream_label}: push_buffer => FLUSHING");
             Ok(())
         }
         Err(gstreamer::FlowError::NotLinked) => {
-            log::debug!("push_buffer => NOT_LINKED");
+            log::debug!("{stream_label}: push_buffer => NOT_LINKED");
             Ok(())
         }
         Err(e) => Err(anyhow::anyhow!("Error in streaming: {e:?}")),
@@ -1083,7 +1215,7 @@ struct Linked {
 }
 
 fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
-    let buffer_size = buffer_size(stream_config.bitrate);
+    let buffer_size = buffer_size_bytes(stream_config);
     log::debug!(
         "buffer_size: {buffer_size}, bitrate: {}",
         stream_config.bitrate
@@ -1152,7 +1284,7 @@ fn build_h264(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
 }
 
 fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
-    let buffer_size = buffer_size(stream_config.bitrate);
+    let buffer_size = buffer_size_bytes(stream_config);
     let bin = bin
         .clone()
         .dynamic_cast::<Bin>()
@@ -1551,8 +1683,7 @@ struct StreamStats {
     aud_gap_max_us: u64,
 
     vid_gap_last_instant: Option<std::time::Instant>,
-    aud_base_instant: Option<std::time::Instant>,
-    vid_base_instant: Option<std::time::Instant>,
+    media_base_instant: Option<std::time::Instant>,
 }
 
 impl StreamStats {
@@ -1589,8 +1720,7 @@ impl StreamStats {
             aud_gap_max_us: 0,
 
             vid_gap_last_instant: None,
-            aud_base_instant: None,
-            vid_base_instant: None,
+            media_base_instant: None,
         }
     }
 
@@ -1638,32 +1768,26 @@ impl StreamStats {
     }
 
     fn audio_ts_from_recv(&mut self, recv_at: std::time::Instant, current_ts: u64) -> u64 {
-        let base = match self.aud_base_instant {
-            Some(base) => base,
-            None => {
-                let base = recv_at
+        let base = self
+            .media_base_instant
+            .get_or_insert_with(|| {
+                recv_at
                     .checked_sub(std::time::Duration::from_micros(current_ts))
-                    .unwrap_or(recv_at);
-                self.aud_base_instant = Some(base);
-                base
-            }
-        };
-        let ts_us = recv_at.duration_since(base).as_micros() as u64;
+                    .unwrap_or(recv_at)
+            });
+        let ts_us = recv_at.duration_since(*base).as_micros() as u64;
         ts_us.max(current_ts)
     }
 
     fn video_ts_from_recv(&mut self, recv_at: std::time::Instant, current_ts: u64) -> u64 {
-        let base = match self.vid_base_instant {
-            Some(base) => base,
-            None => {
-                let base = recv_at
+        let base = self
+            .media_base_instant
+            .get_or_insert_with(|| {
+                recv_at
                     .checked_sub(std::time::Duration::from_micros(current_ts))
-                    .unwrap_or(recv_at);
-                self.vid_base_instant = Some(base);
-                base
-            }
-        };
-        let ts_us = recv_at.duration_since(base).as_micros() as u64;
+                    .unwrap_or(recv_at)
+            });
+        let ts_us = recv_at.duration_since(*base).as_micros() as u64;
         ts_us.max(current_ts)
     }
 
@@ -1793,10 +1917,33 @@ fn make_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
     Ok(queue)
 }
 
-fn buffer_size(bitrate: u32) -> u32 {
-    // bitrate is bits/sec
-    let bytes_per_sec = bitrate / 8;
-    let target_ms = 1000u32;
-    let bytes = bytes_per_sec * target_ms / 1000;
-    std::cmp::max(bytes, 64 * 1024)
+fn buffer_size_bytes(stream_config: &StreamConfig) -> u32 {
+    let bitrate = stream_config.bitrate.max(1) as u64;
+    let fps = stream_config.fps.max(1) as u64;
+    let bytes_per_sec = (bitrate + 7) / 8;
+    let buffer_ms = stream_config.buffer_duration_ms.max(1000);
+    let base = bytes_per_sec.saturating_mul(buffer_ms) / 1000;
+    let max_frame_guess = max_frame_guess_bytes(stream_config, bytes_per_sec, fps);
+    let target = base.max(max_frame_guess.saturating_mul(4)).max(128 * 1024);
+    target.min(u32::MAX as u64) as u32
+}
+
+fn max_frame_guess_bytes(
+    stream_config: &StreamConfig,
+    bytes_per_sec: u64,
+    fps: u64,
+) -> u64 {
+    let avg_frame = bytes_per_sec / fps.max(1);
+    let speed = stream_config.interframe_speed.max(1) as u64;
+    let factor = 6 + (speed.saturating_sub(1) * 2);
+    avg_frame.saturating_mul(factor)
+}
+
+fn media_queue_capacity(stream_config: &StreamConfig) -> usize {
+    let fps = stream_config.fps.max(1) as u64;
+    let buffer_ms = stream_config.buffer_duration_ms.max(1000);
+    let base = (fps * buffer_ms) / 1000;
+    let min_capacity = if stream_config.bitrate >= 2_000_000 { 1000 } else { 300 };
+    let target = base.saturating_mul(4) as usize;
+    target.max(min_capacity).min(5000)
 }

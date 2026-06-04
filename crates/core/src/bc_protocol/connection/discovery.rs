@@ -793,7 +793,7 @@ impl Discoverer {
         const MAP_PUNCH_ATTEMPTS: usize = 5;
         let register_dmap = register_result.dmap;
         let mut reply = ReceiverStream::new(self.subscribe(0).await?);
-        let mut deadline = tokio::time::sleep(*MAXIMUM_WAIT);
+        let deadline = tokio::time::sleep(*MAXIMUM_WAIT);
         tokio::pin!(deadline);
 
         let mut punch_interval = interval(*RESEND_WAIT);
@@ -1190,10 +1190,6 @@ pub(crate) struct Discovery {
 }
 
 impl Discovery {
-    pub(crate) async fn new() -> Result<Self> {
-        Self::new_with_region(None).await
-    }
-
     pub(crate) async fn new_with_region(relay_region: Option<String>) -> Result<Self> {
         Ok(Self {
             discoverer: Discoverer::new().await?,
@@ -1337,6 +1333,10 @@ impl Discovery {
         // drop(discoverer_ref);
 
         let socket = self.discoverer.get_socket().await;
+        log::info!(
+            "MEDIA PATH: direct P2P over LAN to {} (NOT via Reolink relay)",
+            connect_result.addr
+        );
         Ok(DiscoveryResult {
             socket,
             addr: connect_result.addr,
@@ -1368,6 +1368,10 @@ impl Discovery {
         }?;
         trace!("connect_result: {:?}", connect_result);
         let socket = self.discoverer.get_socket().await;
+        log::info!(
+            "MEDIA PATH: direct P2P to camera device address {} (NOT via Reolink relay)",
+            connect_result.addr
+        );
         Ok(DiscoveryResult {
             socket,
             addr: connect_result.addr,
@@ -1389,6 +1393,10 @@ impl Discovery {
         trace!("connect_result: {:?}", connect_result);
 
         let socket = self.discoverer.get_socket().await;
+        log::info!(
+            "MEDIA PATH: direct P2P to camera public/NAT-mapped address {} (dmap hole-punch, NOT via Reolink relay)",
+            connect_result.addr
+        );
         Ok(DiscoveryResult {
             socket,
             addr: connect_result.addr,
@@ -1407,6 +1415,10 @@ impl Discovery {
         trace!("connect_result: {:?}", connect_result);
 
         let socket = self.discoverer.get_socket().await;
+        log::info!(
+            "MEDIA PATH: routed THROUGH Reolink relay servers at {} (NOT direct P2P)",
+            connect_result.addr
+        );
         Ok(DiscoveryResult {
             socket,
             addr: connect_result.addr,
@@ -1429,6 +1441,10 @@ impl Discovery {
             match map_attempt {
                 Ok(Ok(connect_result)) => {
                     log::info!("Relay-assisted P2P map succeeded at {}", connect_result.addr);
+                    log::info!(
+                        "MEDIA PATH: direct P2P to camera public/NAT-mapped address {} (dmap hole-punch, NOT via Reolink relay)",
+                        connect_result.addr
+                    );
                     let socket = self.discoverer.get_socket().await;
                     return Ok(DiscoveryResult {
                         socket,

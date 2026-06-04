@@ -38,8 +38,9 @@ use tokio_util::{
 
 const MTU: usize = 1350;
 const UDPDATA_HEADER_SIZE: usize = 20;
-const SOCKET_IN_CAPACITY: usize = 2000;
-const SOCKET_OUT_CAPACITY: usize = 16000;
+const SOCKET_IN_CAPACITY: usize = 4096;
+const SOCKET_OUT_CAPACITY: usize = 32768;
+pub(crate) const DEFAULT_GAP_SKIP_WAIT_MS: u64 = 120;
 
 pub(crate) type InnerFramed = Framed<Compat<IntoAsyncRead<UdpPayloadSource>>, BcCodex>;
 pub(crate) struct UdpSource {
@@ -55,11 +56,12 @@ impl UdpSource {
         username: T,
         password: Option<U>,
         debug: bool,
+        gap_skip_wait: Duration,
     ) -> Result<Self> {
         let stream = Arc::new(connect().await?);
 
         Self::new_from_socket(
-            stream, addr, client_id, camera_id, username, password, debug,
+            stream, addr, client_id, camera_id, username, password, debug, gap_skip_wait,
         )
         .await
     }
@@ -68,6 +70,7 @@ impl UdpSource {
         username: T,
         password: Option<U>,
         debug: bool,
+        gap_skip_wait: Duration,
     ) -> Result<Self> {
         // Ensure that the discovery keep alive are all stopped here
         // We now handle all coms in UdpSource
@@ -80,6 +83,7 @@ impl UdpSource {
             username,
             password,
             debug,
+            gap_skip_wait,
         )
         .await
     }
@@ -92,9 +96,12 @@ impl UdpSource {
         username: T,
         password: Option<U>,
         debug: bool,
+        gap_skip_wait: Duration,
     ) -> Result<Self> {
         let bcudp_source = BcUdpSource::new_from_socket(stream, addr).await?;
-        let payload_source = bcudp_source.into_payload_source(client_id, camera_id).await;
+        let payload_source = bcudp_source
+            .into_payload_source(client_id, camera_id, gap_skip_wait)
+            .await;
         let async_read = payload_source.into_async_read().compat();
         let codex = if debug {
             BcCodex::new_with_debug(Credentials::new(username, password))
@@ -178,8 +185,9 @@ impl BcUdpSource {
         self,
         client_id: i32,
         camera_id: i32,
+        gap_skip_wait: Duration,
     ) -> UdpPayloadSource {
-        UdpPayloadSource::new(self, client_id, camera_id).await
+        UdpPayloadSource::new(self, client_id, camera_id, gap_skip_wait).await
     }
 }
 
@@ -306,6 +314,13 @@ struct UdpPayloadInner {
     sent: BTreeMap<u32, UdpData>,
     recieved: BTreeMap<u32, Vec<u8>>,
     last_delivery_at: Instant,
+    gap_skip_wait: Duration,
+    // --- debug transport stats (1/sec heartbeat) ---
+    stat_last_report: Instant,
+    stat_pkts_in: u64,
+    stat_bytes_in: u64,
+    stat_delivered: u64,
+    stat_resends: u64,
     /// Offical Client does ack every 10ms if we don't also do this the camera
     /// seems to think we have a poor connection and will abort
     /// This `ack_interval` controls how ofen we do this
@@ -323,6 +338,7 @@ impl UdpPayloadInner {
         thread_sink: ReceiverStream<Vec<u8>>,
         client_id: i32,
         camera_id: i32,
+        gap_skip_wait: Duration,
     ) -> Self {
         let mut set = JoinSet::new();
         let camera_addr = inner.addr;
@@ -486,6 +502,11 @@ impl UdpPayloadInner {
             }
         });
 
+        log::info!(
+            "UDP gap skip wait set to {}ms",
+            gap_skip_wait.as_millis()
+        );
+
         Self {
             camera_addr,
             ack_tx,
@@ -500,6 +521,12 @@ impl UdpPayloadInner {
             sent: Default::default(),
             recieved: Default::default(),
             last_delivery_at: Instant::now(),
+            gap_skip_wait,
+            stat_last_report: Instant::now(),
+            stat_pkts_in: 0,
+            stat_bytes_in: 0,
+            stat_delivered: 0,
+            stat_resends: 0,
             resend_interval: interval(Duration::from_millis(500)), // Offical Client does resend every 500ms
             ack_latency: Default::default(),
             cancel,
@@ -512,6 +539,7 @@ impl UdpPayloadInner {
             _ = self.resend_interval.tick() => {
                 log::trace!("Resend Tick");
                 for (_, resend) in self.sent.iter() {
+                    self.stat_resends += 1;
                     self.socket_in.feed(BcUdp::Data(resend.clone())).await?;
                 }
                 self.ack_tx.send_replace(self.build_send_ack()); // Ensure we update the ack packet sometimes too
@@ -565,6 +593,8 @@ impl UdpPayloadInner {
                         BcUdp::Data(data)  => {
                             if data.connection_id == self.client_id {
                                 let packet_id = data.packet_id;
+                                self.stat_pkts_in += 1;
+                                self.stat_bytes_in += data.payload.len() as u64;
                                 if packet_id >= self.packets_want {
                                     // error!("packets_want: {}", this.packets_want);
                                     self.recieved.insert(packet_id, data.payload);
@@ -581,14 +611,19 @@ impl UdpPayloadInner {
         log::trace!("Send");
         if self.packets_want > 0 && !self.recieved.is_empty() {
             let wait = self.last_delivery_at.elapsed();
-            if wait >= Duration::from_millis(300) {
+            if wait >= self.gap_skip_wait {
                 if let Some(&next_id) = self.recieved.keys().next() {
                     if next_id > self.packets_want {
+                        let last_id = self.recieved.keys().max().copied().unwrap_or(next_id);
+                        let gap_len = next_id.saturating_sub(self.packets_want);
                         log::warn!(
-                            "UDP payload gap: skipping missing packets {}..{} after {:?}",
+                            "UDP payload gap: skipping missing packets {}..{} (gap={}, wait={:?}, pending={}, max_id={})",
                             self.packets_want,
                             next_id.saturating_sub(1),
-                            wait
+                            gap_len,
+                            wait,
+                            self.recieved.len(),
+                            last_id,
                         );
                         self.packets_want = next_id;
                         self.ack_tx.send_replace(self.build_send_ack());
@@ -599,8 +634,31 @@ impl UdpPayloadInner {
         while let Some(payload) = self.recieved.remove(&self.packets_want) {
             log::trace!("  + {}", self.packets_want);
             self.packets_want += 1;
+            self.stat_delivered += 1;
             self.thread_stream.feed(Ok(payload)).await?;
             self.last_delivery_at = Instant::now();
+        }
+        if self.stat_last_report.elapsed() >= Duration::from_secs(1) {
+            let win = self.stat_last_report.elapsed();
+            let kbps = (self.stat_bytes_in as f64 * 8.0 / 1000.0) / win.as_secs_f64().max(0.001);
+            log::debug!(
+                "UDP HB: in_pkts={} in_kbps={:.0} delivered={} resends={} packets_want={} sent_unacked={} recieved_pending={} ack_latency_us={} since_delivery={:?} win={:?}",
+                self.stat_pkts_in,
+                kbps,
+                self.stat_delivered,
+                self.stat_resends,
+                self.packets_want,
+                self.sent.len(),
+                self.recieved.len(),
+                self.ack_latency.get_value(),
+                self.last_delivery_at.elapsed(),
+                win,
+            );
+            self.stat_pkts_in = 0;
+            self.stat_bytes_in = 0;
+            self.stat_delivered = 0;
+            self.stat_resends = 0;
+            self.stat_last_report = Instant::now();
         }
         log::trace!("recieved: {}", self.recieved.len());
         log::trace!("Flush");
@@ -638,7 +696,24 @@ impl UdpPayloadInner {
                 connection_id: self.camera_id,
                 packet_id: first_missing - 1, // Last we actually have is first_missing - 1
                 group_id: 0,
-                maybe_latency: self.ack_latency.get_value(),
+                // Report zero latency to the camera.
+                //
+                // This field feeds the camera's adaptive-bitrate / congestion control.
+                // A non-zero value makes the camera treat the link as poor and downshift
+                // to a low "fluent" floor (~340 kbps even on a 4 Mbps main stream over a
+                // healthy direct-P2P connection). The previous `AckLatency` value was also
+                // computed incorrectly: it measured the inter-arrival gap between the
+                // camera's Acks (i.e. how often the camera acks our near-zero uplink), not
+                // real link latency, producing a steady ~21 ms that permanently pinned the
+                // bitrate. Reporting 0 ("healthy link") lets the camera serve full bitrate.
+                // Genuine packet loss is still handled by the reliable-UDP layer (resend +
+                // gap-skip), so always-0 is safe on good links.
+                //
+                // TODO(adaptive): on genuinely lossy links a smarter signal could be fed
+                // here (e.g. raise it only when `recieved`/gap-skips indicate real
+                // congestion) instead of a constant 0. `AckLatency` is kept and logged in
+                // the UDP heartbeat (`ack_latency_us=`) for exactly that future use.
+                maybe_latency: 0,
                 payload: missing_ids,
             }
         } else {
@@ -677,7 +752,12 @@ impl Drop for UdpPayloadInner {
     }
 }
 impl UdpPayloadSource {
-    async fn new(inner: BcUdpSource, client_id: i32, camera_id: i32) -> Self {
+    async fn new(
+        inner: BcUdpSource,
+        client_id: i32,
+        camera_id: i32,
+        gap_skip_wait: Duration,
+    ) -> Self {
         let (inner_sink, thread_sink) = channel(100);
         let (thread_stream, inner_stream) = channel(100);
 
@@ -687,6 +767,7 @@ impl UdpPayloadSource {
             ReceiverStream::new(thread_sink),
             client_id,
             camera_id,
+            gap_skip_wait,
         );
         let cancel_token = tokio_util::sync::CancellationToken::new();
 

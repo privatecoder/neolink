@@ -95,6 +95,7 @@ impl AddressOrUid {
                 password: camera_config.password.clone(),
             },
             debug: false,
+            udp_gap_skip_ms: camera_config.udp_gap_skip_ms,
         };
 
         trace!("Camera Info: {:?}", options);

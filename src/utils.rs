@@ -102,6 +102,7 @@ impl AddressOrUid {
             },
             debug: camera_config.debug,
             max_discovery_retries: camera_config.max_discovery_retries,
+            udp_gap_skip_ms: camera_config.udp_gap_skip_ms,
         };
 
         trace!("Camera Info: {:?}", options);
@@ -120,6 +121,16 @@ pub(crate) async fn connect_and_login(camera_config: &CameraConfig) -> Result<Bc
     info!(
         "{}: Connecting to camera at {}",
         camera_config.name, camera_addr
+    );
+    info!(
+        "{}: Effective connection config: discovery={:?}, relay_region={:?}, udp_gap_skip_ms={:?}, max_encryption={}, max_discovery_retries={}, stream={:?}",
+        camera_config.name,
+        camera_config.discovery,
+        camera_config.relay_server_region,
+        camera_config.udp_gap_skip_ms,
+        camera_config.max_encryption,
+        camera_config.max_discovery_retries,
+        camera_config.stream,
     );
 
     let camera = camera_addr

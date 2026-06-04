@@ -317,7 +317,7 @@ impl NeoCam {
                                 "{name}: All permits dropped, keeping relay warm for {}s",
                                 warm_secs
                             );
-                            let mut warm_deadline = sleep(Duration::from_secs(warm_secs));
+                            let warm_deadline = sleep(Duration::from_secs(warm_secs));
                             tokio::pin!(warm_deadline);
                             tokio::select! {
                                 _ = &mut warm_deadline => {

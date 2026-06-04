@@ -6,6 +6,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::{
     collections::HashMap,
     sync::atomic::{AtomicBool, AtomicU16, Ordering},
+    time::Duration,
 };
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -106,6 +107,8 @@ pub struct BcCameraOpt {
     pub credentials: Credentials,
     /// Toggle debug print of underlying data
     pub debug: bool,
+    /// UDP gap skip wait in ms for packet reassembly (None uses default).
+    pub udp_gap_skip_ms: Option<u64>,
 }
 
 /// Used to choose the print format of various status messages like battery levels
@@ -340,6 +343,11 @@ impl BcCamera {
     pub async fn new(options: &BcCameraOpt) -> Result<Self> {
         let username: String = options.credentials.username.clone();
         let passwd: Option<String> = options.credentials.password.clone();
+        let gap_skip_wait = Duration::from_millis(
+            options
+                .udp_gap_skip_ms
+                .unwrap_or(connection::DEFAULT_GAP_SKIP_WAIT_MS),
+        );
 
         let (sink, source): (BcConnSink, BcConnSource) = {
             match BcCamera::find_camera(options).await? {
@@ -355,6 +363,7 @@ impl BcCamera {
                         &username,
                         passwd.as_ref(),
                         options.debug,
+                        gap_skip_wait,
                     )
                     .await?
                     .split();

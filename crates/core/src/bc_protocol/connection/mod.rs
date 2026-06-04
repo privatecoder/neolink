@@ -16,7 +16,7 @@ mod udpsource;
 
 pub(crate) use self::{
     bcconn::BcConnection, bcconn::*, bcsub::BcSubscription, discovery::Discovery,
-    tcpsource::TcpSource, udpsource::UdpSource,
+    tcpsource::TcpSource, udpsource::UdpSource, udpsource::DEFAULT_GAP_SKIP_WAIT_MS,
 };
 
 pub(crate) struct DiscoveryResult {

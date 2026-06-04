@@ -1969,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "neolink"
-version = "0.6.4-beta.11"
+version = "0.6.4-beta.12"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2006,7 +2006,7 @@ dependencies = [
 
 [[package]]
 name = "neolink_core"
-version = "0.6.3-rc.3"
+version = "0.6.3-rc.4"
 dependencies = [
  "aes",
  "assert_matches",
@@ -2016,7 +2016,7 @@ dependencies = [
  "crc32fast",
  "crossbeam-channel",
  "delegate",
- "env_logger 0.11.8",
+ "env_logger 0.10.2",
  "futures",
  "get_if_addrs",
  "indoc",

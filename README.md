@@ -54,6 +54,49 @@ uid = "BCDEF0123456789A"
 address = "192.168.1.10"
 ```
 
+### Connection / Discovery Methods
+
+Neolink reaches a camera over the proprietary Baichuan protocol, and there are
+several ways to find and connect to it. The per-camera `discovery` option selects
+which. Reolink's lookup servers (region picked by `relay_server_region`) return up
+to three candidate addresses: the camera's **LAN** address (`dev`), its **public /
+NAT-mapped** address (`dmap`, used for P2P hole-punching), and a **Reolink relay
+server** (`relay`, which forwards traffic on your behalf).
+
+```toml
+[[cameras]]
+  discovery = "relay"   # default
+```
+
+| Method   | What it does | Media path | Bandwidth |
+|----------|--------------|------------|-----------|
+| `local`  | LAN broadcast | **Direct P2P** on the LAN | Full. Same network only. |
+| `remote` | Connect to the camera's `dev` address | **Direct P2P** | Full, if the `dev` address is routable from the host. |
+| `map`    | Hole-punch to the camera's public (`dmap`) address | **Direct P2P** | Full, works through NAT. No relay fallback. |
+| `relay`  | `dmap` hole-punch first, Reolink relay server as fallback | **Direct P2P** when the punch works; **relayed** only if it can't | Full on P2P; the relay-server fallback is forwarded through Reolink and may be slower / rate-limited. |
+| `cellular` | `map` + `relay` | as above | as above |
+| `debug`  | tries everything, first success wins | whichever wins | — |
+
+Despite its name, **`relay` prefers a direct P2P connection** and only forwards
+through Reolink's servers when peer-to-peer is genuinely impossible — so it is the
+recommended default for remote cameras. Use `map` to force pure P2P (no fallback),
+or `local` on the same LAN.
+
+**Bandwidth:** direct P2P (`local` / `remote` / `map`, and `relay`'s P2P branch)
+carries the **full camera bitrate** — a 4 MBit/s 4K main stream streams in real
+time. Only the Reolink relay-server *fallback* is subject to Reolink's
+infrastructure. (Prior to 0.6.4-beta.12 a bug in the latency value Neolink reported
+to the camera throttled *even direct P2P* to ~340 kbps; this is now fixed.)
+
+Each connection logs which path it actually took:
+
+```
+MEDIA PATH: direct P2P to camera public/NAT-mapped address 37.x.x.x:52381 (dmap hole-punch, NOT via Reolink relay)
+```
+
+See [docs/connection-and-bandwidth.md](docs/connection-and-bandwidth.md) for the
+full reference and the transport diagnostics.
+
 ### MQTT
 
 To use mqtt you will need to adjust your config file as such:

@@ -39,6 +39,16 @@ pub(crate) struct CameraConfig {
     #[serde(default, alias = "relay_region")]
     pub(crate) relay_server_region: Option<String>,
 
+    #[validate(range(
+        min = 0,
+        max = 5000,
+        message = "Invalid UDP gap skip wait (ms)",
+        code = "udp_gap_skip_ms"
+    ))]
+    /// How long to wait for missing UDP packets before skipping (ms).
+    #[serde(default, alias = "udp_gap_skip_ms")]
+    pub(crate) udp_gap_skip_ms: Option<u64>,
+
     #[serde(default = "default_maxenc")]
     #[validate(regex(
         path = *RE_MAXENC_SRC,
