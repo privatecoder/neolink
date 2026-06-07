@@ -22,7 +22,6 @@ This is a hardened fork of Neolink, with improvements focused on connection
 stability and on-demand connection behavior. It builds on the work of the
 original Neolink authors (credited in `LICENSE` and `Cargo.toml`).
 
-
 ## Installation
 
 Download from the
@@ -39,22 +38,59 @@ There's a more complete example in this repo's
 in the [Camera Configuration Reference](#camera-configuration-reference) below, but
 the following should work as a minimal example.
 
+Each camera needs **either** a `uid` (for P2P/relay discovery) **or** an
+`address` (a direct `ip[:port]`; the port defaults to `9000` if omitted) — not
+both.
+
 ```toml
 bind = "0.0.0.0"
 
+# A camera reached by UID (P2P / relay)
 [[cameras]]
 name = "Camera01"
 username = "admin"
 password = "password"
 uid = "ABCDEF0123456789"
 
+# A camera reached by a direct address on your LAN
 [[cameras]]
 name = "Camera02"
 username = "admin"
 password = "password"
-uid = "BCDEF0123456789A"
-address = "192.168.1.10"
+address = "192.168.1.10:9000"
 ```
+
+### Server / Global Options
+
+Top-level options (outside any `[[cameras]]` block) configure the RTSP server:
+
+```toml
+bind = "0.0.0.0"          # interface to bind the RTSP server to (default 0.0.0.0)
+bind_port = 8554          # RTSP port (default 8554)
+
+# Optional TLS for the RTSP server. With a certificate set, connect with rtsps://.
+# The PEM must contain both the certificate and the private key.
+# certificate = "/path/to/server.pem"
+# tls_client_auth = "none"   # none | request | require (default none)
+```
+
+To password-protect the RTSP mountpoints, add `[[users]]`. Without any users,
+anyone can connect with no credentials. Restrict a camera to specific users with
+`permitted_users`:
+
+```toml
+[[users]]
+name = "me"
+pass = "mepass"
+
+[[cameras]]
+name = "Camera01"
+# ...
+permitted_users = ["me"]   # default: all users may view
+```
+
+With users defined, connect like
+`rtsp://me:mepass@<host>:8554/Camera01` (or `rtsps://…` when TLS is enabled).
 
 ### Connection / Discovery Methods
 
@@ -129,6 +165,11 @@ OR for only mqtt
 ```bash
 ./neolink mqtt --config=neolink.toml
 ```
+
+The `[mqtt]` block accepts: `broker_addr` (alias `server`), `port`, optional
+`credentials = ["user", "pass"]`, and **optional TLS** — either `ca = "/path/ca.pem"`
+(server-cert verification) **or** `client_auth = ["/path/client.pem", "/path/client.key"]`
+(mutual TLS). `ca` and `client_auth` are mutually exclusive.
 
 Neolink will publish these messages:
 
@@ -364,9 +405,9 @@ All per-camera options (under `[[cameras]]`), with defaults. Sub-tables
 | `use_splash` (alias `splash`) | `true` | Show the `splash_pattern` ("Stream not Ready") instead of a **404** in the brief window before the real stream factory is mounted (helps clients like Blue Iris that give up forever on a 404), and as a fallback if the video codec can't be determined. **Not** a live "connecting" placeholder — it does not play during a connect and transition to the real stream. |
 | `splash_pattern` (alias `pattern`) | `Snow` | Splash look: `Snow`, `Smpte`, `Black`, `White`, `Red`, `Green`, … |
 
-Global (top-level) options: `bind` (default `0.0.0.0`), the RTSP port (default
-`8554`, or via `NEO_LINK_PORT` / the `--config` command), `[mqtt]` (broker), and
-`[[users]]` (RTSP auth) — see the relevant sections above.
+Top-level options (`bind`, `bind_port`, `certificate`, `tls_client_auth`,
+`[[users]]`, `[mqtt]`) are documented under
+[Server / Global Options](#server--global-options) and [MQTT](#mqtt).
 
 ### Pause
 
@@ -381,12 +422,15 @@ username = "admin"
 password = "password"
 uid = "ABCDEF0123456789"
   [cameras.pause]
-  on_motion = true # Should pause when no motion
-  on_client = true # Should pause when no rtsp client
-  timeout = 2.1 # How long to wait after motion stops before pausing
+  on_motion = true    # pause the stream while there is no motion (default false)
+  on_disconnect = true # pause while no RTSP client is connected (alias: on_client) (default false)
+  timeout = 2.1       # seconds to wait after motion stops before pausing (alias: motion_timeout) (default 1.0)
+  mode = "still"      # what to show while paused: black | still | test | none (default none)
 ```
 
-Then start the rtsp server as usual:
+`mode` controls the placeholder shown while paused: `black` (black frame),
+`still` (freeze the last frame), `test` (a test pattern), or `none` (stop sending
+frames). Then start the rtsp server as usual:
 
 ```bash
 ./neolink rtsp --config=neolink.toml
@@ -540,23 +584,32 @@ neolink status-light --config=config.toml CameraName [on|off]
 
 ### Talk
 
-You can talk over the camera using
+You can send audio to the camera's speaker ("talk"). Provide audio from either a
+file or a microphone — Neolink decodes it, resamples it, and re-encodes it to the
+ADPCM format the camera expects (the camera dictates the sample rate / block size,
+so you don't specify them).
+
+From an audio file (any format GStreamer can decode):
 
 ```bash
-neolink talk --config=config.toml --adpcm-file=data.adpc\
-               --sample-rate=16000 --block-size=512 CameraName
+neolink talk --config=config.toml --file-path=announcement.wav CameraName
 ```
 
-Where the sounds is ADPCM encoded
-
-or
+From a microphone:
 
 ```bash
-neolink talk --config=config.toml --microphone  CameraName
+neolink talk --config=config.toml --microphone CameraName
 ```
 
-Which uses the default microphone which depends on
-[gstreamer](https://gstreamer.freedesktop.org/documentation/autodetect/autoaudiosrc.html?gi-language=c#autoaudiosrc-page)
+The microphone source defaults to
+[`autoaudiosrc`](https://gstreamer.freedesktop.org/documentation/autodetect/autoaudiosrc.html?gi-language=c#autoaudiosrc-page);
+override it with `--input-src "alsasrc device=hw:1"`. Other options:
+
+- `--volume <f>` — input volume (default `1.0`)
+- `--noise-suppression` (with `--noise-suppression-level <n>`, default `1`) — WebRTC noise suppression
+- `--echo-cancel` (with `--echo-suppression-level <n>`, default `2`) — WebRTC echo cancellation
+
+(`--microphone`/`--input-src` and `--file-path` are mutually exclusive.)
 
 ### PTZ
 
@@ -588,6 +641,36 @@ neolink ptz --config=config.toml CameraName zoom 2.5
 
 With 1.0 being normal and 2.5 being 2.5x zoom
 
+### Services (camera ports)
+
+You can inspect and change the camera's service ports (`baichuan`, `http`,
+`https`, `rtmp`, `rtsp`, `onvif`):
+
+```bash
+# Show the current state of a service
+neolink services --config=config.toml CameraName rtsp get
+# Turn a service on or off
+neolink services --config=config.toml CameraName onvif off
+# Set the port (and optionally on/off)
+neolink services --config=config.toml CameraName http port 8080
+neolink services --config=config.toml CameraName http set 8080 on
+```
+
+### Users (camera accounts)
+
+You can manage the camera's own user accounts:
+
+```bash
+# List users
+neolink users --config=config.toml CameraName list
+# Add a user (type: user | administrator)
+neolink users --config=config.toml CameraName add alice secret administrator
+# Change a user's password
+neolink users --config=config.toml CameraName password alice newsecret
+# Delete a user
+neolink users --config=config.toml CameraName delete alice
+```
+
 ## License
 
 Neolink is free software, released under the GNU Affero General Public License
@@ -595,9 +678,3 @@ v3.
 
 This means that if you incorporate it into a piece of software available over
 the network, you must offer that software's source code to your users.
-
-## Donations
-
-If you find this code helpful please consider supporting development.
-
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/G2G5HOYIZ)
