@@ -5,7 +5,7 @@ use std::str::FromStr;
 /// A standards-compliant bridge to Reolink IP cameras
 ///
 /// Neolink is free software released under the GNU AGPL v3.
-/// You can find its source code at https://github.com/thirtythreeforty/neolink
+/// You can find its source code at https://github.com/privatecoder/neolink
 #[derive(Parser, Debug)]
 #[command(name = "neolink", arg_required_else_help = true, version = crate_version!(), author = crate_authors!("\n"))]
 pub struct Opt {

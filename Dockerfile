@@ -2,6 +2,7 @@
 # Copyright (c) 2020 George Hilliard,
 #                    Andrew King,
 #                    Miroslav Šedivý
+# Copyright (c) 2026 privatecoder
 # SPDX-License-Identifier: AGPL-3.0-only
 
 FROM docker.io/rust:slim-bookworm AS build-base

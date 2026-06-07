@@ -2,9 +2,10 @@
 name = "neolink"
 description = "A standards-compliant bridge to Reolink IP cameras"
 version = "0.7.0"
-authors = []
+authors = ["privatecoder"]
 edition = "2018"
 license = "AGPL-3.0-or-later"
+repository = "https://github.com/privatecoder/neolink"
 
 [workspace]
 members = [

@@ -20,7 +20,7 @@
 //! You should have received a copy of the GNU General Public License along with this program. If
 //! not, see <https://www.gnu.org/licenses/>.
 //!
-//! Neolink source code is available online at <https://github.com/QuantumEntangledAndy/neolink>
+//! Neolink source code is available online at <https://github.com/privatecoder/neolink>
 //!
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
