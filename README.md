@@ -18,8 +18,9 @@ does has been reverse engineered.
 
 ## This Fork
 
-This fork is an extension of
-[QuantumEntangledAndy's](https://github.com/QuantumEntangledAndy/neolink) with some attempted improvements for stability.
+This is a hardened fork of Neolink, with improvements focused on connection
+stability and on-demand connection behavior. It builds on the work of the
+original Neolink authors (credited in `LICENSE` and `Cargo.toml`).
 
 
 ## Installation
@@ -86,8 +87,8 @@ or `local` on the same LAN.
 **Bandwidth:** direct P2P (`local` / `remote` / `map`, and `relay`'s P2P branch)
 carries the **full camera bitrate** — a 4 MBit/s 4K main stream streams in real
 time. Only the Reolink relay-server *fallback* is subject to Reolink's
-infrastructure. (Prior to 0.6.4-beta.12 a bug in the latency value Neolink reported
-to the camera throttled *even direct P2P* to ~340 kbps; this is now fixed.)
+infrastructure. (A bug in the latency value Neolink reported to the camera once
+throttled *even direct P2P* to ~340 kbps; this is now fixed.)
 
 Each connection logs which path it actually took:
 
@@ -458,12 +459,12 @@ new requested activation such as a client connecting or an mqtt command.
 
 ### Docker
 
-[Docker](https://hub.docker.com/r/quantumentangledandy/neolink) builds are also
-provided in multiple architectures. The latest tag tracks master while each
-branch gets it's own tag.
+[Docker](https://github.com/privatecoder/neolink/pkgs/container/neolink) builds
+are published to GitHub Container Registry. The `latest` tag tracks the most
+recent release; each pushed tag also gets its own image tag.
 
 ```bash
-docker pull quantumentangledandy/neolink
+docker pull ghcr.io/privatecoder/neolink
 
 # Add `-e "RUST_LOG=debug"` to run with debug logs
 #
@@ -472,7 +473,7 @@ docker pull quantumentangledandy/neolink
 # method then normal bridge mode should work fine
 # and you can ommit this option. Not all OSes support
 # network=host, notably macos lacks this option.
-docker run --network host --volume=$PWD/config.toml:/etc/neolink.toml quantumentangledandy/neolink
+docker run --network host --volume=$PWD/config.toml:/etc/neolink.toml ghcr.io/privatecoder/neolink
 ```
 
 #### Environmental Variables

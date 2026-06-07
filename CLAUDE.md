@@ -10,8 +10,8 @@ and standard clients. Its primary mode runs an RTSP server so NVR software (Blue
 Iris, Shinobi) can consume the camera streams; it also exposes MQTT control and
 one-shot CLI commands (image, battery, ptz, talk, etc.).
 
-This is the `privatecoder` fork of `QuantumEntangledAndy/neolink`, focused on
-stability and on-demand connection behavior.
+This is the `privatecoder/neolink` fork, focused on stability and on-demand
+connection behavior.
 
 ## Build / test / lint
 
@@ -116,13 +116,27 @@ a `mod.rs` `main(opts, reactor)`. `src/main.rs` parses, loads+validates config, 
 `DiscoveryMethods` and the relay region/UDP-gap tuning are surfaced up through
 `CameraConfig` in `src/config.rs` and passed into `BcCameraOpt`.
 
-`docs/reolink.md` holds reverse-engineering findings on Reolink's SongP2P/relay
-behavior — the DMAP relay-map phase, direct-vs-relay path selection (direct P2P
-often carries the stream even when relay is available), and observed frame-size /
-reassembly characteristics (main-stream I-frame bursts up to ~240 KB). Read it
-before touching the discovery/connection/reassembly code.
-`docs/connection-and-bandwidth.md` documents the `discovery` methods and the
-transport diagnostics.
+The `docs/` directory holds the full technical reference for how Neolink talks to
+Reolink cameras — start at [`docs/README.md`](docs/README.md) (index + end-to-end
+overview). Read the relevant page before touching that area:
+
+- [`docs/architecture.md`](docs/architecture.md) — the camera-ownership model
+  (reactor / actors / permits).
+- [`docs/connection-modes.md`](docs/connection-modes.md) — `connect_mode`, the
+  connect/disconnect lifecycle, reconnect + backoff.
+- [`docs/connection-and-bandwidth.md`](docs/connection-and-bandwidth.md) —
+  `discovery` methods, regions, the UDP/CUBIC flow control that governs bitrate, and
+  the transport diagnostics.
+- [`docs/discovery-handshake.md`](docs/discovery-handshake.md) — the UDP P2P
+  negotiation message catalog and per-method sequences.
+- [`docs/bc-protocol.md`](docs/bc-protocol.md) — BC control framing, binary mode,
+  encryption, message IDs.
+- [`docs/media-streams.md`](docs/media-streams.md) — the BcMedia substream format,
+  codecs, stream kinds, and frame-size / reassembly characteristics.
+- [`docs/av-timestamping.md`](docs/av-timestamping.md) — RTSP-output PTS.
+- [`docs/two-way-audio.md`](docs/two-way-audio.md) — talk (ADPCM DVI-4).
+- [`docs/reolink.md`](docs/reolink.md) — empirical SongP2P / RDT notes (direct-vs-relay
+  selection, the CUBIC governor).
 
 ## Transport / bandwidth gotchas (UDP path)
 
@@ -132,10 +146,10 @@ touching `crates/core/src/bc_protocol/connection/udpsource.rs`:
 - **`maybe_latency` is the camera's bitrate lever — report your measured
   received-bytes/second there, not `0`.** Despite the name it is NOT latency: it is
   the receiver's measured throughput (bytes/s) that the camera's CUBIC uses as its
-  bandwidth estimate. History: a miscomputed ACK-inter-arrival value pinned the
-  bitrate to ~340 kbps (pre-beta.12); beta.12 set it to `0`, which cleared that
-  floor but left the camera on a conservative default that capped some models /
-  remote paths at ~2 Mbit/s of a 4 Mbit/s feed; **beta.15 reports the real
+  bandwidth estimate. History: a miscomputed ACK-inter-arrival value originally
+  pinned the bitrate to ~340 kbps; reporting a constant `0` cleared that floor but
+  left the camera on a conservative default that capped some models / remote paths
+  at ~2 Mbit/s of a 4 Mbit/s feed; **Neolink now reports the real
   received-bytes-per-~1s** (`ack_recv_rate`, latched ~1 Hz in `build_send_ack`),
   letting CUBIC ramp to full rate (an affected camera: 1.9→4.7 Mbit/s; others
   unchanged). Pitfalls if you touch this: the unit is bytes/**second** (a
@@ -143,8 +157,7 @@ touching `crates/core/src/bc_protocol/connection/udpsource.rs`:
   under-reports and caps the rate; verified against an official-client packet
   capture (ratio ≈ 1.0). The legacy `AckLatency` (ACK inter-arrival, not RTT) is now
   heartbeat-log-only. Full writeup: `docs/connection-and-bandwidth.md`
-  "`maybe_latency` is the bitrate lever" and `docs/reolink.md` "RDT / p2p_udt flow
-  control".
+  "UDP transport flow control" and `docs/reolink.md` "RDT / p2p_udt flow control".
 - **`release_max_level_debug`** (in root `Cargo.toml`'s `log` dependency) compiles
   **all `log::trace!` out of release builds** — including Docker. Diagnostics that
   must survive release use `log::debug!`. The per-second `UDP HB:` heartbeat in

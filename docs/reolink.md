@@ -1,102 +1,62 @@
-# Reolink P2P / Relay Findings
+# Reolink SongP2P / RDT — empirical notes
 
-## Topline
-- The SDK uses **SongP2P (BC_P2P_TYPE_SONG)** and attempts **direct + relay + LAN** in parallel.
-- In practice, the stream can be **direct P2P** even when relay is available (blocking relay does not stop stream; blocking direct peer does).
-- The relay-assisted map step appears to use a **DMAP / relay map** phase ("Q ok" and "2rly" entries), which lines up with the relay server IPs listed below.
+Protocol-level observations about Reolink's P2P and reliable-UDP transport that
+underpin the connection and streaming behaviour. The detailed, field-level specs live
+in the topic docs; this file captures the SDK/protocol facts and the things that were
+established empirically (disassembly + packet capture).
 
-## P2P / Relay Evidence
-- Connection type: `connType=3`, `connRet=0` in most runs.
-- P2P type: `BC_P2P_TYPE_SONG`, `p2pRet=0`.
-- Summary shows all paths available:
-  - `direct=yes relay=yes lan=yes connFdTypes=3,2`
-- **Direct P2P** peer (external): `37.15.103.160:54392` (from `2p:` line).
-- **LAN** peer: `192.168.1.10:54392` (from `2sub:` line).
-- **Relay** peer: `13.38.26.165:<port>` (from `2rly:` line), with relay map / Q ok on `13.38.26.165:58200`.
-- **Mapping / server list** includes multiple relay / map servers, example subset:
-  - `119.23.230.154` (server from SongP2P debug)
-  - `13.38.26.165` (relay/map)
-  - `43.204.92.13`, `35.156.78.129`, `35.152.156.39`, `52.56.65.139`, `51.16.221.160`, `54.252.82.145`, `129.158.224.26`, `129.213.189.52`, `132.226.204.68`, `144.24.42.1`, `16.163.195.33`, `15.188.197.53`
-- Debug shows `server=119.23.230.154` and `ver=2022.06.10`.
+Cross-references:
 
-## Blocking Test Result (Direct vs Relay)
-- Blocking relay server `13.38.26.165` **did not** stop the stream.
-- Blocking direct peer `37.15.103.160` **did** stop the stream.
-- Conclusion: stream was using **direct P2P**, with relay available as fallback.
+- Connection paths, regions, bandwidth, the `maybe_latency` field, the `UdpAck` wire
+  format, and diagnostics → [connection-and-bandwidth.md](connection-and-bandwidth.md)
+- The UDP discovery message catalog and negotiation sequences →
+  [discovery-handshake.md](discovery-handshake.md)
+- BC control framing and encryption → [bc-protocol.md](bc-protocol.md)
+- The BcMedia substream format and frame characteristics →
+  [media-streams.md](media-streams.md)
 
-## LiveOpen Path (Render vs Data)
-- Probe mode (`--bcsdk-data-probe`) uses `BCSDK_LiveOpen2` (compressed/data frames) and then switches to `BCSDK_LiveOpen` (render) after the data probe finishes.
-- Both main and sub follow the same path in probe mode.
+## SongP2P behaviour
 
-## Stream Configuration (Encode Table)
-- Main: `3840x2160`, `fps=20`, `bitrate=4096`, `gop=2`
-- Sub: `640x360`, `fps=10`, `bitrate=256`, `gop=4`
+- The SDK uses **SongP2P** (`BC_P2P_TYPE_SONG`). Direct, relay, and LAN paths are
+  attempted in parallel; the established connection reports a connection type and the
+  set of available path types.
+- A stream can run over **direct P2P even when a relay path is available.** Empirically:
+  blocking the relay server does not interrupt a direct-P2P stream; blocking the direct
+  peer does. The `relay` discovery method therefore prefers a direct hole-punch and
+  uses the relay only as a fallback.
+- Address discovery uses a DMAP / relay-map phase against region-specific Reolink
+  lookup servers, which return the camera's `dev` / `dmap` / `relay` candidates plus a
+  region relay list.
+- The client issues no encoder-control commands during normal streaming (no
+  `E_BC_CMD_SET_ENC_PROFILE` / `E_BC_CMD_IFRAME_PREVIEW`); the encode profile is
+  whatever the camera is configured for.
 
-## Compressed Frame Sizes (DATA_FRAME_DESC)
+## RDT / p2p_udt flow control
 
-### Sub stream (100 frames)
-- `avg=1236.2`, `min=20`, `max=16940`, `maxOverAvg=13.70`
-- Pattern: periodic large frames (~16-17 KB) about every ~15 frames, many very small frames (20-229 B).
-- Estimated packets (MTU=1200):
-  - Large frames: ~14-15 packets
-  - Small frames: 1 packet
+The camera is the reliable-transport **sender** running **CUBIC**. Its send rate is
+governed by receiver feedback in the p2p_udt ACK (the same packet as Neolink's
+`UdpAck`, magic `0x2a87cf20`).
 
-### Main stream (100 frames)
-- `avg=27221.6`, `min=16698`, `max=238005`, `maxOverAvg=8.74`
-- Pattern: periodic very large frames (~226-238 KB) about every ~30 frames, most frames ~17-20 KB.
-- Estimated packets (MTU=1200):
-  - Large frames: ~189-199 packets
-  - Typical frames: ~14-18 packets
+- **`maybe_latency` (offset `0x14`) is the bandwidth lever** — it is the receiver's
+  measured throughput in **bytes per second**, not latency. The receiver reports its
+  actual received bytes over a ~1-second window; this lets CUBIC ramp a high-bitrate
+  stream to full rate. (Field-level detail and the camera-response table:
+  [connection-and-bandwidth.md](connection-and-bandwidth.md) → "UDP transport flow
+  control".)
+- **Cumulative ACK** = `group_id · 2³⁰ + packet_id` (64-bit sequence). **Selective
+  ACK** = the ACK payload bitmap, empty when lossless.
+- There is **no receiver-window field** on this ACK wire.
+  `RDT_Set_Max_Pending_ACK_Number` exists in the SDK but lives in a different module
+  and is not present on the p2p_udt ACK.
+- The `0x2a87cf3a` packet at session start is a standalone encrypted auth/handshake
+  packet, not part of flow control.
 
-## First Frame Properties (Observed)
-- Sub first data frame: `640x360`, `frameRate=15`, `length~16-17 KB`, `extlen=0`.
-- Main first data frame: `3840x2160`, `frameRate=15`, `length~238 KB`, `extlen=120`.
-- Render frames show `format=0` for both streams.
+## Practical implications
 
-## Encoder / IDR Requests
-- No evidence of the app sending `E_BC_CMD_SET_ENC_PROFILE` or `E_BC_CMD_IFRAME_PREVIEW`.
-- No native calls matching `SetEnc*` / `IFramePreview*` observed in logs.
-
-## Transport / Buffer Hints
-- High-level SDK JS logs surface no recv window / buffer / queue hints; the flow
-  control lives in `libBCSDKWrapper.dylib`.
-- Fragmentation fields in DATA_FRAME_DESC were not exposed (`fragFields=NA`).
-
-## RDT / p2p_udt flow control (the throughput governor — solved)
-The camera is the reliable-transport **sender** running **CUBIC**; its rate ramps
-off receiver feedback in the **p2p_udt ACK** (same packet as Neolink's `UdpAck`,
-magic `0x2a87cf20`). Established from the official client's disassembly + a packet
-capture:
-
-- **`maybe_latency` (off 0x14) is the bitrate lever — it is the receiver's measured
-  throughput in BYTES/SECOND, not latency.** The camera's CUBIC uses it as its
-  bandwidth estimate. Capture proof: in the official client this field tracks the
-  measured receive rate at ratio ≈ 1.0 (~525 KB/s at full 4.2 Mbit/s) and freezes at
-  the last 1-second sample when the stream stops (a ~1 Hz latch).
-  - `0` → no estimate → conservative default (full on some models, ~2 Mbit/s on
-    others); a small constant → camera paces down to it (~340 kbps); the **real
-    measured bytes/s** → CUBIC ramps to full rate. **Neolink reports its own
-    received-bytes-per-~1s** (fixed in 0.6.4-beta.15). Unit is bytes/**second** — a
-    bytes/100 ms value is 10× too small and throttles.
-- **Cumulative ACK** = `group_id·2³⁰ + packet_id` (64-bit seq, base `0x40000000`;
-  `0xffffffff/0xffffffff` = nothing acked). **Selective ACK** = the payload truth-map
-  (same as Neolink sends; empty when lossless).
-- `RDT_Set_Max_Pending_ACK_Number` exists in the SDK but lives in a *different*
-  module and is **not** on this p2p_udt ACK wire — there is no window field here.
-- The `0x2a87cf3a` packet is a **standalone encrypted auth/handshake** at session
-  start (not an ACK extension, not flow control). ACK cadence (~12 ms) is not a
-  lever.
-
-Full writeup, the three-act history, and the ruled-out hypotheses are in
-[connection-and-bandwidth.md](connection-and-bandwidth.md) → "`maybe_latency` is the
-bitrate lever".
-
-## Practical Implications for Rust P2P Implementation
-- **Main stream is bursty** with very large I-frame bursts (200-ish packets). Reassembly limits must accommodate ~240 KB frames.
-- **Sub stream is mostly tiny** with periodic larger frames (~17 KB). Easier to reassemble.
-- Ensure relay map / DMAP phase succeeds ("Q ok" to relay server), but do not assume relay path is used; direct P2P may carry the stream.
-- Use SongP2P detail/debug to match relay servers and direct peer addresses.
-- **Report your measured received-bytes/second in ACK `maybe_latency`** (latched ~1
-  Hz), not `0` and not a constant — that is what lets the camera's CUBIC ramp a
-  high-bitrate stream to full rate. It is the receiver's job to feed the sender a
-  truthful delivery-rate estimate.
+- Size reassembly limits for the main stream's ~240 KB I-frame bursts (~200 packets);
+  see [media-streams.md](media-streams.md).
+- Report measured received bytes per second in the ACK `maybe_latency` field
+  (latched ~1 Hz) so the camera ramps to full bitrate — it is the receiver's job to
+  feed the sender a truthful delivery-rate estimate.
+- Do not assume the relay path is in use; direct P2P may carry the stream even when a
+  relay is available.
