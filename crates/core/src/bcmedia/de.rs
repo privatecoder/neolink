@@ -1,16 +1,16 @@
 use super::model::*;
 use crate::Error;
 use bytes::{Buf, BytesMut};
-use nom::{bytes::streaming::take, combinator::*, error::context, number::streaming::*};
+use nom::{bytes::streaming::take, combinator::*, error::context, number::streaming::*, Parser};
 
-type IResult<I, O, E = nom::error::VerboseError<I>> = Result<(I, O), nom::Err<E>>;
+type IResult<I, O, E = nom_language::error::VerboseError<I>> = Result<(I, O), nom::Err<E>>;
 
 // PAD_SIZE: Media packets use 8 byte padding
 const PAD_SIZE: u32 = 8;
 
 impl BcMedia {
     pub(crate) fn deserialize(buf: &mut BytesMut) -> Result<BcMedia, Error> {
-        let (result, len) = match consumed(bcmedia)(buf) {
+        let (result, len) = match consumed(bcmedia).parse(buf) {
             Ok((_, (parsed_buff, result))) => Ok((result, parsed_buff.len())),
             Err(e) => Err(e),
         }?;
@@ -33,7 +33,8 @@ fn bcmedia(buf: &[u8]) -> IResult<&[u8], BcMedia> {
                     | MAGIC_HEADER_BCMEDIA_ADPCM
             )
         }),
-    )(buf)?;
+    )
+    .parse(buf)?;
 
     match magic {
         MAGIC_HEADER_BCMEDIA_INFO_V1 => {
@@ -68,7 +69,8 @@ fn bcmedia_info_v1(buf: &[u8]) -> IResult<&[u8], BcMediaInfoV1> {
     let (buf, _header_size) = context(
         "Header size mismatch in BCMedia InfoV1",
         verify(le_u32, |x| *x == 32),
-    )(buf)?;
+    )
+    .parse(buf)?;
     let (buf, video_width) = le_u32(buf)?;
     let (buf, video_height) = le_u32(buf)?;
     let (buf, _unknown) = le_u8(buf)?;
@@ -114,7 +116,8 @@ fn bcmedia_info_v2(buf: &[u8]) -> IResult<&[u8], BcMediaInfoV2> {
     let (buf, _header_size) = context(
         "Failed to match headersize in BCMedia Info V2",
         verify(le_u32, |x| *x == 32),
-    )(buf)?;
+    )
+    .parse(buf)?;
     let (buf, video_width) = le_u32(buf)?;
     let (buf, video_height) = le_u32(buf)?;
     let (buf, _unknown) = le_u8(buf)?;
@@ -159,14 +162,16 @@ fn bcmedia_info_v2(buf: &[u8]) -> IResult<&[u8], BcMediaInfoV2> {
 fn take4(buf: &[u8]) -> IResult<&[u8], &str> {
     map_res(nom::bytes::streaming::take(4usize), |r| {
         std::str::from_utf8(r)
-    })(buf)
+    })
+    .parse(buf)
 }
 
 fn bcmedia_iframe(buf: &[u8]) -> IResult<&[u8], BcMediaIframe> {
     let (buf, video_type_str) = context(
         "Video Type is unrecognised in IFrame",
         verify(take4, |x| matches!(x, "H264" | "H265")),
-    )(buf)?;
+    )
+    .parse(buf)?;
     let (buf, payload_size) = le_u32(buf)?;
     let (buf, additional_header_size) = le_u32(buf)?;
     let (buf, microseconds) = le_u32(buf)?;
@@ -215,7 +220,8 @@ fn bcmedia_pframe(buf: &[u8]) -> IResult<&[u8], BcMediaPframe> {
     let (buf, video_type_str) = context(
         "Video Type is unrecognised in PFrame",
         verify(take4, |x| matches!(x, "H264" | "H265")),
-    )(buf)?;
+    )
+    .parse(buf)?;
     let (buf, payload_size) = le_u32(buf)?;
     let (buf, additional_header_size) = le_u32(buf)?;
     let (buf, microseconds) = le_u32(buf)?;
@@ -273,7 +279,8 @@ fn bcmedia_adpcm(buf: &[u8]) -> IResult<&[u8], BcMediaAdpcm> {
     let (buf, _magic) = context(
         "ADPCM data magic value is invalid",
         verify(le_u16, |x| *x == MAGIC_HEADER_BCMEDIA_ADPCM_DATA),
-    )(buf)?;
+    )
+    .parse(buf)?;
     // On some camera this value is just 2
     // On other cameras is half the block size without the header
     let (buf, _half_block_size) = le_u16(buf)?;

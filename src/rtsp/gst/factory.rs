@@ -130,7 +130,10 @@ impl NeoMediaFactoryImpl {
         log::debug!("build_pipeline: Acquiring callback lock");
         let callback_guard = self.call_back.blocking_lock();
         let has_callback = callback_guard.is_some();
-        log::debug!("build_pipeline: Lock acquired, callback present: {}", has_callback);
+        log::debug!(
+            "build_pipeline: Lock acquired, callback present: {}",
+            has_callback
+        );
 
         match callback_guard.as_ref() {
             Some(call) => {
@@ -138,7 +141,10 @@ impl NeoMediaFactoryImpl {
                 let new_media = call(media);
                 match new_media {
                     Ok(new_media) => {
-                        log::debug!("build_pipeline: Callback succeeded, returned element: {}", new_media.is_some());
+                        log::debug!(
+                            "build_pipeline: Callback succeeded, returned element: {}",
+                            new_media.is_some()
+                        );
                         Ok(new_media)
                     }
                     Err(e) => {

@@ -77,18 +77,18 @@ impl UdpXml {
         let p2p: Result<P2P, _> = quick_xml::de::from_reader(s);
         p2p.map(|i| i.xml)
     }
-    pub(crate) fn serialize<W: Write>(&self, mut w: W) -> Result<W, quick_xml::de::DeError> {
+    pub(crate) fn serialize<W: Write>(&self, mut w: W) -> Result<W, quick_xml::se::SeError> {
         let mut writer = quick_xml::writer::Writer::new(&mut w);
         // No header on a UdpXml
         // writer.write_event(quick_xml::events::Event::Decl(
         //     quick_xml::events::BytesDecl::new("1.0", Some("UTF-8"), None),
         // ))?;
-        writer
-            .create_element("P2P")
-            .write_inner_content::<_, quick_xml::de::DeError>(|writer| {
-                writer.write_serializable("", &self)?;
-                Ok(())
-            })?;
+        writer.create_element("P2P").write_inner_content(|writer| {
+            writer
+                .write_serializable("", &self)
+                .map_err(std::io::Error::other)?;
+            Ok(())
+        })?;
 
         Ok(w)
     }

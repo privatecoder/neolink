@@ -4,33 +4,22 @@ use bytes::{Buf, BytesMut};
 use log::*;
 use nom::{
     bytes::streaming::take, combinator::*, error::context as error_context, number::streaming::*,
-    sequence::*, Parser,
+    Parser,
 };
 
-type IResult<I, O, E = nom::error::VerboseError<I>> = Result<(I, O), nom::Err<E>>;
+type IResult<I, O, E = nom_language::error::VerboseError<I>> = Result<(I, O), nom::Err<E>>;
 
 impl Bc {
     /// Returns Ok(deserialized data, the amount of data consumed)
     /// Can then use this as the amount that should be remove from a buffer
     pub(crate) fn deserialize(context: &BcContext, buf: &mut BytesMut) -> Result<Bc, Error> {
-        let parser = BcParser { context };
-        let (result, amount) = match consumed(parser)(buf) {
+        let (result, amount) = match consumed(|buf| bc_msg(context, buf)).parse(buf) {
             Ok((_, (parsed_buff, result))) => Ok((result, parsed_buff.len())),
             Err(e) => Err(Error::from(e)),
         }?;
 
         buf.advance(amount);
         Ok(result)
-    }
-}
-
-struct BcParser<'a> {
-    context: &'a BcContext,
-}
-
-impl<'a> Parser<&'a [u8], Bc, nom::error::VerboseError<&'a [u8]>> for BcParser<'a> {
-    fn parse(&mut self, buf: &'a [u8]) -> IResult<&'a [u8], Bc> {
-        bc_msg(self.context, buf)
     }
 }
 
@@ -59,15 +48,16 @@ fn bc_body<'a>(context: &BcContext, header: &BcHeader, buf: &'a [u8]) -> IResult
     }
 }
 
-fn hex32<'a>() -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], String> {
+fn hex32<'a>(
+) -> impl Parser<&'a [u8], Output = String, Error = nom_language::error::VerboseError<&'a [u8]>> {
     map_res(take(32usize), |slice: &'a [u8]| {
         String::from_utf8(slice.to_vec())
     })
 }
 
 fn bc_legacy_login_msg(buf: &'_ [u8]) -> IResult<&'_ [u8], LegacyMsg> {
-    let (buf, username) = hex32()(buf)?;
-    let (buf, password) = hex32()(buf)?;
+    let (buf, username) = hex32().parse(buf)?;
+    let (buf, password) = hex32().parse(buf)?;
 
     Ok((buf, LegacyMsg::LoginMsg { username, password }))
 }
@@ -225,19 +215,21 @@ fn bc_header(buf: &[u8]) -> IResult<&[u8], BcHeader> {
     let (buf, _magic) = error_context(
         "Magic invalid",
         verify(le_u32, |x| *x == MAGIC_HEADER || *x == MAGIC_HEADER_REV),
-    )(buf)?;
-    let (buf, msg_id) = error_context("MsgID missing", le_u32)(buf)?;
-    let (buf, body_len) = error_context("BodyLen missing", le_u32)(buf)?;
-    let (buf, channel_id) = error_context("ChannelID missing", le_u8)(buf)?;
-    let (buf, stream_type) = error_context("StreamType missing", le_u8)(buf)?;
-    let (buf, msg_num) = error_context("MsgNum missing", le_u16)(buf)?;
+    )
+    .parse(buf)?;
+    let (buf, msg_id) = error_context("MsgID missing", le_u32).parse(buf)?;
+    let (buf, body_len) = error_context("BodyLen missing", le_u32).parse(buf)?;
+    let (buf, channel_id) = error_context("ChannelID missing", le_u8).parse(buf)?;
+    let (buf, stream_type) = error_context("StreamType missing", le_u8).parse(buf)?;
+    let (buf, msg_num) = error_context("MsgNum missing", le_u16).parse(buf)?;
     let (buf, (response_code, class)) =
-        error_context("ResponseCode missing", tuple((le_u16, le_u16)))(buf)?;
+        error_context("ResponseCode missing", (le_u16, le_u16)).parse(buf)?;
 
     let (buf, payload_offset) = error_context(
         "Payload Offset is missing",
         cond(has_payload_offset(class), le_u32),
-    )(buf)?;
+    )
+    .parse(buf)?;
 
     Ok((
         buf,

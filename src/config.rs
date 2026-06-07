@@ -1,7 +1,7 @@
 use crate::mqtt::Discoveries;
+use neolink_core::bc_protocol::DiscoveryMethods;
 #[cfg(feature = "gstreamer")]
 use neolink_core::bc_protocol::StreamKind;
-use neolink_core::bc_protocol::DiscoveryMethods;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -268,7 +268,6 @@ pub(crate) struct CameraConfig {
         alias = "max_retries"
     )]
     pub(crate) max_discovery_retries: usize,
-
 }
 
 #[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq, Eq, Hash)]
@@ -364,7 +363,6 @@ fn default_mqtt() -> MqttConfig {
         discovery: Default::default(),
     }
 }
-
 
 fn default_discovery() -> DiscoveryMethods {
     DiscoveryMethods::Relay
@@ -508,7 +506,6 @@ fn default_certificate() -> Option<String> {
 fn default_tls_client_auth() -> String {
     "none".to_string()
 }
-
 
 fn default_channel_id() -> u8 {
     0

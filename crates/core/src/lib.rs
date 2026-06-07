@@ -77,4 +77,4 @@ pub use bc_protocol::Error;
 
 pub(crate) use bc_protocol::{Credentials, Result};
 
-pub(crate) type NomErrorType<'a> = nom::error::VerboseError<&'a [u8]>;
+pub(crate) type NomErrorType<'a> = nom_language::error::VerboseError<&'a [u8]>;

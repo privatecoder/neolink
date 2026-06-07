@@ -93,7 +93,9 @@ impl NeoInstance {
                         if let Err(e) = camera_permit.aquired_users().await {
                             break AnyResult::Err(e);
                         }
-                        log::info!("{thread_name2}: Stream permit acquired, starting camera stream");
+                        log::info!(
+                            "{thread_name2}: Stream permit acquired, starting camera stream"
+                        );
                         tokio::select! {
                             v = camera_permit.dropped_users() => {
                                 log::debug!("{thread_name2}: Dropped users: {v:?}");

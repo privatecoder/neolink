@@ -37,5 +37,5 @@ pub struct Opt {
     #[arg(long, default_value = "2")]
     pub echo_suppression_level: i32,
     #[arg(long, default_value = "1")]
-    pub noise_suppression_level: i32
+    pub noise_suppression_level: i32,
 }

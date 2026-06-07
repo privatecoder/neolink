@@ -10,7 +10,7 @@ use futures::{
     sink::{Sink, SinkExt},
     stream::{IntoAsyncRead, Stream, StreamExt, TryStreamExt},
 };
-use rand::{seq::SliceRandom, thread_rng, Rng};
+use rand::{rng, seq::SliceRandom, RngExt};
 use socket2::SockRef;
 use std::collections::BTreeMap;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
@@ -396,8 +396,8 @@ impl UdpPayloadInner {
                                         // Might also have to do this for the relay but not sure
                                         let msg = BcUdp::Discovery(UdpDiscovery {
                                             tid: {
-                                                let mut rng = thread_rng();
-                                                (rng.gen::<u8>()) as u32
+                                                let mut rng = rng();
+                                                (rng.random::<u8>()) as u32
                                             },
                                             payload: UdpXml::C2dHb(C2dHb {
                                                     cid: thread_client_id,
@@ -457,8 +457,8 @@ impl UdpPayloadInner {
                         thread_interval.tick().await;
                         let msg = BcUdp::Discovery(UdpDiscovery {
                             tid: {
-                                let mut rng = thread_rng();
-                                (rng.gen::<u8>()) as u32
+                                let mut rng = rng();
+                                (rng.random::<u8>()) as u32
                             },
                             payload: UdpXml::C2dHb(C2dHb {
                                     cid: thread_client_id,
@@ -473,10 +473,7 @@ impl UdpPayloadInner {
             }
         });
 
-        log::info!(
-            "UDP gap skip wait set to {}ms",
-            gap_skip_wait.as_millis()
-        );
+        log::info!("UDP gap skip wait set to {}ms", gap_skip_wait.as_millis());
 
         Self {
             camera_addr,
@@ -907,7 +904,7 @@ fn set_udp_buffer_sizes(socket: &std::net::UdpSocket, size: usize) {
 async fn connect_try_port(port: u16) -> Result<UdpSocket> {
     let mut ports: Vec<u16> = (53500..54000).collect();
     {
-        let mut rng = thread_rng();
+        let mut rng = rng();
         ports.shuffle(&mut rng);
         drop(rng); // Do not hold RNG over an await
     }

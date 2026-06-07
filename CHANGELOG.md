@@ -3,6 +3,37 @@
 All notable changes to this fork are documented here.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.7.0] - 2026-06-07
+
+### Changed
+
+- **All dependencies updated to their latest releases.** Both workspace crates
+  (`neolink` and `neolink_core`) are bumped to a synced `0.7.0`. No functional or
+  on-the-wire behaviour change is intended — the camera protocol, encryption, and
+  RTSP output are unchanged. Validated against live cameras (connect, login, 4K
+  H265 + AAC main/sub streaming, and the `on_demand` disconnect/reconnect cycle)
+  plus the full unit-test suite, which parses real captured BC/UDP/media samples.
+
+  Notable major-version bumps and the migrations they required:
+  - **nom 7 → 8** — the parser library was reworked (associated-type `Parser`
+    trait; `VerboseError` moved to the new `nom-language` crate). The BC / UDP /
+    media binary deserializers were migrated accordingly (combinators now invoked
+    via `.parse()`, the manual `Parser` impl replaced with a closure).
+  - **aes 0.8 → 0.9 / cfb-mode 0.8 → 0.9** (RustCrypto `cipher` 0.5) — the CFB
+    cipher types are no longer `Clone` and `AsyncStreamCipher` was removed; the
+    AES-128 key is now stored and the CFB cipher is built per call. Same
+    algorithm, identical output.
+  - **rand 0.8 → 0.10** — `thread_rng()` → `rng()`, `Rng::gen()` → `random()`
+    (now on the `RngExt` trait).
+  - **quick-xml 0.36 → 0.40** — serializer errors split into `SeError`; stricter
+    XML-declaration validation (a malformed-declaration typo in a test fixture was
+    corrected — real camera XML is unaffected).
+  - **toml 0.8 → 1.1**, **thiserror 1 → 2**, **validator 0.18 → 0.20**,
+    **rumqttc 0.24 → 0.25**, **gstreamer 0.24 → 0.25** (×4),
+    **tikv-jemallocator 0.5 → 0.7**, **socket2 0.5 → 0.6**, **md5 0.7 → 0.8**,
+    **delegate 0.12 → 0.13**, **env_logger → 0.11**, plus a full `cargo update`
+    of all transitive dependencies.
+
 ## [0.6.4-beta.15] - 2026-06-05
 
 ### Fixed

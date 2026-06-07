@@ -21,7 +21,16 @@ pub(super) fn from_input(
     block_align: u16,
     sample_rate: u16,
 ) -> Result<(JoinSet<AnyResult<()>>, Receiver<Vec<u8>>)> {
-    let pipeline = create_pipeline(input_src, volume, noise_suppression, echo_cancel, echo_suppression_level, noise_suppression_level, block_align, sample_rate)?;
+    let pipeline = create_pipeline(
+        input_src,
+        volume,
+        noise_suppression,
+        echo_cancel,
+        echo_suppression_level,
+        noise_suppression_level,
+        block_align,
+        sample_rate,
+    )?;
     input(pipeline)
 }
 
@@ -152,12 +161,18 @@ fn create_pipeline(
     let mut webrtcdsp = "".to_string();
     if noise_suppression || echo_cancel {
         let noise_string = if noise_suppression {
-            format!("noise-suppression=true noise-suppression-level={}", noise_suppression_level)
+            format!(
+                "noise-suppression=true noise-suppression-level={}",
+                noise_suppression_level
+            )
         } else {
             "noise-suppression=false".to_string()
         };
         let echo_string = if echo_cancel {
-            format!("echo-cancel=true echo-suppression-level={}", echo_suppression_level)
+            format!(
+                "echo-cancel=true echo-suppression-level={}",
+                echo_suppression_level
+            )
         } else {
             "echo-cancel=false".to_string()
         };
@@ -192,7 +207,6 @@ fn create_pipeline(
     let appsink = get_sink(&pipeline)?;
     appsink.set_property("max-buffers", &(1u32));
     appsink.set_property("drop", &true);
-    
 
     // Tell the appsink what format we want. It will then be the audiotestsrc's job to
     // provide the format we request.

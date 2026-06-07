@@ -7,7 +7,6 @@ use crate::bc::model::*;
 use crate::bc::xml::*;
 use crate::{Credentials, Error, Result};
 use bytes::BytesMut;
-use nom::AsBytes;
 use tokio_util::codec::{Decoder, Encoder};
 
 pub(crate) struct BcCodex {
@@ -62,10 +61,7 @@ impl Decoder for BcCodex {
                 if buf.is_empty() {
                     Ok(None)
                 } else {
-                    log::debug!(
-                        "bytes remaining on BC stream: {:X?}",
-                        buf.as_bytes().chunks(25).next()
-                    );
+                    log::debug!("bytes remaining on BC stream: {:X?}", buf.chunks(25).next());
                     // Right after this we seem to get an issue with the camera dropping us
                     // Needs probing
                     // F0, DE, BC, A, 3, 0, 0, 0, 88, 6, 0, 0, 0, 1, 4, 0, C8, 0, 0, 0, 0, 0, 0, 0, 30, 31, 64, 63, 48,

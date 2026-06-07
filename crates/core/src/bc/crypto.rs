@@ -1,7 +1,4 @@
-use aes::{
-    cipher::{AsyncStreamCipher, KeyIvInit},
-    Aes128,
-};
+use aes::{cipher::KeyIvInit, Aes128};
 use cfb_mode::{Decryptor, Encryptor};
 
 type Aes128CfbEnc = Encryptor<Aes128>;
@@ -22,18 +19,14 @@ pub enum EncryptionProtocol {
     /// Latest cameras/firmwares use Aes with the key derived from
     /// the camera's password and the negotiated NONCE
     Aes {
-        /// The encryptor
-        enc: Aes128CfbEnc,
-        /// The decryptor
-        dec: Aes128CfbDec,
+        /// The 16-byte AES-128 key; the CFB cipher is built per call
+        key: [u8; 16],
     },
     /// Same as Aes but the media stream is also encrypted and not just
     /// the control commands
     FullAes {
-        /// The encryptor
-        enc: Aes128CfbEnc,
-        /// The decryptor
-        dec: Aes128CfbDec,
+        /// The 16-byte AES-128 key; the CFB cipher is built per call
+        key: [u8; 16],
     },
 }
 
@@ -48,17 +41,11 @@ impl EncryptionProtocol {
     }
     /// Helper to make aes
     pub fn aes(key: [u8; 16]) -> Self {
-        EncryptionProtocol::Aes {
-            enc: Aes128CfbEnc::new(key.as_slice().into(), IV.into()),
-            dec: Aes128CfbDec::new(key.as_slice().into(), IV.into()),
-        }
+        EncryptionProtocol::Aes { key }
     }
     /// Helper to make full aes
     pub fn full_aes(key: [u8; 16]) -> Self {
-        EncryptionProtocol::FullAes {
-            enc: Aes128CfbEnc::new(key.as_slice().into(), IV.into()),
-            dec: Aes128CfbDec::new(key.as_slice().into(), IV.into()),
-        }
+        EncryptionProtocol::FullAes { key }
     }
 
     /// Decrypt the data, offset comes from the header of the packet
@@ -72,11 +59,13 @@ impl EncryptionProtocol {
                     .map(|(key, i)| *i ^ key ^ (offset as u8))
                     .collect()
             }
-            EncryptionProtocol::Aes { dec, .. } | EncryptionProtocol::FullAes { dec, .. } => {
+            EncryptionProtocol::Aes { key } | EncryptionProtocol::FullAes { key } => {
                 // AES decryption
 
                 let mut decrypted = buf.to_vec();
-                dec.clone().decrypt(&mut decrypted);
+                let dec = Aes128CfbDec::new_from_slices(key, IV)
+                    .expect("AES-128 key and IV are fixed valid lengths");
+                dec.decrypt(&mut decrypted);
                 decrypted
             }
         }
@@ -93,10 +82,12 @@ impl EncryptionProtocol {
                 // Encrypt is the same as decrypt
                 self.decrypt(offset, buf)
             }
-            EncryptionProtocol::Aes { enc, .. } | EncryptionProtocol::FullAes { enc, .. } => {
+            EncryptionProtocol::Aes { key } | EncryptionProtocol::FullAes { key } => {
                 // AES encryption
                 let mut encrypted = buf.to_vec();
-                enc.clone().encrypt(&mut encrypted);
+                let enc = Aes128CfbEnc::new_from_slices(key, IV)
+                    .expect("AES-128 key and IV are fixed valid lengths");
+                enc.encrypt(&mut encrypted);
                 encrypted
             }
         }

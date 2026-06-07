@@ -15,7 +15,7 @@ use futures::{
 };
 use lazy_static::lazy_static;
 use log::*;
-use rand::{seq::SliceRandom, thread_rng, Rng};
+use rand::{rng, seq::SliceRandom, RngExt};
 use socket2::SockRef;
 use std::collections::{btree_map::Entry, BTreeMap, HashMap, HashSet};
 use std::convert::TryInto;
@@ -478,9 +478,7 @@ impl Discoverer {
         let log_region = relay_region.clone();
         let task = tokio::task::spawn_blocking(move || {
             let mut addrs = vec![];
-            let relay_host = relay_region
-                .as_deref()
-                .and_then(relay_hostname_for_region);
+            let relay_host = relay_region.as_deref().and_then(relay_hostname_for_region);
             let hostnames: Vec<&str> = match relay_host {
                 Some(host) => vec![host],
                 None => P2P_RELAY_HOSTNAMES.to_vec(),
@@ -1136,7 +1134,6 @@ impl Discoverer {
             }
         });
     }
-
 }
 
 impl Drop for Discoverer {
@@ -1168,7 +1165,11 @@ impl Discovery {
     pub(crate) async fn get_registration(&self, uid: &str) -> Result<RegisterResult> {
         if let Some(lookup) = cached_lookup(uid).await {
             let client_id = self.client_id;
-            match self.discoverer.register_address(uid, client_id, &lookup).await {
+            match self
+                .discoverer
+                .register_address(uid, client_id, &lookup)
+                .await
+            {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     log::warn!(
@@ -1407,7 +1408,10 @@ impl Discovery {
             .await;
             match map_attempt {
                 Ok(Ok(connect_result)) => {
-                    log::info!("Relay-assisted P2P map succeeded at {}", connect_result.addr);
+                    log::info!(
+                        "Relay-assisted P2P map succeeded at {}",
+                        connect_result.addr
+                    );
                     log::info!(
                         "MEDIA PATH: direct P2P to camera public/NAT-mapped address {} (dmap hole-punch, NOT via Reolink relay)",
                         connect_result.addr
@@ -1469,19 +1473,19 @@ fn get_broadcasts(ports: &[u16]) -> Result<Vec<SocketAddr>> {
 }
 
 fn generate_tid() -> u32 {
-    let mut rng = thread_rng();
-    (rng.gen::<u8>()) as u32
+    let mut rng = rng();
+    (rng.random::<u8>()) as u32
 }
 
 fn generate_cid() -> i32 {
-    let mut rng = thread_rng();
-    rng.gen()
+    let mut rng = rng();
+    rng.random()
 }
 
 async fn connect() -> Result<UdpSocket> {
     let mut ports: Vec<u16> = (53500..54000).collect();
     {
-        let mut rng = thread_rng();
+        let mut rng = rng();
         ports.shuffle(&mut rng);
     }
 
