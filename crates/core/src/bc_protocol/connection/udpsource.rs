@@ -40,7 +40,15 @@ const MTU: usize = 1350;
 const UDPDATA_HEADER_SIZE: usize = 20;
 const SOCKET_IN_CAPACITY: usize = 4096;
 const SOCKET_OUT_CAPACITY: usize = 32768;
-pub(crate) const DEFAULT_GAP_SKIP_WAIT_MS: u64 = 120;
+/// How long the reassembler waits for a missing packet before skipping it.
+///
+/// A skipped packet desyncs the framing for one message; the BC control codec
+/// resyncs (and the media codec drops to the next frame) rather than dropping
+/// the connection, but we still prefer the gap to be filled by a retransmit.
+/// Selective-ACK NAKs the missing packet on every received packet, so a larger
+/// window lets several retransmit round-trips land before we give up. 120 ms
+/// was too tight on remote/relay paths (one RTT); 500 ms covers several.
+pub(crate) const DEFAULT_GAP_SKIP_WAIT_MS: u64 = 500;
 
 pub(crate) type InnerFramed = Framed<Compat<IntoAsyncRead<UdpPayloadSource>>, BcCodex>;
 pub(crate) struct UdpSource {

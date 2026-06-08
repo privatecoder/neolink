@@ -194,9 +194,19 @@ Reading the heartbeat:
 
 ## Tuning for jitter / loss
 
-- **`udp_gap_skip_ms`** (default `120`) — how long the reassembler waits for a
+- **`udp_gap_skip_ms`** (default `500`) — how long the reassembler waits for a
   missing packet before skipping it. Raise on lossy links to favour completeness over
-  latency; on a clean link it rarely triggers.
+  latency; on a clean link it rarely triggers. The default was raised from 120 ms so
+  that a retransmit (NAKed via the selective-ACK bitmap on every received packet) has
+  several round-trips to land before a skip is attempted.
+
+  A skip punches a hole in the reassembled byte stream, which desyncs the BC framing
+  for one message. Both the control codec (`BcCodex`) and the media codec
+  (`BcMediaCodex`) recover by scanning forward to the next BC header magic and
+  resuming — so a skip costs one corrupted message, not the whole connection. (Prior
+  to this, the control codec errored fatally on the resulting `Magic invalid`,
+  producing a `Connection Lost` + reconnect every few minutes on high-bitrate remote
+  streams.)
 - **`buffer_duration`** (default `3000` ms; aliases `buffer`, `duration`) — size of
   the internal video buffer, expressed as ms of stream
   (`≈ bitrate/8 × buffer_duration`). Larger absorbs bursty/jittery delivery (smoother

@@ -100,6 +100,18 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
   frames), and **audio** rides a content-clock anchored once to the video clock. A/V
   drift now stays near zero with no playback stalls.
 
+- **A single lost UDP packet no longer drops the whole connection.** When the
+  reliable-UDP reassembler skips a missing packet (after `udp_gap_skip_ms`), the
+  hole desynced the control-protocol framing and the `BcCodex` decoder errored
+  fatally on the next header (`Magic invalid`), tearing down the connection and
+  forcing a reconnect + re-login — observed every few minutes on high-bitrate
+  remote/relay streams. The control codec now **resyncs** to the next BC header
+  magic (the media codec already did), losing only the one corrupted message
+  instead of the connection. Verified live: a real 2-packet loss on a 4K stream
+  resynced in place (dropped ~13 KB, one I-frame chunk) with zero reconnect and
+  no playback stall. The default `udp_gap_skip_ms` was also raised 120 → 500 ms
+  so a retransmit has more time to fill the gap before a skip is attempted.
+
 - **Lower latency.** Removed unnecessary internal sleeps and tuned the camera
   wake-up delay to reduce end-to-end latency.
 

@@ -165,8 +165,20 @@ touching `crates/core/src/bc_protocol/connection/udpsource.rs`:
   reason; enable with `RUST_LOG=...connection::udpsource=debug`.
 - The reliable-UDP reassembler advances `packets_want` only over contiguous
   packets; `recieved_pending > 0` means a gap is blocking delivery, and
-  `udp_gap_skip_ms` bounds how long it waits before skipping. A frozen
-  `packets_want` with `in_pkts=0` means the camera stopped sending (not loss).
+  `udp_gap_skip_ms` bounds how long it waits before skipping (default 500 ms). A
+  frozen `packets_want` with `in_pkts=0` means the camera stopped sending (not
+  loss).
+- **A skipped packet desyncs the framing, so both codecs resync instead of
+  dropping the connection.** Skipping punches a hole in the byte stream; the next
+  BC header then fails its magic check. `BcCodex` (control) and `BcMediaCodex`
+  (media) both scan forward to the next magic and resume (`bc::codex` /
+  `bcmedia::codex`), losing only the one corrupted message. Before this fix
+  `BcCodex` errored fatally on `Magic invalid` and forced a reconnect + re-login
+  on every skip — the symptom was a `Connection Lost: ... Magic invalid` every
+  few minutes on high-bitrate remote streams. Do NOT make `BcCodex` strict again:
+  the BC header is plaintext + length-prefixed and each message decrypts
+  independently, so resync is safe. The search starts at offset 1 to guarantee
+  forward progress (`next_bc_magic_offset`).
 - The displayed version comes from `git describe --tags` (build.rs), not just the
   `Cargo.toml` version — tag releases for the version string to be meaningful.
 

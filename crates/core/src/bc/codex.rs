@@ -6,11 +6,15 @@
 use crate::bc::model::*;
 use crate::bc::xml::*;
 use crate::{Credentials, Error, Result};
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
 pub(crate) struct BcCodex {
     context: BcContext,
+    /// Bytes discarded while resyncing the stream after a desync (e.g. a UDP
+    /// packet was lost/skipped, punching a hole in the framing). Reset to 0
+    /// once a message decodes cleanly again.
+    amount_skipped: usize,
 }
 
 impl BcCodex {
@@ -18,13 +22,35 @@ impl BcCodex {
         let mut context = BcContext::new(credentials);
 
         context.debug_on();
-        Self { context }
+        Self {
+            context,
+            amount_skipped: 0,
+        }
     }
     pub(crate) fn new(credentials: Credentials) -> Self {
         Self {
             context: BcContext::new(credentials),
+            amount_skipped: 0,
         }
     }
+}
+
+/// Find the byte offset of the next BC header magic, searching from offset 1 so
+/// a resync always makes forward progress — even when `Bc::deserialize` failed
+/// *after* a valid magic (e.g. a truncated/garbled body), in which case a valid
+/// magic still sits at offset 0 and must be skipped past.
+fn next_bc_magic_offset(src: &[u8]) -> Option<usize> {
+    if src.len() < 5 {
+        return None;
+    }
+    src.windows(4)
+        .enumerate()
+        .skip(1)
+        .find(|(_, w)| {
+            let magic = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+            magic == MAGIC_HEADER || magic == MAGIC_HEADER_REV
+        })
+        .map(|(offset, _)| offset)
 }
 
 impl Encoder<Bc> for BcCodex {
@@ -81,12 +107,49 @@ impl Decoder for BcCodex {
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
         // trace!("Decoding: {:X?}", src);
-        let bc = Bc::deserialize(&self.context, src);
-        // trace!("As: {:?}", bc);
-        let bc = match bc {
-            Ok(bc) => bc,
-            Err(Error::NomIncomplete(_)) => return Ok(None),
-            Err(e) => return Err(e),
+        let bc = loop {
+            match Bc::deserialize(&self.context, src) {
+                Ok(bc) => {
+                    if self.amount_skipped > 0 {
+                        log::debug!(
+                            "BC stream resynced after skipping {} byte(s)",
+                            self.amount_skipped
+                        );
+                        self.amount_skipped = 0;
+                    }
+                    break bc;
+                }
+                Err(Error::NomIncomplete(_)) => return Ok(None),
+                Err(e) => {
+                    // A lost/skipped UDP packet punches a hole in the byte stream
+                    // that desyncs the BC framing. Rather than tearing the whole
+                    // connection down (which forces a reconnect + re-login), scan
+                    // forward to the next BC header magic and resume. BC headers
+                    // are plaintext and length-prefixed, and each message decrypts
+                    // independently, so resyncing is safe and costs only the one
+                    // corrupted message.
+                    if self.amount_skipped == 0 {
+                        log::debug!("BC stream desync ({e:?}); resyncing to next header magic");
+                    }
+                    match next_bc_magic_offset(src) {
+                        Some(offset) => {
+                            self.amount_skipped += offset;
+                            src.advance(offset);
+                            // Retry deserialize from the recovered position.
+                        }
+                        None => {
+                            // No magic visible yet. Drop everything but a short
+                            // tail (a magic may straddle the next packet) and
+                            // wait for more bytes.
+                            let keep = src.len().min(3);
+                            let drop = src.len() - keep;
+                            self.amount_skipped += drop;
+                            src.advance(drop);
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
         };
         // Update context
         if let Bc {
@@ -144,5 +207,71 @@ impl Decoder for BcCodex {
         }
 
         Ok(Some(bc))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bcencrypt_codex() -> BcCodex {
+        BcCodex {
+            context: BcContext::new_with_encryption(EncryptionProtocol::BCEncrypt),
+            amount_skipped: 0,
+        }
+    }
+
+    #[test]
+    fn next_magic_skips_offset_zero() {
+        // A valid magic sits at offset 0 (where a failed deserialize left us)
+        // and the real next message starts at offset 8. We must skip past 0.
+        let magic = MAGIC_HEADER.to_le_bytes();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&magic);
+        buf.extend_from_slice(&[1, 2, 3, 4]);
+        buf.extend_from_slice(&magic);
+        buf.extend_from_slice(&[0, 0]);
+        assert_eq!(next_bc_magic_offset(&buf), Some(8));
+    }
+
+    #[test]
+    fn next_magic_finds_reversed_magic() {
+        let magic = MAGIC_HEADER_REV.to_le_bytes();
+        let mut buf = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+        buf.extend_from_slice(&magic);
+        buf.extend_from_slice(&[0, 0, 0]);
+        assert_eq!(next_bc_magic_offset(&buf), Some(5));
+    }
+
+    #[test]
+    fn next_magic_none_when_absent_or_short() {
+        assert_eq!(next_bc_magic_offset(&[0u8; 32]), None);
+        assert_eq!(next_bc_magic_offset(&[1, 2, 3]), None); // < 5 bytes
+        assert_eq!(next_bc_magic_offset(&[]), None);
+    }
+
+    #[test]
+    fn decode_resyncs_past_leading_garbage() {
+        // A proven, fully-deserializable modern message under BCEncrypt.
+        let sample = include_bytes!("samples/modern_video_start1.bin");
+
+        // Sanity: decodes cleanly on its own.
+        let mut clean = BytesMut::from(&sample[..]);
+        assert!(bcencrypt_codex().decode(&mut clean).unwrap().is_some());
+
+        // Simulate a hole from a skipped UDP packet: non-magic garbage in front
+        // of an otherwise-intact message. The codec must skip the garbage and
+        // still decode the message instead of erroring (which would drop the
+        // whole connection).
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&[0xAAu8; 37]);
+        buf.extend_from_slice(&sample[..]);
+
+        let mut codex = bcencrypt_codex();
+        let msg = codex
+            .decode(&mut buf)
+            .expect("resync must not surface a fatal error");
+        assert!(msg.is_some(), "should resync and decode the message");
+        assert_eq!(codex.amount_skipped, 0, "skip counter resets after success");
     }
 }
