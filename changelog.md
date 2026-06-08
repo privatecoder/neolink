@@ -143,7 +143,10 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
   enlarged (100 → 500 messages) to absorb temporary bursts without stalling.
 
 - **Reduced log spam** — quieter handling of H.264/H.265 parser warnings caused by
-  camera stream errors.
+  camera stream errors. The per-second RTSP factory heartbeat (`… HB elapsed=…
+  vid_ts=… aud_buf=…`) is now `debug!` rather than `info!`, so default `info`
+  logs are no longer flooded; enable it with
+  `RUST_LOG='info,neolink::rtsp::factory=debug'`.
 
 - **Unsupported camera features are no longer re-probed.** Cameras without a
   battery or floodlight rejected those queries with a confusing `Task Error` on

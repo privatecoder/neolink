@@ -634,7 +634,7 @@ pub(super) async fn make_factory(
                                     let drop_video = drop_video.swap(0, Ordering::Relaxed);
                                     let drop_other = drop_other.swap(0, Ordering::Relaxed);
 
-                                    log::info!(
+                                    log::debug!(
                                         "{stream_label}: HB elapsed={:?} vid_ts={:?} aud_ts={:?} \
                                         vid_buf={}/{} aud_buf={}/{} last_media={:?} \
                                         vid_push={} aud_push={} dropP_pressure={} dropP_backpressure={} \
