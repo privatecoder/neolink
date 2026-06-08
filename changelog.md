@@ -60,9 +60,13 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
   - **`MEDIA PATH` log line** — states at connect time whether media flows over
     **direct P2P** or is **routed through Reolink relay servers** (previously
     indistinguishable in the logs).
-  - **Effective-connection-config log line** — prints the active `discovery`,
-    `relay_region`, `udp_gap_skip_ms`, `max_encryption`, `max_discovery_retries`,
-    and `stream` when a camera connects.
+  - **Effective-connection-config log line** — prints the *resolved* values
+    applied for a camera (`discovery`, `relay_region`, `connect_mode`,
+    `udp_gap_skip_ms`, `buffer_duration`, `max_encryption`,
+    `max_discovery_retries`, `strict`, `stream`). Defaulted/optional settings
+    are shown with their effective value (e.g. `udp_gap_skip_ms=500 ms
+    (default)`, `relay_region=none (all relay servers)`) instead of a raw
+    `None`.
   - **Per-second UDP transport heartbeat** — `in_pkts`, `in_kbps`, `delivered`,
     `resends`, `packets_want`, `sent_unacked`, `recieved_pending`, plus
     reassembly/health counters `reorder_events`, `max_reorder_depth`,
@@ -146,6 +150,13 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
   every check. Neolink now caches the camera's "unsupported" reply for the
   connection, skips re-probing, and logs a single clear `no battery, skipping` /
   `floodlight tasks not supported, skipping` line instead of an error.
+
+- **RTSP server now fails loudly if the bind port is already in use.** The
+  socket bind result was previously ignored, so a port clash (most commonly
+  Home Assistant's built-in go2rtc, which also uses RTSP port `8554`) left
+  Neolink logging `Starting RTSP Server …` while serving nothing. It now returns
+  a clear error naming the address/port and the likely go2rtc conflict instead
+  of silently running dead.
 
 ---
 

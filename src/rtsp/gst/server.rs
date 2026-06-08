@@ -82,8 +82,17 @@ impl NeoRtspServer {
         let server = self;
         server.set_address(bind_addr);
         server.set_service(&format!("{}", bind_port));
-        // Attach server to default Glib context
-        let _ = server.attach(None);
+        // Attach server to default Glib context. This binds the listen socket,
+        // so a failure here almost always means the port is already in use.
+        // (Notably, Home Assistant's built-in go2rtc also defaults to RTSP port
+        // 8554 — pick a different `bind_port` in that case.)
+        server.attach(None).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to start RTSP server on {bind_addr}:{bind_port}: {e}. \
+                 Is the port already in use? (Home Assistant's built-in go2rtc \
+                 listens on RTSP port 8554 — set a different bind_port.)"
+            )
+        })?;
         let main_loop = Arc::new(MainLoop::new(None, false));
 
         // Run the Glib main loop.
