@@ -48,7 +48,7 @@ const SOCKET_OUT_CAPACITY: usize = 32768;
 /// Selective-ACK NAKs the missing packet on every received packet, so a larger
 /// window lets several retransmit round-trips land before we give up. 120 ms
 /// was too tight on remote/relay paths (one RTT); 500 ms covers several.
-pub(crate) const DEFAULT_GAP_SKIP_WAIT_MS: u64 = 500;
+pub const DEFAULT_GAP_SKIP_WAIT_MS: u64 = 500;
 
 pub(crate) type InnerFramed = Framed<Compat<IntoAsyncRead<UdpPayloadSource>>, BcCodex>;
 pub(crate) struct UdpSource {

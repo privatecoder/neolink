@@ -44,6 +44,7 @@ mod users;
 mod version;
 
 pub(crate) use connection::*;
+pub use connection::DEFAULT_GAP_SKIP_WAIT_MS;
 pub use credentials::*;
 pub use errors::Error;
 pub use ledstate::LightState;

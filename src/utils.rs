@@ -122,14 +122,30 @@ pub(crate) async fn connect_and_login(camera_config: &CameraConfig) -> Result<Bc
         "{}: Connecting to camera at {}",
         camera_config.name, camera_addr
     );
+    // Show the *effective* values that will actually be applied — resolve
+    // optional/defaulted settings rather than printing raw `None`.
+    let relay_region = match &camera_config.relay_server_region {
+        Some(region) => format!("{region:?}"),
+        None => "none (all relay servers)".to_string(),
+    };
+    let udp_gap_skip_ms = match camera_config.udp_gap_skip_ms {
+        Some(ms) => format!("{ms} ms"),
+        None => format!(
+            "{} ms (default)",
+            neolink_core::bc_protocol::DEFAULT_GAP_SKIP_WAIT_MS
+        ),
+    };
     info!(
-        "{}: Effective connection config: discovery={:?}, relay_region={:?}, udp_gap_skip_ms={:?}, max_encryption={}, max_discovery_retries={}, stream={:?}",
+        "{}: Effective connection config: discovery={:?}, relay_region={}, connect_mode={:?}, udp_gap_skip_ms={}, buffer_duration={} ms, max_encryption={}, max_discovery_retries={}, strict={}, stream={:?}",
         camera_config.name,
         camera_config.discovery,
-        camera_config.relay_server_region,
-        camera_config.udp_gap_skip_ms,
+        relay_region,
+        camera_config.connect_mode,
+        udp_gap_skip_ms,
+        camera_config.buffer_duration,
         camera_config.max_encryption,
         camera_config.max_discovery_retries,
+        camera_config.strict,
         camera_config.stream,
     );
 

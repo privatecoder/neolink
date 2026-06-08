@@ -16,8 +16,11 @@ mod udpsource;
 
 pub(crate) use self::{
     bcconn::BcConnection, bcconn::*, bcsub::BcSubscription, discovery::Discovery,
-    tcpsource::TcpSource, udpsource::UdpSource, udpsource::DEFAULT_GAP_SKIP_WAIT_MS,
+    tcpsource::TcpSource, udpsource::UdpSource,
 };
+// Publicly re-exported (via bc_protocol) so the binary can show the effective
+// default in its connection-config log.
+pub use self::udpsource::DEFAULT_GAP_SKIP_WAIT_MS;
 
 pub(crate) struct DiscoveryResult {
     socket: Arc<UdpSocket>,
