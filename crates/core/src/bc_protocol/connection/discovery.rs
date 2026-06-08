@@ -108,7 +108,8 @@ fn relay_hostname_for_region(region: &str) -> Option<&'static str> {
         "asia (hong kong)" => Some("p2p3.reolink.com"),
         "middle east" => Some("p2p6.reolink.com"),
         "europe (france)" => Some("p2p7.reolink.com"),
-        "europe (unite kingdom)" => Some("p2p8.reolink.com"),
+        // Accept the correct spelling and the legacy "unite" typo.
+        "europe (united kingdom)" | "europe (unite kingdom)" => Some("p2p8.reolink.com"),
         "north america (west us)" => Some("p2p9.reolink.com"),
         _ => None,
     }
