@@ -4,7 +4,7 @@ use log::*;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::atomic::{AtomicBool, AtomicU16, Ordering},
     time::Duration,
 };
@@ -75,6 +75,9 @@ pub struct BcCamera {
     // Certain commands such as logout require the username/pass in plain text.... why....???
     credentials: Credentials,
     abilities: RwLock<HashMap<String, ReadKind>>,
+    /// Features (e.g. "battery", "floodlight_tasks") the camera has rejected as
+    /// unsupported, so the doomed request is not re-sent on this connection.
+    unsupported: RwLock<HashSet<String>>,
     #[allow(dead_code)]
     cancel: CancellationToken,
 }
@@ -380,6 +383,7 @@ impl BcCamera {
             logged_in: AtomicBool::new(false),
             credentials: Credentials::new(username, passwd),
             abilities: Default::default(),
+            unsupported: Default::default(),
             cancel: CancellationToken::new(),
         };
         me.keepalive().await?;
@@ -409,6 +413,19 @@ impl BcCamera {
         } else {
             ReadKind::None
         }
+    }
+
+    /// True if this camera previously rejected `feature` as unsupported on this
+    /// connection (see [`Self::mark_feature_unsupported`]).
+    async fn feature_unsupported(&self, feature: &str) -> bool {
+        self.unsupported.read().await.contains(feature)
+    }
+
+    /// Record that the camera rejected `feature` as unsupported, so later calls
+    /// can skip the doomed request. The set lives on the `BcCamera`, so a fresh
+    /// connection re-probes once and a transient rejection self-heals.
+    async fn mark_feature_unsupported(&self, feature: &str) {
+        self.unsupported.write().await.insert(feature.to_string());
     }
     async fn has_ability_ro<T: Into<String>>(&self, name: T) -> Result<()> {
         let s: String = name.into();

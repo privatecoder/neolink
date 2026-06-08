@@ -129,6 +129,12 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 - **Reduced log spam** — quieter handling of H.264/H.265 parser warnings caused by
   camera stream errors.
 
+- **Unsupported camera features are no longer re-probed.** Cameras without a
+  battery or floodlight rejected those queries with a confusing `Task Error` on
+  every check. Neolink now caches the camera's "unsupported" reply for the
+  connection, skips re-probing, and logs a single clear `no battery, skipping` /
+  `floodlight tasks not supported, skipping` line instead of an error.
+
 ---
 
 ## Removed

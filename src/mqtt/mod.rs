@@ -532,8 +532,9 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                                 }).await;
                                 let xml = match xml {
                                     Err(e) => match e.downcast::<neolink_core::Error>() {
-                                        Ok(neolink_core::Error::CameraServiceUnavailable{..}) => {
-                                            log::debug!("Battery not supported");
+                                        Ok(neolink_core::Error::CameraServiceUnavailable{..})
+                                        | Ok(neolink_core::Error::Unsupported{..}) => {
+                                            log::debug!("{}: no battery, skipping battery reporting", camera_name);
                                             futures::future::pending().await
                                         },
                                         Ok(e) => Err(e.into()),
@@ -564,7 +565,8 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                             Ok(cam.is_flightlight_tasks_enabled().await?)
                         })).await;
                         if flt_status.is_err() {
-                            // Assume floodlight unsupported
+                            // Camera has no floodlight tasks; stop probing.
+                            log::debug!("{}: floodlight tasks not supported, skipping", camera_name);
                             futures::future::pending::<()>().await;
                         }
                         let flt_status = flt_status.unwrap();

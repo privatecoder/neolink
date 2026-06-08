@@ -79,6 +79,10 @@ impl BcCamera {
 
     /// Requests the current battery status of the camera
     pub async fn battery_info(&self) -> Result<BatteryInfo> {
+        // If the camera already told us it has no battery, don't re-ask.
+        if self.feature_unsupported("battery").await {
+            return Err(Error::Unsupported { feature: "battery" });
+        }
         let connection = self.get_connection();
 
         let msg_num = self.new_message_num();
@@ -121,6 +125,11 @@ impl BcCamera {
         } = msg
         {
             Ok(battery_info)
+        } else if msg.meta.response_code == 400 {
+            // The camera rejected the battery query: it has no battery. Cache it
+            // so we don't probe again on this connection.
+            self.mark_feature_unsupported("battery").await;
+            Err(Error::Unsupported { feature: "battery" })
         } else {
             Err(Error::UnintelligibleReply {
                 reply: std::sync::Arc::new(Box::new(msg)),

@@ -223,6 +223,15 @@ pub enum Error {
         actual: String,
     },
 
+    /// Raised when the camera reports it does not support a feature (e.g. it has
+    /// no battery or no floodlight). The rejection is cached on the camera so the
+    /// doomed request is not re-sent for the life of the connection.
+    #[error("Camera does not support feature: {feature}")]
+    Unsupported {
+        /// The feature the camera rejected, e.g. "battery"
+        feature: &'static str,
+    },
+
     /// Raised when a thread panics
     #[error("Thread panicked")]
     JoinError(#[from] std::sync::Arc<tokio::task::JoinError>),

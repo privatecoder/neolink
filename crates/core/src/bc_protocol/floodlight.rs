@@ -103,6 +103,12 @@ impl BcCamera {
 
     /// Get the Flood Light tasks XML
     pub async fn get_flightlight_tasks(&self) -> Result<FloodlightTask> {
+        // If the camera already rejected floodlight tasks, don't re-ask.
+        if self.feature_unsupported("floodlight_tasks").await {
+            return Err(Error::Unsupported {
+                feature: "floodlight tasks",
+            });
+        }
         let connection = self.get_connection();
         let msg_num = self.new_message_num();
         let mut sub_get = connection
@@ -128,6 +134,13 @@ impl BcCamera {
 
         sub_get.send(get).await?;
         let msg = sub_get.recv().await?;
+        if msg.meta.response_code == 405 {
+            // Method not allowed: this camera does not support floodlight tasks.
+            self.mark_feature_unsupported("floodlight_tasks").await;
+            return Err(Error::Unsupported {
+                feature: "floodlight tasks",
+            });
+        }
         if msg.meta.response_code != 200 {
             return Err(Error::CameraServiceUnavailable {
                 id: msg.meta.msg_id,

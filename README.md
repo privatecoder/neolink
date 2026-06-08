@@ -279,7 +279,12 @@ Setting a value of `None` will disable the stream
 
 Certain features like preview and motion detection may not be desired
 you can disable them with the following config options.
-Disabling these may help to conserve battery
+Disabling these may help to conserve battery.
+
+> Note: you do not need to disable `enable_battery` / `enable_floodlight` on cameras
+> that lack a battery or floodlight — Neolink detects the camera's rejection, skips
+> re-probing, and logs a single `no battery, skipping` / `floodlight tasks not
+> supported, skipping` line instead of repeated errors.
 
 ```toml
 bind = "0.0.0.0"

@@ -125,7 +125,14 @@ impl NeoInstance {
                         for i in 0..5 {
                             r = task(cam_ref).await;
                             if let Err(e) = &r {
-                                log::debug!("- Task Error: {e:?}");
+                                // `Unsupported` is an expected "feature not present"
+                                // signal the caller handles; don't log it as an error.
+                                if !matches!(
+                                    e.downcast_ref::<neolink_core::Error>(),
+                                    Some(neolink_core::Error::Unsupported { .. })
+                                ) {
+                                    log::debug!("- Task Error: {e:?}");
+                                }
                             }
                             if let Err(Some(e @ neolink_core::Error::CameraServiceUnavailable{code: 400, ..})) = r.as_ref().map_err(|e| e.downcast_ref::<neolink_core::Error>()) {
                                 // Retryable without a reconnect
