@@ -135,16 +135,20 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
   camera disconnect/reconnect cycles, with **exponential backoff** on reconnection
   to give the network time to recover and reduce load.
 
-- **No more CPU spin / wedged runtime after a connection drop.** Two long-lived
-  tasks could enter a non-yielding loop when a camera connection was lost — most
-  damagingly the connection's message-router (`bcconn`), which on a closed command
-  channel re-entered a poll that was immediately ready forever. This pinned a CPU
-  core *and* starved the async runtime, so the camera never reconnected and the
-  RTSP server accepted clients but never served them (the symptom was ~100% CPU
-  with the log going silent after `Connection Lost … Attempt reconnect`). The
-  router now treats a closed channel as terminal, and the motion listener stops
-  re-polling a dropped subscription, so connection loss tears down cleanly and
-  reconnects.
+- **No more 100% CPU / wedged runtime after a camera drop (the big one).** When a
+  camera dropped, the process could peg one or two CPU cores and go silent right
+  after `Connection Lost … Attempt reconnect` — the camera never reconnected and
+  RTSP clients connected but were never served. A gdb capture pinned it to the
+  **MQTT** client: rumqttc replays queued ("pending") requests with
+  `sleep(pending_throttle)` between each, and the default throttle is `0`, so when
+  the queue can't drain against a half-open broker connection `EventLoop::poll()`
+  busy-loops internally (`sleep(0) → pop → write`) and never returns — pegging a
+  core and, with only a couple of worker threads, starving the whole runtime so
+  cameras couldn't reconnect. Neolink now sets a small non-zero `pending_throttle`
+  on every MQTT connection, capping that loop to a trickle. Two unrelated
+  non-yielding loops found along the way were also fixed: the connection's
+  message-router (`bcconn`) re-polling a closed command channel, and the motion
+  listener re-polling a dropped subscription.
 
 - **Pipeline torn down on client disconnect.** When an RTSP client disconnects, its
   GStreamer pipeline is now killed, preventing writes to a closed socket.
