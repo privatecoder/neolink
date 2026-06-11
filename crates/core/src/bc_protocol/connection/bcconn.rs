@@ -90,12 +90,17 @@ impl BcConnection {
             tokio::select! {
                 _ = thread_cancel.cancelled() => Result::Ok(()),
                 v = async {
-                    loop {
-                        if let n @ Err(_) = poller.run().await {
-                            trace!("Polling has ended");
-                            return n;
-                        }
-                    }
+                    // `poller.run()` loops internally until its command channel
+                    // either errors or is exhausted. An `Ok(())` return means the
+                    // channel closed (all senders dropped) — i.e. the connection is
+                    // gone and no further commands will ever arrive. Re-looping here
+                    // would re-enter `run()`, whose `reciever.next().await` is now
+                    // immediately `Ready(None)` forever: a single poll spins without
+                    // yielding, pinning a core AND starving the `select!` so even
+                    // `thread_cancel` can't stop it. So treat `Ok(())` as terminal.
+                    let res = poller.run().await;
+                    trace!("Polling has ended: {res:?}");
+                    res
                 }=> v
             }
         });

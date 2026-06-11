@@ -263,8 +263,19 @@ impl BcCamera {
                             Err(e) => Err(e),
                         };
 
+                        // A subscription error means the connection/subscription is
+                        // gone. Forward it once so the consumer learns of the drop,
+                        // then stop: re-polling a closed subscription returns
+                        // immediately every iteration, which busy-spins this task and
+                        // floods the channel with the same error.
+                        let connection_lost = status.is_err();
+
                         if tx.send(status).await.is_err() {
                             // Motion reciever has been dropped
+                            break;
+                        }
+
+                        if connection_lost {
                             break;
                         }
                     }
