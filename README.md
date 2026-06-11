@@ -403,7 +403,7 @@ All per-camera options (under `[[cameras]]`), with defaults. Sub-tables
 | `buffer_duration` (aliases `buffer`, `duration`) | `3000` | Size of Neolink's internal video buffer, expressed as ms of stream. Larger absorbs network jitter/bursts (smoother, more latency); smaller = lower latency, less burst tolerance. |
 | `max_encryption` | `Aes` | `none`, `bcencrypt`, or `aes`. |
 | `strict` | `false` | Error the media stream on unexpected packets instead of tolerating them. |
-| `max_discovery_retries` (alias `retries`) | `10` | Discovery attempts before giving up. |
+| `max_discovery_retries` (alias `retries`) | `10` | Registration attempts per discovery cycle (`0` = infinite). On timeout the whole connect is retried, so it never permanently gives up. Backoff: 1,2,4,8,16,32 s, capped at 60 s. |
 | `update_time` (alias `time`) | `false` | Force-set the camera clock to "now" on connect. |
 | `debug` (alias `verbose`) | `false` | Dump decrypted XML from the camera (noisy; troubleshooting only). |
 | `enabled` (alias `enable`) | `true` | Set `false` to disable a camera without deleting it. |
