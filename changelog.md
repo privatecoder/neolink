@@ -135,6 +135,17 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
   camera disconnect/reconnect cycles, with **exponential backoff** on reconnection
   to give the network time to recover and reduce load.
 
+- **No more CPU spin / wedged runtime after a connection drop.** Two long-lived
+  tasks could enter a non-yielding loop when a camera connection was lost — most
+  damagingly the connection's message-router (`bcconn`), which on a closed command
+  channel re-entered a poll that was immediately ready forever. This pinned a CPU
+  core *and* starved the async runtime, so the camera never reconnected and the
+  RTSP server accepted clients but never served them (the symptom was ~100% CPU
+  with the log going silent after `Connection Lost … Attempt reconnect`). The
+  router now treats a closed channel as terminal, and the motion listener stops
+  re-polling a dropped subscription, so connection loss tears down cleanly and
+  reconnects.
+
 - **Pipeline torn down on client disconnect.** When an RTSP client disconnects, its
   GStreamer pipeline is now killed, preventing writes to a closed socket.
 
