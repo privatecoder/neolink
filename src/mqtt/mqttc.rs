@@ -24,6 +24,59 @@ use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+/// Detects a `rumqttc` `EventLoop::poll()` busy-spin.
+///
+/// On a half-open connection (TCP still "up" but the broker is unreachable, so
+/// the keepalive `PingResp` never arrives) rumqttc 0.25's `poll()` can start
+/// returning `Ok(..)` immediately and without end, re-arming its keepalive timer
+/// on every call. Our `loop { poll().await; .. }` then turns that into a CPU
+/// spin — and because this runtime has only a couple of worker threads, a few
+/// such spins (each per-camera last-will is its own connection) starve
+/// everything else, so cameras never reconnect. Observed as ~100% CPU with the
+/// log going silent right after a camera drop.
+///
+/// Healthy polls block on the socket/keepalive and are spaced by network
+/// latency, so they never trip this. A *sustained* run of back-to-back
+/// sub-millisecond returns does: the caller then drops the connection so it is
+/// rebuilt (main client, via the existing backoff) or stopped (last-will),
+/// instead of spinning a core forever.
+struct PollSpinGuard {
+    streak: u32,
+    last: std::time::Instant,
+    spin_since: Option<std::time::Instant>,
+}
+
+impl PollSpinGuard {
+    fn new() -> Self {
+        Self {
+            streak: 0,
+            last: std::time::Instant::now(),
+            spin_since: None,
+        }
+    }
+
+    /// Record that `poll()` just returned. `true` means it has been returning
+    /// instantly, back-to-back, long enough to be a pathological spin rather
+    /// than a legitimate short burst (e.g. retained messages after subscribe).
+    fn is_spinning(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last) < Duration::from_millis(1) {
+            self.streak = self.streak.saturating_add(1);
+        } else {
+            self.streak = 0;
+            self.spin_since = None;
+        }
+        self.last = now;
+
+        if self.streak > 1000 {
+            let since = *self.spin_since.get_or_insert(now);
+            now.duration_since(since) > Duration::from_millis(200)
+        } else {
+            false
+        }
+    }
+}
+
 pub(crate) struct Mqtt {
     cancel: CancellationToken,
     outgoing_tx: MpscSender<MqttRequest>,
@@ -190,6 +243,7 @@ impl<'a> MqttBackend<'a> {
         log::debug!("MQTT Published Startup");
         let loop_cancel = CancellationToken::new();
         let _drop_guard = loop_cancel.clone().drop_guard();
+        let mut spin_guard = PollSpinGuard::new();
         loop {
             let r = tokio::select! {
                 v = self.outgoing_rx.recv() => {
@@ -279,6 +333,10 @@ impl<'a> MqttBackend<'a> {
                     AnyResult::Ok(())
                 },
                 v = connection.poll() =>  {
+                    if spin_guard.is_spinning() {
+                        log::warn!("MQTT event loop busy-spinning (broker unreachable / missed keepalive PingResp); dropping the connection to force a clean reconnect");
+                        break Err(anyhow!("MQTT event loop busy-spin detected"));
+                    }
                     let  notification = v.with_context(|| "MQTT connection dropped")?;
                     // Handle message on another thread so that we can keep polling
                     let client = client.clone();
@@ -570,10 +628,15 @@ impl LastWillMqtt {
         let thread_cancel = cancel.clone();
 
         tokio::task::spawn(async move {
+            let mut spin_guard = PollSpinGuard::new();
             loop {
                 let r = tokio::select! {
                     _ = thread_cancel.cancelled() => AnyResult::Ok(()),
                     v = connection.poll() =>  {
+                        if spin_guard.is_spinning() {
+                            log::warn!("MQTT last-will event loop busy-spinning; dropping connection");
+                            break Err(anyhow!("MQTT last-will event loop busy-spin detected"));
+                        }
                         v?;
                         AnyResult::Ok(())
                     },
