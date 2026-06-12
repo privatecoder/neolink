@@ -24,6 +24,56 @@ use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+/// Caps a `rumqttc` poll loop's iteration rate so a spinning `EventLoop` can't
+/// peg a CPU core and starve the runtime.
+///
+/// `EventLoop::poll()` runs a single `select!` and *returns* on every call (no
+/// internal loop), so `loop { poll().await; .. }` spins whenever `poll()` keeps
+/// returning immediately — which it does on a broken/half-open or
+/// message-flooding broker connection (draining `state.events`, a hot read, or a
+/// keepalive-deadline-in-the-past). `pending_throttle` only paces the *pending*
+/// branch, so it can't cover those paths. This is the structural backstop: a
+/// healthy client iterates a handful of times per second (events + the 5 s
+/// keepalive), so capping the loop far above that rate is invisible to normal
+/// traffic but turns a million-iterations-per-second spin into a sleep.
+struct PollRateLimiter {
+    window_start: std::time::Instant,
+    count: u32,
+}
+
+impl PollRateLimiter {
+    fn new() -> Self {
+        Self {
+            window_start: std::time::Instant::now(),
+            count: 0,
+        }
+    }
+
+    /// Call once per poll-loop iteration. If the loop is iterating far faster
+    /// than any healthy MQTT workload would, sleep out the rest of the 1 s
+    /// window so the spin can't monopolise the worker.
+    async fn tick(&mut self) {
+        // Healthy peak is well under this (pending replay is throttled to
+        // ~100/s; an incoming burst is a few dozen messages). A spin is
+        // millions/s, so this only ever trips on a spin.
+        const MAX_ITERS_PER_SEC: u32 = 1000;
+        self.count += 1;
+        let elapsed = self.window_start.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            self.window_start = std::time::Instant::now();
+            self.count = 0;
+        } else if self.count > MAX_ITERS_PER_SEC {
+            log::warn!(
+                "MQTT event loop iterating >{}/s (broker connection spinning); throttling to keep the CPU free",
+                MAX_ITERS_PER_SEC
+            );
+            sleep(Duration::from_secs(1) - elapsed).await;
+            self.window_start = std::time::Instant::now();
+            self.count = 0;
+        }
+    }
+}
+
 pub(crate) struct Mqtt {
     cancel: CancellationToken,
     outgoing_tx: MpscSender<MqttRequest>,
@@ -197,7 +247,9 @@ impl<'a> MqttBackend<'a> {
         log::debug!("MQTT Published Startup");
         let loop_cancel = CancellationToken::new();
         let _drop_guard = loop_cancel.clone().drop_guard();
+        let mut poll_rate = PollRateLimiter::new();
         loop {
+            poll_rate.tick().await;
             let r = tokio::select! {
                 v = self.outgoing_rx.recv() => {
                     let msg = v.ok_or(anyhow!("All outgoing MQTT channels closed"))?;
@@ -584,7 +636,9 @@ impl LastWillMqtt {
         let thread_cancel = cancel.clone();
 
         tokio::task::spawn(async move {
+            let mut poll_rate = PollRateLimiter::new();
             loop {
+                poll_rate.tick().await;
                 let r = tokio::select! {
                     _ = thread_cancel.cancelled() => AnyResult::Ok(()),
                     v = connection.poll() =>  {
