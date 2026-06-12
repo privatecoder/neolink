@@ -38,9 +38,10 @@ There's a more complete example in this repo's
 in the [Camera Configuration Reference](#camera-configuration-reference) below, but
 the following should work as a minimal example.
 
-Each camera needs **either** a `uid` (for P2P/relay discovery) **or** an
-`address` (a direct `ip[:port]`; the port defaults to `9000` if omitted) — not
-both.
+Each camera needs a `uid` (for P2P/relay discovery), an `address` (a direct
+`ip[:port]`; the port defaults to `9000` if omitted), **or both**. If both are
+given, the `address` is used as the direct connection target while the `uid`
+identifies the camera for discovery; only specifying neither is rejected.
 
 ```toml
 bind = "0.0.0.0"
@@ -387,7 +388,7 @@ All per-camera options (under `[[cameras]]`), with defaults. Sub-tables
 | Option | Default | Description |
 |---|---|---|
 | `name` | *(required)* | Camera name; used in the RTSP path and logs. |
-| `uid` | – | Camera UID (for relay/P2P discovery). One of `uid`/`address` is required. |
+| `uid` | – | Camera UID (for relay/P2P discovery). At least one of `uid`/`address` is required; both may be set. |
 | `address` | – | Camera `ip[:port]` for direct/LAN connections. |
 | `username` | *(required)* | Camera login user. |
 | `password` (alias `pass`) | – | Camera login password. |
