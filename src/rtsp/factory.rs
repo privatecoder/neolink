@@ -259,12 +259,17 @@ pub(super) async fn make_factory(
                         } else {
                             15
                         };
+                        // Always bound the learn phase. With no cached stream type a
+                        // silent/offline camera would otherwise never send media, and the
+                        // gst RTSP callback (which blocks waiting for the pipeline reply)
+                        // would hold its worker thread forever. 15s is generous for a cold
+                        // start; on timeout we fall through to the fallback pipeline.
                         let learn_timeout = if cached_both {
                             Some(Duration::from_secs(2))
                         } else if cached_any {
                             Some(Duration::from_secs(4))
                         } else {
-                            None
+                            Some(Duration::from_secs(15))
                         };
 
                         log::info!("{name}::{stream}: Waiting for media frames from camera");
@@ -293,26 +298,6 @@ pub(super) async fn make_factory(
                                             break;
                                         }
                                     }
-                                }
-                            }
-                        } else {
-                            while let Some(media) = media_rx.recv().await {
-                                log::debug!(
-                                    "{name}::{stream}: Received media frame #{}",
-                                    frame_count
-                                );
-                                stream_config.update_from_media(&media);
-                                buffer.push(media);
-                                frame_count += 1;
-                                // Buffer a few frames before building the pipeline (shorter when cached types exist).
-                                if frame_count >= buffer_target
-                                    || (frame_count >= 10
-                                        && stream_config.vid_type.is_some()
-                                        && stream_config.aud_type.is_some())
-                                {
-                                    log::info!("{name}::{stream}: Stream type learned: video={:?}, audio={:?}",
-                                    stream_config.vid_type, stream_config.aud_type);
-                                    break;
                                 }
                             }
                         }
@@ -866,9 +851,10 @@ fn send_to_sources(
     // Update TS
     match data {
         BcMedia::Aac(aac) => {
-            let info = aac
-                .duration_info()
-                .expect("Could not calculate AAC duration");
+            let Some(info) = aac.duration_info() else {
+                log::warn!("{stream_label}: dropping AAC frame with unparseable duration");
+                return Ok(());
+            };
             let aac_len = aac.data.len();
             if let Some(recv_at) = recv_at {
                 stats.record_aac_gap(recv_at);
@@ -900,9 +886,10 @@ fn send_to_sources(
             stats.record_aac(&info, aac_len);
         }
         BcMedia::Adpcm(adpcm) => {
-            let duration = adpcm
-                .duration()
-                .expect("Could not calculate ADPCM duration");
+            let Some(duration) = adpcm.duration() else {
+                log::warn!("{stream_label}: dropping ADPCM frame with unparseable duration");
+                return Ok(());
+            };
             let dur = Duration::from_micros(duration as u64);
             if let Some(aud_src) = aud_src.as_ref() {
                 if !stats.aud_anchored {
@@ -1552,6 +1539,13 @@ fn make_element(kind: &str, name: &str) -> AnyResult<Element> {
             "imagefreeze" => "imagefreeze (gst-plugins-good)",
             "audiotestsrc" => "audiotestsrc (gst-plugins-base)",
             "decodebin" => "playback (gst-plugins-good)",
+            "textoverlay" => "pango (gst-plugins-base)",
+            "jpegenc" => "jpeg (gst-plugins-good)",
+            "rtpjpegpay" => "rtp (gst-plugins-good)",
+            "faad" => "faad (gst-plugins-bad)",
+            "avdec_aac" => "libav (gst-libav)",
+            "fallbackswitch" => "fallbackswitch (gst-plugins-rs / gst-plugins-bad)",
+            "queue" => "coreelements (gstreamer)",
             _ => "Unknown",
         };
         format!(
