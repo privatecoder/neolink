@@ -150,6 +150,17 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
                                     if let Ok(()) = &r {
                                         break r
                                     } else {
+                                        // Back off before restarting. `listen_on_camera` re-runs heavy
+                                        // setup on every start (retained status publishes, two dedicated
+                                        // last-will MQTT connections, and several re-subscribes). A camera
+                                        // drop can make it return an error; without a delay this loop
+                                        // re-runs that setup back-to-back, flooding the broker connection
+                                        // with publishes and new-connection churn — which spins the MQTT
+                                        // event loop. Log the cause and wait before retrying.
+                                        log::warn!(
+                                            "{name}: MQTT camera handler stopped ({r:?}); restarting in 5s"
+                                        );
+                                        tokio::time::sleep(Duration::from_secs(5)).await;
                                         continue;
                                     }
                                 }

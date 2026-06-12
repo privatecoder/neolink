@@ -314,8 +314,8 @@ impl<'a> MqttBackend<'a> {
                                                 let _ = tx.send(Ok(()));
                                             },
                                             Err(rumqttc::ClientError::Request(_)) | Err(rumqttc::ClientError::TryRequest(_)) => {
-                                                // Requeue it
-                                                outgoing_tx.send(MqttRequest::Send(msg, tx)).await?;
+                                                // Requeue it, preserving the retain flag.
+                                                outgoing_tx.send(MqttRequest::SendRetained(msg, tx)).await?;
                                             }
                                         };
                                         v?;
