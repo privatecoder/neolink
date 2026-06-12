@@ -136,19 +136,23 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
   to give the network time to recover and reduce load.
 
 - **No more 100% CPU / wedged runtime after a camera drop (the big one).** When a
-  camera dropped, the process could peg one or two CPU cores and go silent right
+  camera dropped, the process could peg one or more CPU cores and go silent right
   after `Connection Lost … Attempt reconnect` — the camera never reconnected and
-  RTSP clients connected but were never served. A gdb capture pinned it to the
-  **MQTT** client: rumqttc replays queued ("pending") requests with
-  `sleep(pending_throttle)` between each, and the default throttle is `0`, so when
-  the queue can't drain against a half-open broker connection `EventLoop::poll()`
-  busy-loops internally (`sleep(0) → pop → write`) and never returns — pegging a
-  core and, with only a couple of worker threads, starving the whole runtime so
-  cameras couldn't reconnect. Neolink now sets a small non-zero `pending_throttle`
-  on every MQTT connection, capping that loop to a trickle. Two unrelated
-  non-yielding loops found along the way were also fixed: the connection's
-  message-router (`bcconn`) re-polling a closed command channel, and the motion
-  listener re-polling a dropped subscription.
+  RTSP clients connected but were never served. gdb captures pinned it to the
+  **MQTT** client (`rumqttc`): its `EventLoop::poll()` runs a single `select!` and
+  *returns on every call*, so our `loop { poll().await }` spins whenever `poll()`
+  keeps returning instantly against a broken/half-open or message-flooding broker
+  connection — draining `state.events`, a hot read, or a keepalive deadline left
+  in the past. With only a couple of worker threads, one or two such spins starve
+  the whole runtime, so the camera-reconnect task never runs. The fix is a
+  **`PollRateLimiter` that caps each MQTT poll loop to ~1000 iterations/s**
+  (healthy is a handful/s), which structurally bounds the CPU regardless of which
+  internal rumqttc path causes the fast return; it logs a warning when it engages.
+  A non-zero `pending_throttle` is also set (it paced the *pending*-replay path,
+  the first thing found, but didn't cover the others). Two further non-yielding
+  loops were fixed along the way: the connection's message-router (`bcconn`)
+  re-polling a closed command channel, and the motion listener re-polling a
+  dropped subscription.
 
 - **Pipeline torn down on client disconnect.** When an RTSP client disconnects, its
   GStreamer pipeline is now killed, preventing writes to a closed socket.
