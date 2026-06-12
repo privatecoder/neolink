@@ -9,6 +9,12 @@ use crate::{Credentials, Error, Result};
 use bytes::{Buf, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
+/// Maximum number of bytes the resync may skip (cumulatively, across decode
+/// calls) without a clean decode before the error is surfaced as fatal. Tolerates
+/// UDP holes while preventing a genuinely broken stream from being scanned
+/// forever.
+const MAX_RESYNC_BYTES: usize = 64 * 1024;
+
 pub(crate) struct BcCodex {
     context: BcContext,
     /// Bytes discarded while resyncing the stream after a desync (e.g. a UDP
@@ -130,6 +136,17 @@ impl Decoder for BcCodex {
                     // corrupted message.
                     if self.amount_skipped == 0 {
                         log::debug!("BC stream desync ({e:?}); resyncing to next header magic");
+                    }
+                    // Bound the resync: tolerating UDP holes is intentional, but if we
+                    // skip more than a sane budget without a clean decode the stream is
+                    // likely genuinely broken (protocol/decrypt/parse regression), so
+                    // surface the error instead of scanning forever.
+                    if self.amount_skipped > MAX_RESYNC_BYTES {
+                        log::warn!(
+                            "BC stream resync gave up after {} byte(s); surfacing error: {e:?}",
+                            self.amount_skipped
+                        );
+                        return Err(e);
                     }
                     match next_bc_magic_offset(src) {
                         Some(offset) => {

@@ -261,10 +261,6 @@ impl BcMediaAac {
                 first_header_len = Some(header_len);
             }
 
-            let blocks = (data[6] & 0b00000011) + 1;
-            total_blocks += blocks as u64;
-            adts_frames += 1;
-
             let frame_length = (((data[3] & 0b00000011) as usize) << 11)
                 | ((data[4] as usize) << 3)
                 | (((data[5] & 0b11100000) as usize) >> 5);
@@ -272,9 +268,15 @@ impl BcMediaAac {
             if first_frame_length.is_none() {
                 first_frame_length = Some(frame_length as u16);
             }
+            // Validate the frame before counting it: a truncated/short frame must
+            // not contribute to the block/frame totals (and thus the duration).
             if frame_length < 7 || offset + frame_length > self.data.len() {
                 break;
             }
+
+            let blocks = (data[6] & 0b00000011) + 1;
+            total_blocks += blocks as u64;
+            adts_frames += 1;
             offset += frame_length;
         }
 

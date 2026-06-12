@@ -602,7 +602,7 @@ impl UdpPayloadInner {
             },
         }?;
         log::trace!("Send");
-        if self.packets_want > 0 && !self.recieved.is_empty() {
+        if !self.recieved.is_empty() {
             let wait = self.last_delivery_at.elapsed();
             if wait >= self.gap_skip_wait {
                 if let Some(&next_id) = self.recieved.keys().next() {
