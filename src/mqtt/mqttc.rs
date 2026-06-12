@@ -231,12 +231,13 @@ impl<'a> MqttBackend<'a> {
         }
 
         mqttoptions.set_keep_alive(Duration::from_secs(5));
-        // rumqttc replays queued ("pending") requests using `sleep(pending_throttle)`
-        // between each. The default is 0, so when the queue can't drain against a
-        // half-open broker connection, `EventLoop::poll()` busy-loops internally
-        // (`next_request -> sleep(0) -> pop -> write`) and never returns — pegging a
-        // CPU core and, with only a couple of worker threads, starving the runtime so
-        // cameras never reconnect. A small non-zero throttle turns that into a trickle.
+        // rumqttc replays queued ("pending") requests with `sleep(pending_throttle)`
+        // between each; the default is 0, which tight-drains the pending queue. A
+        // small non-zero value paces that path. NOTE: `EventLoop::poll()` returns on
+        // every call (it runs a single `select!`), so this only covers the pending
+        // branch — not live request traffic. The primary CPU-spin fix is the
+        // per-camera MQTT handler restart backoff in `mqtt/mod.rs`; the poll-loop
+        // rate limiter (`PollRateLimiter`) is a failsafe.
         mqttoptions.set_pending_throttle(Duration::from_millis(10));
 
         // On unclean disconnect send this
@@ -636,12 +637,13 @@ impl LastWillMqtt {
         }
 
         mqttoptions.set_keep_alive(Duration::from_secs(5));
-        // rumqttc replays queued ("pending") requests using `sleep(pending_throttle)`
-        // between each. The default is 0, so when the queue can't drain against a
-        // half-open broker connection, `EventLoop::poll()` busy-loops internally
-        // (`next_request -> sleep(0) -> pop -> write`) and never returns — pegging a
-        // CPU core and, with only a couple of worker threads, starving the runtime so
-        // cameras never reconnect. A small non-zero throttle turns that into a trickle.
+        // rumqttc replays queued ("pending") requests with `sleep(pending_throttle)`
+        // between each; the default is 0, which tight-drains the pending queue. A
+        // small non-zero value paces that path. NOTE: `EventLoop::poll()` returns on
+        // every call (it runs a single `select!`), so this only covers the pending
+        // branch — not live request traffic. The primary CPU-spin fix is the
+        // per-camera MQTT handler restart backoff in `mqtt/mod.rs`; the poll-loop
+        // rate limiter (`PollRateLimiter`) is a failsafe.
         mqttoptions.set_pending_throttle(Duration::from_millis(10));
 
         // On unclean disconnect send this

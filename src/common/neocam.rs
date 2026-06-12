@@ -38,7 +38,6 @@ pub(crate) enum NeoCamCommand {
     Disconnect(OneshotSender<()>),
     Connect(OneshotSender<()>),
     GetPermit(OneshotSender<Permit>),
-    GetUid(OneshotSender<String>),
 }
 /// The underlying camera binding
 pub(crate) struct NeoCam {
@@ -57,7 +56,6 @@ impl NeoCam {
         let (md_request_tx, md_request_rx) = mpsc(100);
         // Start disconnected - camera will connect when first RTSP client arrives (via permit system)
         let (state_tx, state_rx) = watch(NeoCamThreadState::Disconnected);
-        let (uid_tx, uid_rx) = watch(config.camera_uid.clone());
 
         let set = JoinSet::new();
         let users = UseCounter::new().await;
@@ -126,14 +124,6 @@ impl NeoCam {
                             NeoCamCommand::GetPermit(sender) => {
                                 let _ = sender.send(users.create_activated().await?);
                             }
-                            NeoCamCommand::GetUid(sender) => {
-                                let mut uid_rx = uid_rx.clone();
-                                tokio::task::spawn(async move {
-                                    let uid = uid_rx.wait_for(|v| v.is_some()).await?.clone().unwrap();
-                                    let _ = sender.send(uid);
-                                    AnyResult::Ok(())
-                                });
-                            },
                         }
                     }
                     Ok(())
@@ -182,7 +172,6 @@ impl NeoCam {
         // connected for another reason (RTSP client, MQTT command, etc.)
         let _report_instance = instance.subscribe().await?;
         let _uid_instance = instance.clone();
-        let _uid_tx = uid_tx;
 
         // MD permits
         let md_permit_instance = instance.subscribe().await?;
@@ -233,7 +222,7 @@ impl NeoCam {
                     let mut config_rx = connect_instance.config().await?;
                     let name = config_rx.borrow().name.clone();
 
-                    loop {
+                    'lifecycle: loop {
                         // Snapshot the mode (and mark the current config as seen so a
                         // later `changed()` only fires on a genuine config change).
                         let mode = config_rx.borrow_and_update().connect_mode;
@@ -285,7 +274,19 @@ impl NeoCam {
 
                                 // Stay connected until all permits drop, plus a warm grace.
                                 loop {
-                                    permit.dropped_users().await?;
+                                    // Wait for users to drop, but also react to config
+                                    // changes (e.g. connect_mode) while connected. Users
+                                    // are present here, so re-evaluating re-reads the mode
+                                    // without dropping the active stream (connect() is
+                                    // idempotent and aquired_users() returns immediately).
+                                    tokio::select! {
+                                        r = permit.dropped_users() => { r?; }
+                                        r = config_rx.changed() => {
+                                            if r.is_err() { break 'lifecycle; }
+                                            log::info!("{name}: config changed; re-evaluating connect mode");
+                                            continue 'lifecycle;
+                                        }
+                                    }
                                     let warm_secs = config_rx.borrow().relay_warm_seconds;
                                     if warm_secs == 0 {
                                         break;
@@ -304,6 +305,14 @@ impl NeoCam {
                                             v?;
                                             log::info!("{name}: Permit reacquired during warm relay window");
                                             continue;
+                                        }
+                                        r = config_rx.changed() => {
+                                            if r.is_err() { break 'lifecycle; }
+                                            // No active users during the warm window, so
+                                            // ending it (disconnect) to re-evaluate the mode
+                                            // is safe and disrupts nothing.
+                                            log::info!("{name}: config changed during warm window; re-evaluating");
+                                            break;
                                         }
                                     }
                                 }

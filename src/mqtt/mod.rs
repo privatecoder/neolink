@@ -160,8 +160,13 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
                                         log::warn!(
                                             "{name}: MQTT camera handler stopped ({r:?}); restarting in 5s"
                                         );
-                                        tokio::time::sleep(Duration::from_secs(5)).await;
-                                        continue;
+                                        // Cancellation-aware backoff: don't make shutdown or
+                                        // config-driven removal wait up to 5s.
+                                        tokio::select! {
+                                            _ = thread_global_cancel.cancelled() => break AnyResult::Ok(()),
+                                            _ = local_cancel.cancelled() => break AnyResult::Ok(()),
+                                            _ = tokio::time::sleep(Duration::from_secs(5)) => continue,
+                                        }
                                     }
                                 }
                             }) ;
