@@ -16,8 +16,34 @@ use std::sync::mpsc as std_mpsc;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use std::future::Future;
 
 use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
+
+/// Spawn a detached task and log (instead of silently dropping) an error result.
+fn spawn_logged<F>(label: String, fut: F)
+where
+    F: Future<Output = AnyResult<()>> + Send + 'static,
+{
+    tokio::task::spawn(async move {
+        if let Err(e) = fut.await {
+            log::warn!("{label}: task ended with error: {e:?}");
+        }
+    });
+}
+
+/// `spawn_logged` for a blocking task.
+fn spawn_blocking_logged<F>(label: String, f: F)
+where
+    F: FnOnce() -> AnyResult<()> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = f() {
+            log::warn!("{label}: blocking task ended with error: {e:?}");
+        }
+    });
+}
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, TrySendError};
@@ -185,6 +211,7 @@ struct TimedMedia {
 pub(super) async fn make_factory(
     camera: NeoInstance,
     stream: StreamKind,
+    cancel: CancellationToken,
 ) -> AnyResult<(NeoMediaFactory, JoinHandle<AnyResult<()>>)> {
     log::debug!("make_factory called for stream {:?}", stream);
 
@@ -194,6 +221,14 @@ pub(super) async fn make_factory(
 
     // Create the task that creates the pipelines
     let thread = tokio::task::spawn(async move {
+        let r: AnyResult<()> = tokio::select! {
+            // Cancelled when its `stream_main` generation is dropped (e.g. a config
+            // change), so the handler task doesn't leak.
+            _ = cancel.cancelled() => {
+                log::debug!("RTSP factory message-handler cancelled");
+                Ok(())
+            }
+            v = async move {
         let name = camera.config().await?.borrow().name.clone();
         log::info!("{name}::{stream}: Message handler task started, waiting for messages");
 
@@ -204,7 +239,8 @@ pub(super) async fn make_factory(
                     log::debug!("NewClient message received for {name}::{stream}");
                     let camera = camera.clone();
                     let name = name.clone();
-                    tokio::task::spawn(async move {
+                    let task_label = format!("{name}::{stream} client");
+                    spawn_logged(task_label, async move {
                         clear_bin(&element)?;
                         log::info!(
                             "{name}::{stream}: Factory received new client, setting up pipeline"
@@ -451,7 +487,8 @@ pub(super) async fn make_factory(
                         // Run blocking code in tokio's blocking thread pool
                         // This maintains the tokio runtime context needed for permit drop
                         // Move permit into this thread to keep it alive for the session duration
-                        tokio::task::spawn_blocking(move || {
+                        let sender_label = stream_label.clone();
+                        spawn_blocking_logged(sender_label, move || {
                             use std::time::{Duration, Instant};
 
                             let start = Instant::now();
@@ -779,6 +816,12 @@ pub(super) async fn make_factory(
             }
         }
         AnyResult::Ok(())
+            } => v,
+        };
+        if let Err(e) = &r {
+            log::warn!("RTSP factory message-handler task ended with error: {e:?}");
+        }
+        r
     });
 
     log::debug!("Setting up factory with custom callback");
