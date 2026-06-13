@@ -44,6 +44,7 @@ config ─▶ NeoReactor ─▶ NeoCam ──(on demand)──▶ discovery/look
 | A/V timestamping on the RTSP output | [av-timestamping.md](av-timestamping.md) |
 | Two-way audio (talk) | [two-way-audio.md](two-way-audio.md) |
 | Reolink SongP2P / RDT — empirical notes | [reolink.md](reolink.md) |
+| Home Assistant integration (go2rtc, WebRTC/MSE/HLS, H264/H265, viewing cards) | [home-assistant.md](home-assistant.md) |
 
 Per-camera configuration options and their defaults are documented in the project
 `README.md` ("Camera Configuration Reference").
