@@ -516,7 +516,7 @@ pub(super) async fn make_factory(
 
                             // Send buffered frames (no pacing)
                             for buffered in buffer.drain(..) {
-                                if let Err(e) = send_to_sources(
+                                match send_to_sources(
                                     buffered,
                                     &stream_label,
                                     &mut pools,
@@ -530,12 +530,13 @@ pub(super) async fn make_factory(
                                     &mut aud_pacer,
                                     &mut stats,
                                     None,
-                                ) {
-                                    if e.to_string().contains("App source is closed") {
+                                )? {
+                                    PushOutcome::Gone => {
                                         log::info!("{stream_label}: Client disconnected, stopping camera relay");
                                         return AnyResult::Ok(());
                                     }
-                                    return Err(e);
+                                    // Pre-PLAY buffered frames: NotLinked is expected, tolerate it.
+                                    PushOutcome::Pushed | PushOutcome::NotLinked => {}
                                 }
                             }
 
@@ -744,7 +745,7 @@ pub(super) async fn make_factory(
                                     continue;
                                 }
 
-                                if let Err(e) = send_to_sources(
+                                match send_to_sources(
                                     timed.media,
                                     &stream_label,
                                     &mut pools,
@@ -758,15 +759,14 @@ pub(super) async fn make_factory(
                                     &mut aud_pacer,
                                     &mut stats,
                                     Some(timed.recv_at),
-                                ) {
-                                    if e.to_string().contains("App source is closed")
-                                        || e.to_string().contains("App source is not linked")
-                                    {
+                                )? {
+                                    PushOutcome::Gone => {
                                         log::info!("{stream_label}: Client disconnected, stopping camera relay");
                                         break;
                                     }
-                                    log::warn!("Failed to send to source: {e:?}");
-                                    return Err(e);
+                                    // NotLinked after PLAY is handled by the link /
+                                    // disconnect_grace checks at the top of the loop.
+                                    PushOutcome::Pushed | PushOutcome::NotLinked => {}
                                 }
                             }
 
@@ -833,6 +833,19 @@ fn video_microseconds(m: &BcMedia) -> Option<u32> {
     }
 }
 
+/// Outcome of pushing a buffer to an appsrc / sending a frame to the sources.
+enum PushOutcome {
+    /// Buffer accepted (or nothing to push for this frame).
+    Pushed,
+    /// Pad not linked yet. This is normal before the RTSP client reaches PLAY, so
+    /// it is tolerated; the live loop's link/`disconnect_grace`/activation-deadline
+    /// checks decide when an unlinked client is actually gone.
+    NotLinked,
+    /// The appsrc/pipeline is gone (flushing, EOS, closed, or another hard push
+    /// error): stop this client's relay.
+    Gone,
+}
+
 fn send_to_sources(
     data: BcMedia,
     stream_label: &str,
@@ -847,20 +860,20 @@ fn send_to_sources(
     aud_pacer: &mut Option<PacerState>,
     stats: &mut StreamStats,
     recv_at: Option<std::time::Instant>,
-) -> AnyResult<()> {
+) -> AnyResult<PushOutcome> {
     // Update TS
     match data {
         BcMedia::Aac(aac) => {
             let Some(info) = aac.duration_info() else {
                 log::warn!("{stream_label}: dropping AAC frame with unparseable duration");
-                return Ok(());
+                return Ok(PushOutcome::Pushed);
             };
             let aac_len = aac.data.len();
             if let Some(recv_at) = recv_at {
                 stats.record_aac_gap(recv_at);
             }
             let dur = Duration::from_micros(info.duration_us as u64);
-            if let Some(aud_src) = aud_src.as_ref() {
+            let outcome = if let Some(aud_src) = aud_src.as_ref() {
                 // Audio carries no camera timestamp: ride a content-clock (advance by
                 // the frame's own duration), anchored once to the video camera-clock so
                 // it stays aligned with video without following bursty network arrival.
@@ -870,7 +883,7 @@ fn send_to_sources(
                 }
                 let ts_us = *aud_ts;
                 log::debug!("Sending AAC: {:?}", Duration::from_micros(ts_us));
-                send_to_appsrc(
+                let outcome = send_to_appsrc(
                     aud_src,
                     stream_label,
                     aac.data,
@@ -880,15 +893,21 @@ fn send_to_sources(
                     pace,
                     aud_pacer,
                 )?;
-                stats.aud_pushed += 1;
+                if matches!(outcome, PushOutcome::Pushed) {
+                    stats.aud_pushed += 1;
+                }
                 *aud_ts = ts_us + info.duration_us as u64;
-            }
+                outcome
+            } else {
+                PushOutcome::Pushed
+            };
             stats.record_aac(&info, aac_len);
+            Ok(outcome)
         }
         BcMedia::Adpcm(adpcm) => {
             let Some(duration) = adpcm.duration() else {
                 log::warn!("{stream_label}: dropping ADPCM frame with unparseable duration");
-                return Ok(());
+                return Ok(PushOutcome::Pushed);
             };
             let dur = Duration::from_micros(duration as u64);
             if let Some(aud_src) = aud_src.as_ref() {
@@ -898,7 +917,7 @@ fn send_to_sources(
                 }
                 let ts_us = *aud_ts;
                 log::trace!("Sending ADPCM: {:?}", Duration::from_micros(ts_us));
-                send_to_appsrc(
+                let outcome = send_to_appsrc(
                     aud_src,
                     stream_label,
                     adpcm.data,
@@ -908,10 +927,13 @@ fn send_to_sources(
                     pace,
                     aud_pacer,
                 )?;
-                stats.aud_pushed += 1;
+                if matches!(outcome, PushOutcome::Pushed) {
+                    stats.aud_pushed += 1;
+                }
                 *aud_ts = ts_us + duration as u64;
-                return Ok(());
+                return Ok(outcome);
             }
+            Ok(PushOutcome::Pushed)
         }
         BcMedia::Iframe(BcMediaIframe {
             data, microseconds, ..
@@ -924,7 +946,7 @@ fn send_to_sources(
                 let frame_dur =
                     Duration::from_micros(1_000_000u64 / stream_config.fps.max(1) as u64);
                 log::trace!("Sending I-frame: {:?}", Duration::from_micros(ts_us));
-                send_to_appsrc(
+                let outcome = send_to_appsrc(
                     vid_src,
                     stream_label,
                     data,
@@ -934,10 +956,13 @@ fn send_to_sources(
                     pace,
                     vid_pacer,
                 )?;
-                stats.vid_pushed += 1;
+                if matches!(outcome, PushOutcome::Pushed) {
+                    stats.vid_pushed += 1;
+                }
                 *vid_ts = ts_us;
-                return Ok(());
+                return Ok(outcome);
             }
+            Ok(PushOutcome::Pushed)
         }
         BcMedia::Pframe(BcMediaPframe {
             data, microseconds, ..
@@ -954,7 +979,7 @@ fn send_to_sources(
                 let frame_dur =
                     Duration::from_micros(1_000_000u64 / stream_config.fps.max(1) as u64);
 
-                if max > 0 && level >= max * 80 / 100 {
+                let outcome = if max > 0 && level >= max * 80 / 100 {
                     stats.p_dropped_pressure += 1;
                     log::trace!(
                         "Dropping P-frame due to buffer pressure ({}/{} bytes, {}%)",
@@ -962,9 +987,10 @@ fn send_to_sources(
                         max,
                         level * 100 / max
                     );
+                    PushOutcome::Pushed
                 } else {
                     log::trace!("Sending P-frame: {:?}", Duration::from_micros(ts_us));
-                    send_to_appsrc(
+                    let outcome = send_to_appsrc(
                         vid_src,
                         stream_label,
                         data,
@@ -974,15 +1000,18 @@ fn send_to_sources(
                         pace,
                         vid_pacer,
                     )?;
-                    stats.vid_pushed += 1;
-                }
+                    if matches!(outcome, PushOutcome::Pushed) {
+                        stats.vid_pushed += 1;
+                    }
+                    outcome
+                };
                 *vid_ts = ts_us;
-                return Ok(());
+                return Ok(outcome);
             }
+            Ok(PushOutcome::Pushed)
         }
-        _ => {}
+        _ => Ok(PushOutcome::Pushed),
     }
-    Ok(())
 }
 
 fn bucket_size_for(n: usize) -> Option<usize> {
@@ -1057,7 +1086,7 @@ fn send_to_appsrc(
     pools: &mut std::collections::HashMap<usize, gstreamer::BufferPool>,
     pace: bool,
     pacer: &mut Option<PacerState>,
-) -> AnyResult<()> {
+) -> AnyResult<PushOutcome> {
     // Treat shutdown as clean stop
     // if is_closed(appsrc) {
     //     return Ok(());
@@ -1111,18 +1140,22 @@ fn send_to_appsrc(
         }
     }
 
-    match result {
-        Ok(_) => Ok(()),
+    Ok(match result {
+        Ok(_) => PushOutcome::Pushed,
+        Err(gstreamer::FlowError::NotLinked) => {
+            // Normal before the client reaches PLAY (pads not linked yet); tolerate.
+            log::debug!("{stream_label}: push_buffer => NOT_LINKED");
+            PushOutcome::NotLinked
+        }
         Err(gstreamer::FlowError::Flushing) => {
             log::debug!("{stream_label}: push_buffer => FLUSHING");
-            Ok(())
+            PushOutcome::Gone
         }
-        Err(gstreamer::FlowError::NotLinked) => {
-            log::debug!("{stream_label}: push_buffer => NOT_LINKED");
-            Ok(())
+        Err(e) => {
+            log::warn!("{stream_label}: push_buffer failed: {e:?}");
+            PushOutcome::Gone
         }
-        Err(e) => Err(anyhow::anyhow!("Error in streaming: {e:?}")),
-    }
+    })
 }
 
 #[derive(Clone, Debug)]
