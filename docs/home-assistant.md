@@ -202,6 +202,45 @@ the WebRTC→MSE fallback delay described above — pin the playback mode for th
 fast startup is the goal, a persistent go2rtc stream helps more, since go2rtc can hold
 a recent keyframe and hand it to new consumers immediately.
 
+## Bitrate: CBR vs VBR
+
+Like the GOP, the rate-control mode is a **camera-side encoding setting** — Neolink
+streams whatever the camera produces and the stream-info reply it reads carries no
+CBR/VBR flag, so Neolink neither sets nor logs which mode is in use. Configure it per
+stream in the Reolink app/web UI. The choice mostly comes down to **where you watch**.
+
+**VBR (variable)** allocates bits where they're needed — more during motion, fewer on
+a static scene — with the configured bitrate acting as a ceiling/target max.
+
+- *Pros:* better quality per average bitrate; much lower bandwidth/storage when the
+  scene is still (most of the time for a fixed camera); detail holds up during motion.
+- *Cons:* **bitrate spikes** during motion. On a constrained upload / P2P-relay /
+  remote link those bursts can exceed the available bandwidth → packet loss → Neolink's
+  catch-up/backpressure dropping engages (the `CATCHUP enter` path), causing stutter
+  and freeze-until-keyframe.
+
+**CBR (constant)** holds a steady bitrate regardless of scene.
+
+- *Pros:* predictable bandwidth — easy to provision for remote/relay, smoother
+  delivery, more consistent latency and fewer loss-induced glitches.
+- *Cons:* wastes bits on static scenes (more storage), and during heavy motion it
+  can't exceed the cap, so quality drops (more blockiness) exactly when you want detail.
+
+Guidance:
+
+| Situation | Pick |
+|---|---|
+| Main stream on **LAN** (or recording to an NVR) | **VBR** — best quality + storage efficiency; LAN absorbs the spikes |
+| Viewed **remotely / over P2P-relay** on limited upload, with stutter/backpressure | **CBR**, or keep VBR but **lower the max-bitrate cap** |
+| **Sub stream** for live tiles | Either; **CBR** gives a steady, predictable small stream across many tiles |
+
+**Interaction with GOP.** VBR motion spikes and large I-frames are the same root
+stressor on a relay link. Shortening the GOP (more keyframes) *and* running VBR makes
+the bursts compound. So on a remote/relay camera, lean toward **CBR (or VBR with a firm
+cap) + the default longer GOP**; on LAN, **VBR + whatever GOP you like** is fine. See
+[connection-and-bandwidth.md](connection-and-bandwidth.md) for how Neolink's transport
+and backpressure handle these bursts.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
