@@ -156,6 +156,52 @@ These don't change the browser-side codec story, but they smooth the experience:
 - **RTSP port**: pick a free port (the add-on uses 8558) and use that exact port in
   every URL, including go2rtc's.
 
+## I-frame interval (GOP)
+
+The **I-frame (keyframe) interval** — sometimes labelled "interframe" or GOP in the
+Reolink app — is a **camera-side encoding setting**. Neolink streams whatever the
+camera produces and does not change it, so configure it per stream in the Reolink
+app/web UI. Typical defaults are a keyframe roughly every ~2 s on the main stream and
+~4 s on the sub. **Lowering it means more frequent keyframes.**
+
+Why more frequent keyframes help the live-view experience:
+
+- **Faster first picture on connect.** A decoder (and MSE/WebRTC) can only begin
+  rendering at a keyframe, so a freshly-connecting client shows nothing until the next
+  one arrives — up to a full interval of black. With a 2 s interval that's up to ~2 s
+  per attempt, and since opening a card often makes several connection attempts (see
+  the fallback cascade above), the wait repeats each time. A shorter interval gives a
+  quicker first frame.
+- **Faster recovery after packet loss.** On a lossy remote/relay link a damaged group
+  of frames shows artifacts or freezes until the next keyframe. More frequent
+  keyframes shorten that visible glitch. It also helps Neolink's backpressure
+  catch-up, which drops predicted frames *until the next keyframe* — more keyframes
+  means a clean picture resumes sooner.
+
+The cost:
+
+- **More bandwidth.** Keyframes are far larger than predicted frames (a 4K main-stream
+  keyframe can be ~240 KB vs ~17–27 KB for a normal frame), so sending them more often
+  is a real increase. Over P2P-relay/remote links the bigger, more frequent bursts
+  also mean more reassembly pressure and more opportunity for loss.
+- **Lower quality under a bitrate cap.** If the stream is bitrate-capped, more of the
+  budget is spent on keyframes, reducing per-frame quality; uncapped, the bitrate
+  simply rises.
+
+Practical guidance:
+
+- **Main (4K / H265):** usually leave it. Its keyframes are already the heavy part, so
+  making them more frequent noticeably raises bandwidth and backpressure on anything
+  but a clean LAN — for a startup saving of ~1 s.
+- **Sub (low-res / H264):** a good candidate to shorten (e.g. ~1–2 s). Keyframes are
+  cheap here, so if you use the sub for live tiles you get snappier opens and faster
+  loss recovery at negligible cost.
+
+This only affects the per-attempt "wait for the first keyframe"; it does **not** fix
+the WebRTC→MSE fallback delay described above — pin the playback mode for that. If
+fast startup is the goal, a persistent go2rtc stream helps more, since go2rtc can hold
+a recent keyframe and hand it to new consumers immediately.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
