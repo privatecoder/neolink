@@ -365,18 +365,51 @@ pub struct BcMediaAdpcm {
 }
 
 impl BcMediaAdpcm {
-    /// The block size, this is bytes without the block header
-    pub fn block_size(&self) -> u32 {
-        self.data.len() as u32 - 4
+    /// The block size, this is bytes without the block header.
+    ///
+    /// Returns `None` for a malformed payload shorter than the 4-byte predictor
+    /// state header, so callers don't underflow on `len() - 4`.
+    pub fn block_size(&self) -> Option<u32> {
+        self.data
+            .len()
+            .checked_sub(4)
+            .map(|block_bytes| block_bytes as u32)
     }
 
-    /// Returns duration in micro seconds;
+    /// Returns duration in micro seconds, or `None` for a malformed short payload.
     pub fn duration(&self) -> Option<u32> {
-        let samples = self.block_size() * 2;
+        let samples = self.block_size()? * 2;
         // Always 8000Hz for ADPCM
         const SAMPLE_FREQUENCY: u32 = 8000;
         const MICROSECONDS: u32 = 1000000;
         let duration = samples * MICROSECONDS / SAMPLE_FREQUENCY;
         Some(duration)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BcMediaAdpcm;
+
+    #[test]
+    fn adpcm_short_payload_has_no_block_size_or_duration() {
+        // Fewer than the 4 predictor-state header bytes must not underflow.
+        for len in 0..4 {
+            let adpcm = BcMediaAdpcm {
+                data: vec![0u8; len],
+            };
+            assert_eq!(adpcm.block_size(), None, "len={len}");
+            assert_eq!(adpcm.duration(), None, "len={len}");
+        }
+    }
+
+    #[test]
+    fn adpcm_valid_payload_block_size_and_duration() {
+        // 4 header bytes + 8 block bytes => block_size 8, 16 samples @ 8kHz.
+        let adpcm = BcMediaAdpcm {
+            data: vec![0u8; 4 + 8],
+        };
+        assert_eq!(adpcm.block_size(), Some(8));
+        assert_eq!(adpcm.duration(), Some(8 * 2 * 1_000_000 / 8000));
     }
 }

@@ -170,7 +170,11 @@ impl StreamConfig {
                 self.aud_type = Some(AudioType::Aac);
             }
             BcMedia::Adpcm(adpcm) => {
-                self.aud_type = Some(AudioType::Adpcm(adpcm.block_size()));
+                if let Some(block_size) = adpcm.block_size() {
+                    self.aud_type = Some(AudioType::Adpcm(block_size));
+                } else {
+                    log::warn!("Ignoring malformed ADPCM frame shorter than its header");
+                }
             }
             BcMedia::Iframe(BcMediaIframe { video_type, .. })
             | BcMedia::Pframe(BcMediaPframe { video_type, .. }) => {
@@ -221,6 +225,10 @@ pub(super) async fn make_factory(
 
     // Create the task that creates the pipelines
     let thread = tokio::task::spawn(async move {
+        // Child token handed to each per-client task (forwarder + blocking sender)
+        // so a generation cancel (config-change restart) tears those down too, not
+        // just the message-handler loop.
+        let child_cancel = cancel.clone();
         let r: AnyResult<()> = tokio::select! {
             // Cancelled when its `stream_main` generation is dropped (e.g. a config
             // change), so the handler task doesn't leak.
@@ -239,6 +247,7 @@ pub(super) async fn make_factory(
                     log::debug!("NewClient message received for {name}::{stream}");
                     let camera = camera.clone();
                     let name = name.clone();
+                    let cancel_child = child_cancel.clone();
                     let task_label = format!("{name}::{stream} client");
                     spawn_logged(task_label, async move {
                         clear_bin(&element)?;
@@ -246,19 +255,43 @@ pub(super) async fn make_factory(
                             "{name}::{stream}: Factory received new client, setting up pipeline"
                         );
 
-                        // Acquire permit - this triggers camera relay connection
-                        // IMPORTANT: Must be moved into blocking thread to keep it alive
+                        // Bound the camera-connect awaits with a timeout and make
+                        // them cancellation-aware. The gst RTSP callback blocks on
+                        // blocking_recv waiting for `reply`; without this a stalled
+                        // connect (sleeping/offline camera, a relay that never
+                        // answers, or stream_while_live waiting on the camera watch)
+                        // would pin a gst worker thread indefinitely. On timeout or
+                        // generation-cancel we return early, dropping `reply`, so the
+                        // callback gets a bounded error instead of hanging.
                         log::debug!(
                             "{name}::{stream}: Acquiring permit to trigger camera connection"
                         );
-                        let permit = camera.permit().await?;
-                        log::debug!("{name}::{stream}: Permit acquired successfully");
-
-                        // Start the camera relay connection
-                        let config = camera.config().await?.borrow().clone();
-                        let mut media_rx = camera.stream_while_live(stream).await?;
-
-                        log::info!("{name}::{stream}: Camera relay established");
+                        let connect = async {
+                            // IMPORTANT: permit must be moved into the blocking sender
+                            // thread later to keep the camera connection alive.
+                            let permit = camera.permit().await?;
+                            log::debug!("{name}::{stream}: Permit acquired successfully");
+                            let config = camera.config().await?.borrow().clone();
+                            let media_rx = camera.stream_while_live(stream).await?;
+                            log::info!("{name}::{stream}: Camera relay established");
+                            let stream_config =
+                                StreamConfig::new(&camera, stream, config.buffer_duration).await?;
+                            AnyResult::Ok((permit, config, media_rx, stream_config))
+                        };
+                        let (permit, config, mut media_rx, mut stream_config) = tokio::select! {
+                            _ = cancel_child.cancelled() => {
+                                log::warn!("{name}::{stream}: client setup cancelled before the camera connected; dropping client");
+                                return Ok(());
+                            }
+                            r = tokio::time::timeout(Duration::from_secs(20), connect) => match r {
+                                Ok(Ok(v)) => v,
+                                Ok(Err(e)) => return Err(e),
+                                Err(_) => {
+                                    log::warn!("{name}::{stream}: camera connect did not complete within 20s; dropping client");
+                                    return Ok(());
+                                }
+                            }
+                        };
 
                         log::info!("{name}::{stream}: Learning camera stream type");
                         // Learn the camera data type
@@ -271,8 +304,6 @@ pub(super) async fn make_factory(
                             .unwrap_or_else(|| config.name.clone());
                         let cache_key = StreamCacheKey { camera_id, stream };
 
-                        let mut stream_config =
-                            StreamConfig::new(&camera, stream, config.buffer_duration).await?;
                         if let Some(cached) = cached_stream_types(&cache_key).await {
                             if cached.vid_type.is_some() || cached.aud_type.is_some() {
                                 log::info!(
@@ -314,6 +345,10 @@ pub(super) async fn make_factory(
                             tokio::pin!(deadline);
                             loop {
                                 tokio::select! {
+                                    _ = cancel_child.cancelled() => {
+                                        log::warn!("{name}::{stream}: client setup cancelled while learning stream type; dropping client");
+                                        return Ok(());
+                                    }
                                     _ = &mut deadline => {
                                         log::info!("{name}::{stream}: Stream type timeout, proceeding with cached types");
                                         break;
@@ -435,12 +470,22 @@ pub(super) async fn make_factory(
                         let drop_video_fwd = drop_video.clone();
                         let drop_other_fwd = drop_other.clone();
                         let label_fwd = stream_label.clone();
+                        let cancel_fwd = cancel_child.clone();
 
-                        // Forwarder task: runs on tokio, owns media_rx
+                        // Forwarder task: runs on tokio, owns media_rx. Stops when the
+                        // camera stream ends or the generation is cancelled; dropping
+                        // std_tx then disconnects the blocking sender too.
                         tokio::spawn(async move {
                             let mut last_drop_log = std::time::Instant::now();
                             let mut dropped = 0u64;
-                            while let Some(m) = media_rx.recv().await {
+                            loop {
+                                let m = tokio::select! {
+                                    _ = cancel_fwd.cancelled() => break,
+                                    m = media_rx.recv() => match m {
+                                        Some(m) => m,
+                                        None => break,
+                                    },
+                                };
                                 let kind = match &m {
                                     BcMedia::Aac(_) | BcMedia::Adpcm(_) => 0,
                                     BcMedia::Iframe(_) | BcMedia::Pframe(_) => 1,
@@ -488,6 +533,7 @@ pub(super) async fn make_factory(
                         // This maintains the tokio runtime context needed for permit drop
                         // Move permit into this thread to keep it alive for the session duration
                         let sender_label = stream_label.clone();
+                        let cancel_send = cancel_child.clone();
                         spawn_blocking_logged(sender_label, move || {
                             use std::time::{Duration, Instant};
 
@@ -579,6 +625,10 @@ pub(super) async fn make_factory(
 
                             // Live loop: recv_timeout so heartbeat + disconnect checks keep running
                             loop {
+                                if cancel_send.is_cancelled() {
+                                    log::info!("{stream_label}: Generation cancelled, stopping camera relay");
+                                    break;
+                                }
                                 let vid_closed =
                                     vid_src.as_ref().map(|src| is_closed(src)).unwrap_or(true);
                                 let aud_closed =
