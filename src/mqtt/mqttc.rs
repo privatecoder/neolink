@@ -266,7 +266,9 @@ impl<'a> MqttBackend<'a> {
         let mut poll_rate = PollRateLimiter::new();
         loop {
             if poll_rate.spinning() {
-                break Err(anyhow!("MQTT event loop spinning; dropping connection to reconnect"));
+                break Err(anyhow!(
+                    "MQTT event loop spinning; dropping connection to reconnect"
+                ));
             }
             let r = tokio::select! {
                 v = self.outgoing_rx.recv() => {
@@ -658,7 +660,9 @@ impl LastWillMqtt {
             let mut poll_rate = PollRateLimiter::new();
             loop {
                 if poll_rate.spinning() {
-                    break Err(anyhow!("MQTT last-will event loop spinning; dropping connection"));
+                    break Err(anyhow!(
+                        "MQTT last-will event loop spinning; dropping connection"
+                    ));
                 }
                 let r = tokio::select! {
                     _ = thread_cancel.cancelled() => AnyResult::Ok(()),
