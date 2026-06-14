@@ -4,7 +4,6 @@ use std::{collections::HashMap, time::Duration};
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory};
 use gstreamer_app::{AppSink, AppSrc, AppSrcCallbacks, AppStreamType};
-use std::sync::Arc;
 use neolink_core::{
     bc_protocol::StreamKind,
     bcmedia::model::{
@@ -13,12 +12,13 @@ use neolink_core::{
     },
 };
 use once_cell::sync::Lazy;
+use std::future::Future;
 use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use std::future::Future;
 
 use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
 
@@ -1439,6 +1439,16 @@ fn encode_black_keyframe(vid_type: VideoType, width: u32, height: u32) -> AnyRes
         .context("keepalive: parse encode pipeline")?
         .downcast::<gstreamer::Pipeline>()
         .map_err(|_| anyhow!("keepalive: encode pipeline is not a Pipeline"))?;
+
+    // Always return the pipeline to Null on any exit path.
+    struct NullGuard(gstreamer::Pipeline);
+    impl Drop for NullGuard {
+        fn drop(&mut self) {
+            let _ = self.0.set_state(gstreamer::State::Null);
+        }
+    }
+    let _guard = NullGuard(pipeline.clone());
+
     let sink = pipeline
         .by_name("sink")
         .context("keepalive: appsink missing")?
@@ -1446,11 +1456,11 @@ fn encode_black_keyframe(vid_type: VideoType, width: u32, height: u32) -> AnyRes
         .map_err(|_| anyhow!("keepalive: sink is not an AppSink"))?;
     pipeline.set_state(gstreamer::State::Playing)?;
 
-    let mut found: Option<Vec<u8>> = None;
     for _ in 0..8 {
-        let sample = match sink.pull_sample() {
-            Ok(s) => s,
-            Err(_) => break, // EOS / error
+        // Bounded pull so a wedged encoder/parser negotiation can't hang the sender.
+        let sample = match sink.try_pull_sample(Some(ClockTime::from_seconds(2))) {
+            Some(s) => s,
+            None => break, // timeout / EOS / error
         };
         if let Some(buf) = sample.buffer() {
             let is_keyframe = !buf.flags().contains(gstreamer::BufferFlags::DELTA_UNIT);
@@ -1458,34 +1468,36 @@ fn encode_black_keyframe(vid_type: VideoType, width: u32, height: u32) -> AnyRes
                 if let Ok(map) = buf.map_readable() {
                     let bytes = map.as_slice().to_vec();
                     if contains_keyframe_nals(&bytes, vid_type) {
-                        found = Some(bytes);
-                        break;
+                        return Ok(bytes);
                     }
                 }
             }
         }
     }
-    let _ = pipeline.set_state(gstreamer::State::Null);
-    found.ok_or_else(|| anyhow!("keepalive: no valid keyframe produced"))
+    Err(anyhow!("keepalive: no valid keyframe produced"))
 }
 
-/// Validate that an Annex-B access unit carries both a parameter set (SPS) and an
-/// IDR slice for the codec, so a client can decode it standalone.
+/// Validate that an Annex-B access unit carries a full set of parameter sets and an
+/// IDR slice for the codec, so a client can decode it standalone: H264 needs
+/// SPS+PPS+IDR, H265 needs VPS+SPS+PPS+IDR.
 fn contains_keyframe_nals(bytes: &[u8], vid_type: VideoType) -> bool {
-    let (mut has_idr, mut has_sps) = (false, false);
+    let (mut has_idr, mut has_vps, mut has_sps, mut has_pps) = (false, false, false, false);
     let mut i = 0usize;
     while i + 3 < bytes.len() {
         if bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 1 {
             let hdr = bytes[i + 3];
             match vid_type {
                 VideoType::H264 => match hdr & 0x1f {
-                    5 => has_idr = true,  // IDR slice
-                    7 => has_sps = true,  // SPS
+                    5 => has_idr = true, // IDR slice
+                    7 => has_sps = true, // SPS
+                    8 => has_pps = true, // PPS
                     _ => {}
                 },
                 VideoType::H265 => match (hdr >> 1) & 0x3f {
                     19 | 20 => has_idr = true, // IDR_W_RADL / IDR_N_LP
+                    32 => has_vps = true,      // VPS
                     33 => has_sps = true,      // SPS
+                    34 => has_pps = true,      // PPS
                     _ => {}
                 },
             }
@@ -1494,7 +1506,10 @@ fn contains_keyframe_nals(bytes: &[u8], vid_type: VideoType) -> bool {
             i += 1;
         }
     }
-    has_idr && has_sps
+    match vid_type {
+        VideoType::H264 => has_idr && has_sps && has_pps,
+        VideoType::H265 => has_idr && has_vps && has_sps && has_pps,
+    }
 }
 
 /// Build the video + audio appsrc pipelines into `bin` from a (possibly cached)
