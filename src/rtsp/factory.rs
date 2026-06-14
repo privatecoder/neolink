@@ -3,7 +3,8 @@ use std::{collections::HashMap, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory};
-use gstreamer_app::{AppSrc, AppSrcCallbacks, AppStreamType};
+use gstreamer_app::{AppSink, AppSrc, AppSrcCallbacks, AppStreamType};
+use std::sync::Arc;
 use neolink_core::{
     bc_protocol::StreamKind,
     bcmedia::model::{
@@ -298,7 +299,7 @@ pub(super) async fn make_factory(
                         let cache_key = StreamCacheKey { camera_id, stream };
                         let cached = cached_stream_types(&cache_key).await;
 
-                        let (stream_config, mut buffer, permit, mut media_rx, vid_src, aud_src) =
+                        let (stream_config, mut buffer, permit, mut media_rx, vid_src, aud_src, use_keepalive) =
                             if let Some(cached) = cached.filter(|c| c.vid_type.is_some()) {
                                 // ===== Fast path: stream type is cached =====
                                 // Build the pipeline from cached caps and return it to
@@ -335,7 +336,7 @@ pub(super) async fn make_factory(
                                     _ = cancel_child.cancelled() => return Ok(()),
                                     r = connect => r?,
                                 };
-                                (stream_config, Vec::new(), permit, media_rx, vid_src, aud_src)
+                                (stream_config, Vec::new(), permit, media_rx, vid_src, aud_src, true)
                             } else {
                                 // ===== Slow path: stream type not cached =====
                                 // We must reach the camera to learn the codec before the
@@ -440,7 +441,7 @@ pub(super) async fn make_factory(
                                     &config.splash_pattern.to_string(),
                                 )?;
                                 let _ = reply.send(SetupOutcome::Pipeline(element));
-                                (stream_config, buffer, permit, media_rx, vid_src, aud_src)
+                                (stream_config, buffer, permit, media_rx, vid_src, aud_src, false)
                             };
 
                         // ---- Clean fix: keep tokio receiver async; forward into bounded std channel ----
@@ -596,6 +597,27 @@ pub(super) async fn make_factory(
                             let disconnect_grace = Duration::from_secs(2);
                             let mut play_logged = false;
 
+                            // Keepalive (cached fast path only): push a low-rate black
+                            // placeholder keyframe until the camera sends its first real
+                            // keyframe, so a client that connected before the camera
+                            // produced frames doesn't time out. Encoded once at the cached
+                            // resolution, so there's no resolution change at the handoff.
+                            let keepalive = if use_keepalive {
+                                match stream_config.vid_type {
+                                    Some(vt) => keepalive_keyframe(vt, stream_config.resolution),
+                                    None => None,
+                                }
+                            } else {
+                                None
+                            };
+                            // If keepalive is disabled (slow path, no video, or encode
+                            // failed), treat the stream as already live so real frames flow
+                            // immediately with no gating.
+                            let mut seen_real_keyframe = keepalive.is_none();
+                            let mut next_keepalive = Instant::now();
+                            let keepalive_step = Duration::from_secs(1);
+                            let mut keepalive_pacer: Option<PacerState> = None;
+
                             // Send buffered frames (no pacing)
                             for buffered in buffer.drain(..) {
                                 match send_to_sources(
@@ -627,6 +649,42 @@ pub(super) async fn make_factory(
                                 if cancel_send.is_cancelled() {
                                     log::info!("{stream_label}: Generation cancelled, stopping camera relay");
                                     break;
+                                }
+
+                                // Keepalive: until the first real camera keyframe, push the
+                                // placeholder at a low rate so the client keeps receiving RTP
+                                // and doesn't time out while the camera is still connecting.
+                                if !seen_real_keyframe {
+                                    if let (Some(bytes), Some(app)) =
+                                        (keepalive.as_ref(), vid_src.as_ref())
+                                    {
+                                        let now = Instant::now();
+                                        if now >= next_keepalive {
+                                            // Advance the shared video clock so the eventual
+                                            // real frame continues monotonically from here.
+                                            stats.vid_pts_us = stats
+                                                .vid_pts_us
+                                                .saturating_add(keepalive_step.as_micros() as u64);
+                                            vid_ts = stats.vid_pts_us;
+                                            match send_to_appsrc(
+                                                app,
+                                                &stream_label,
+                                                bytes.as_ref().clone(),
+                                                Duration::from_micros(vid_ts),
+                                                Some(keepalive_step),
+                                                &mut pools,
+                                                false,
+                                                &mut keepalive_pacer,
+                                            )? {
+                                                PushOutcome::Gone => {
+                                                    log::info!("{stream_label}: Client disconnected during keepalive, stopping camera relay");
+                                                    break;
+                                                }
+                                                PushOutcome::Pushed | PushOutcome::NotLinked => {}
+                                            }
+                                            next_keepalive = now + keepalive_step;
+                                        }
+                                    }
                                 }
                                 let vid_closed =
                                     vid_src.as_ref().map(|src| is_closed(src)).unwrap_or(true);
@@ -778,6 +836,23 @@ pub(super) async fn make_factory(
 
                                 stats.tryrecv_ok += 1;
                                 stats.last_media_instant = Instant::now();
+
+                                // Keepalive handoff: until the first real camera keyframe, drop
+                                // real frames (P-frames / audio) and keep serving the placeholder.
+                                // On the first keyframe, step one frame past the last placeholder
+                                // PTS so the real frame's timestamp is strictly greater, then let
+                                // the normal path timestamp it (vid_cam_last is still None, so
+                                // video_ts_from_camera returns this accumulated value).
+                                if !seen_real_keyframe {
+                                    if is_video(&timed.media) && is_video_keyframe(&timed.media) {
+                                        stats.vid_pts_us =
+                                            stats.vid_pts_us.saturating_add(frame_step_us);
+                                        seen_real_keyframe = true;
+                                        log::info!("{stream_label}: first camera keyframe received; switching from keepalive to live");
+                                    } else {
+                                        continue;
+                                    }
+                                }
 
                                 // ---- Backpressure + lag handling ----
                                 let vid_fill = vid_src
@@ -1300,6 +1375,126 @@ fn clear_bin(bin: &Element) -> Result<()> {
     }
 
     Ok(())
+}
+
+static KEEPALIVE_CACHE: Lazy<std::sync::Mutex<HashMap<(u8, u32, u32), Arc<Vec<u8>>>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// A black keyframe (Annex-B byte-stream access unit) in the given codec at the
+/// given resolution, used as low-rate keepalive RTP so a client that connected
+/// before the camera produced frames doesn't time out. Encoded once per
+/// (codec, resolution) via gstreamer and cached for the process; this is a single
+/// encode, not a running encoder. Returns `None` (keepalive disabled) if the
+/// resolution is unknown or encoding/validation fails.
+fn keepalive_keyframe(vid_type: VideoType, resolution: [u32; 2]) -> Option<Arc<Vec<u8>>> {
+    let (w, h) = (resolution[0], resolution[1]);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let codec_id = match vid_type {
+        VideoType::H264 => 0u8,
+        VideoType::H265 => 1u8,
+    };
+    let key = (codec_id, w, h);
+    if let Ok(cache) = KEEPALIVE_CACHE.lock() {
+        if let Some(bytes) = cache.get(&key) {
+            return Some(bytes.clone());
+        }
+    }
+    match encode_black_keyframe(vid_type, w, h) {
+        Ok(bytes) => {
+            let arc = Arc::new(bytes);
+            if let Ok(mut cache) = KEEPALIVE_CACHE.lock() {
+                cache.insert(key, arc.clone());
+            }
+            log::info!("keepalive: encoded {vid_type:?} {w}x{h} placeholder keyframe");
+            Some(arc)
+        }
+        Err(e) => {
+            log::warn!(
+                "keepalive: could not build a {vid_type:?} {w}x{h} placeholder keyframe ({e:?}); serving without keepalive"
+            );
+            None
+        }
+    }
+}
+
+/// One-shot encode of a black keyframe with gstreamer (openh264enc / x265enc),
+/// returning the first validated keyframe access unit as Annex-B byte-stream bytes.
+fn encode_black_keyframe(vid_type: VideoType, width: u32, height: u32) -> AnyResult<Vec<u8>> {
+    let (enc, parse, kind) = match vid_type {
+        VideoType::H264 => ("openh264enc", "h264parse", "h264"),
+        VideoType::H265 => ("x265enc", "h265parse", "h265"),
+    };
+    // I420 input + several frames so the encoder reliably emits an IDR with
+    // parameter sets (a single non-I420 frame can fail to initialise).
+    let desc = format!(
+        "videotestsrc num-buffers=5 pattern=black ! \
+         video/x-raw,format=I420,width={width},height={height},framerate=5/1 ! \
+         {enc} ! {parse} config-interval=-1 ! \
+         video/x-{kind},stream-format=byte-stream,alignment=au ! \
+         appsink name=sink"
+    );
+    let pipeline = gstreamer::parse::launch(&desc)
+        .context("keepalive: parse encode pipeline")?
+        .downcast::<gstreamer::Pipeline>()
+        .map_err(|_| anyhow!("keepalive: encode pipeline is not a Pipeline"))?;
+    let sink = pipeline
+        .by_name("sink")
+        .context("keepalive: appsink missing")?
+        .downcast::<AppSink>()
+        .map_err(|_| anyhow!("keepalive: sink is not an AppSink"))?;
+    pipeline.set_state(gstreamer::State::Playing)?;
+
+    let mut found: Option<Vec<u8>> = None;
+    for _ in 0..8 {
+        let sample = match sink.pull_sample() {
+            Ok(s) => s,
+            Err(_) => break, // EOS / error
+        };
+        if let Some(buf) = sample.buffer() {
+            let is_keyframe = !buf.flags().contains(gstreamer::BufferFlags::DELTA_UNIT);
+            if is_keyframe {
+                if let Ok(map) = buf.map_readable() {
+                    let bytes = map.as_slice().to_vec();
+                    if contains_keyframe_nals(&bytes, vid_type) {
+                        found = Some(bytes);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let _ = pipeline.set_state(gstreamer::State::Null);
+    found.ok_or_else(|| anyhow!("keepalive: no valid keyframe produced"))
+}
+
+/// Validate that an Annex-B access unit carries both a parameter set (SPS) and an
+/// IDR slice for the codec, so a client can decode it standalone.
+fn contains_keyframe_nals(bytes: &[u8], vid_type: VideoType) -> bool {
+    let (mut has_idr, mut has_sps) = (false, false);
+    let mut i = 0usize;
+    while i + 3 < bytes.len() {
+        if bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 1 {
+            let hdr = bytes[i + 3];
+            match vid_type {
+                VideoType::H264 => match hdr & 0x1f {
+                    5 => has_idr = true,  // IDR slice
+                    7 => has_sps = true,  // SPS
+                    _ => {}
+                },
+                VideoType::H265 => match (hdr >> 1) & 0x3f {
+                    19 | 20 => has_idr = true, // IDR_W_RADL / IDR_N_LP
+                    33 => has_sps = true,      // SPS
+                    _ => {}
+                },
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    has_idr && has_sps
 }
 
 /// Build the video + audio appsrc pipelines into `bin` from a (possibly cached)
