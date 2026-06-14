@@ -615,8 +615,13 @@ pub(super) async fn make_factory(
                             // immediately with no gating.
                             let mut seen_real_keyframe = keepalive.is_none();
                             let mut next_keepalive = Instant::now();
-                            let keepalive_step = Duration::from_secs(1);
+                            // ~10 fps during the outage; some clients treat a 1 fps stream as
+                            // stalled. The frame is a tiny black IDR, so the bitrate is trivial.
+                            let keepalive_step = Duration::from_millis(100);
                             let mut keepalive_pacer: Option<PacerState> = None;
+                            let mut keepalive_pushed = 0u64;
+                            let mut keepalive_notlinked = 0u64;
+                            let mut last_keepalive_report = Instant::now();
 
                             // Send buffered frames (no pacing)
                             for buffered in buffer.drain(..) {
@@ -677,12 +682,22 @@ pub(super) async fn make_factory(
                                                 &mut keepalive_pacer,
                                             )? {
                                                 PushOutcome::Gone => {
-                                                    log::info!("{stream_label}: Client disconnected during keepalive, stopping camera relay");
+                                                    log::info!("{stream_label}: Client disconnected during keepalive ({keepalive_pushed} pushed, {keepalive_notlinked} not-linked), stopping camera relay");
                                                     break;
                                                 }
-                                                PushOutcome::Pushed | PushOutcome::NotLinked => {}
+                                                PushOutcome::Pushed => keepalive_pushed += 1,
+                                                PushOutcome::NotLinked => keepalive_notlinked += 1,
                                             }
                                             next_keepalive = now + keepalive_step;
+                                            if now.duration_since(last_keepalive_report)
+                                                >= Duration::from_secs(2)
+                                            {
+                                                log::info!(
+                                                    "{stream_label}: keepalive active: pushed={keepalive_pushed} not_linked={keepalive_notlinked} pts={:?}",
+                                                    Duration::from_micros(vid_ts)
+                                                );
+                                                last_keepalive_report = now;
+                                            }
                                         }
                                     }
                                 }
