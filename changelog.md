@@ -135,24 +135,47 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
   camera disconnect/reconnect cycles, with **exponential backoff** on reconnection
   to give the network time to recover and reduce load.
 
-- **No more 100% CPU / wedged runtime after a camera drop (the big one).** When a
-  camera dropped, the process could peg one or more CPU cores and go silent right
-  after `Connection Lost … Attempt reconnect` — the camera never reconnected and
-  RTSP clients connected but were never served. gdb captures pinned it to the
-  **MQTT** client (`rumqttc`): its `EventLoop::poll()` runs a single `select!` and
-  *returns on every call*, so our `loop { poll().await }` spins whenever `poll()`
-  keeps returning instantly against a broken/half-open or message-flooding broker
-  connection — draining `state.events`, a hot read, or a keepalive deadline left
-  in the past. With only a couple of worker threads, one or two such spins starve
-  the whole runtime, so the camera-reconnect task never runs. The fix is a
-  **`PollRateLimiter` that caps each MQTT poll loop to ~1000 iterations/s**
-  (healthy is a handful/s), which structurally bounds the CPU regardless of which
-  internal rumqttc path causes the fast return; it logs a warning when it engages.
-  A non-zero `pending_throttle` is also set (it paced the *pending*-replay path,
-  the first thing found, but didn't cover the others). Two further non-yielding
-  loops were fixed along the way: the connection's message-router (`bcconn`)
-  re-polling a closed command channel, and the motion listener re-polling a
-  dropped subscription.
+- **No more 100% CPU / wedged runtime after a camera drop.** When a camera dropped,
+  the process could peg one or more CPU cores and go silent right after
+  `Connection Lost … Attempt reconnect` — the camera never reconnected and RTSP
+  clients connected but were never served. The trigger was the per-camera MQTT
+  handler being restarted in a tight loop with no backoff on a connection drop:
+  each restart re-ran the full handler setup (retained publishes, last-will
+  connections, resubscribes), which flooded the broker and drove `rumqttc`'s
+  `EventLoop::poll()` — a single `select!` that returns on every call — into a
+  busy-spin in our `loop { poll().await }`. With only a couple of worker threads,
+  the spin starved the runtime so the reconnect task never ran. Fixes:
+  - the per-camera handler now waits a **cancellation-aware 5 s backoff** before
+    restarting, so a drop can no longer drive the restart/flood loop;
+  - a spinning event loop is **detected and the connection dropped so it
+    reconnects**, and a `PollRateLimiter` caps each poll loop to ~1000 iterations/s
+    as a structural failsafe (logged, rate-limited) regardless of which internal
+    rumqttc path returns fast; `pending_throttle` is also set non-zero to pace the
+    pending-replay path.
+
+  Two further non-yielding loops were fixed along the way: the connection's
+  message-router (`bcconn`) re-polling a closed command channel, and the motion
+  listener re-polling a dropped subscription.
+
+- **RTSP client setup is bounded, self-cleaning, and serves known streams
+  instantly.** The factory callback that builds a client's pipeline runs on a
+  GStreamer thread that blocks until the pipeline is ready, so a slow or offline
+  camera could hold that thread. Setup is now bounded by a timeout and is
+  cancellation-aware, a stream generation owns and tears down its per-client tasks
+  and RTSP mounts on reconfiguration (no leaked handlers or stale mounts), detached
+  per-client tasks log their errors instead of dropping them, and appsrc pushes use
+  typed outcomes (the pre-PLAY "not linked" state is tolerated rather than treated
+  as a disconnect). Once a stream's codec has been seen it is cached, so a later
+  client gets its pipeline built and served **immediately** — without waiting on
+  the camera — while the camera connection is made in the background; a stream that
+  drops resumes into the same session without the client reconnecting.
+
+- **Hardened media/control parsing against malformed input.** The control-codec
+  resync is now bounded (it gives up after a sane byte budget instead of scanning
+  indefinitely), AAC duration parsing validates frame length before counting
+  frames, and a short/truncated ADPCM frame can no longer underflow its block-size
+  computation. Initial UDP packet gaps at stream start are recovered instead of
+  dropping the connection.
 
 - **Pipeline torn down on client disconnect.** When an RTSP client disconnects, its
   GStreamer pipeline is now killed, preventing writes to a closed socket.
@@ -224,9 +247,12 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
     **delegate 0.12 → 0.13**, **env_logger → 0.11**, plus a full `cargo update`.
 - **Earlier dependency maintenance** — bumped GStreamer and refreshed packages
   ahead of the larger dependency sweep.
+- **Rust edition 2021** — both crates moved to edition 2021 (no behavioural change).
 - **Docker / build** — improved the Dockerfile for development builds and added
-  build caching; fixed the crate edition setting and cleared build warnings. Images
-  are published to GitHub Container Registry (`ghcr.io/privatecoder/neolink`).
+  build caching; fixed the crate edition setting and cleared build warnings. Dropped
+  `apt-get upgrade` from the build and runtime stages so images build reproducibly
+  against the pinned base. Images are published to GitHub Container Registry
+  (`ghcr.io/privatecoder/neolink`).
 
 ---
 
@@ -241,3 +267,7 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
   diagnostics.
 - **[docs/reolink.md](docs/reolink.md)** — reverse-engineering notes on Reolink's
   SongP2P / relay behaviour and the RDT/p2p_udt flow control.
+- **[docs/home-assistant.md](docs/home-assistant.md)** — using Neolink with Home
+  Assistant: the go2rtc / WebRTC / MSE / HLS viewing path, the H264/H265 + AAC
+  codec-vs-transport matrix, why an H265 stream can be slow to open, and the
+  camera-side I-frame-interval (GOP) and CBR/VBR trade-offs.
