@@ -127,32 +127,19 @@ impl NeoMediaFactoryImpl {
         log::debug!("set_callback: Callback stored successfully");
     }
     fn build_pipeline(&self, media: Element) -> AnyResult<Option<Element>> {
-        log::debug!("build_pipeline: Acquiring callback lock");
-        let callback_guard = self.call_back.blocking_lock();
-        let has_callback = callback_guard.is_some();
-        log::debug!(
-            "build_pipeline: Lock acquired, callback present: {}",
-            has_callback
-        );
-
-        match callback_guard.as_ref() {
-            Some(call) => {
-                log::debug!("build_pipeline: Invoking callback");
-                let new_media = call(media);
-                match new_media {
-                    Ok(new_media) => {
-                        log::debug!(
-                            "build_pipeline: Callback succeeded, returned element: {}",
-                            new_media.is_some()
-                        );
-                        Ok(new_media)
-                    }
-                    Err(e) => {
-                        log::error!("build_pipeline: Callback failed with error: {e:?}");
-                        Ok(None)
-                    }
+        // Clone the callback Arc out and release the lock before invoking it. The
+        // callback blocks (up to the setup timeout on the uncached path) waiting for
+        // the pipeline reply; holding the mutex across it would serialize concurrent
+        // clients of the same factory.
+        let call = self.call_back.blocking_lock().clone();
+        match call {
+            Some(call) => match call(media) {
+                Ok(new_media) => Ok(new_media),
+                Err(e) => {
+                    log::error!("build_pipeline: Callback failed with error: {e:?}");
+                    Ok(None)
                 }
-            }
+            },
             None => {
                 log::error!("build_pipeline: NO CALLBACK SET - this should not happen!");
                 Ok(None)

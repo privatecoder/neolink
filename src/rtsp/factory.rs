@@ -221,10 +221,22 @@ pub(super) async fn make_dummy_factory(
     .await
 }
 
+/// What the per-client setup task hands back to the gst factory callback. Using an
+/// explicit outcome (rather than dropping the reply on failure) lets the callback
+/// tell an expected camera-unavailable result apart from the setup task dying — the
+/// former is logged quietly, only the latter is a real error.
+enum SetupOutcome {
+    /// The pipeline is built and ready to serve.
+    Pipeline(Element),
+    /// The camera could not be set up (offline / timeout / generation cancelled).
+    /// Expected; the client's SETUP fails cleanly and it can retry.
+    Unavailable,
+}
+
 enum ClientMsg {
     NewClient {
         element: Element,
-        reply: tokio::sync::oneshot::Sender<Element>,
+        reply: tokio::sync::oneshot::Sender<SetupOutcome>,
     },
 }
 
@@ -308,7 +320,7 @@ pub(super) async fn make_factory(
                                     &stream_config,
                                     &config.splash_pattern.to_string(),
                                 )?;
-                                let _ = reply.send(element);
+                                let _ = reply.send(SetupOutcome::Pipeline(element));
 
                                 // permit() + stream_while_live() return promptly even while
                                 // the camera is mid-outage; media_rx stays empty until the
@@ -329,7 +341,7 @@ pub(super) async fn make_factory(
                                 // We must reach the camera to learn the codec before the
                                 // pipeline can be built, so the gst callback stays blocked on
                                 // the reply. Bound it and make it cancellation-aware; on
-                                // timeout/cancel we drop the reply (rare: only a first-ever
+                                // timeout/cancel we report Unavailable (rare: only a first-ever
                                 // connect to a camera that is currently offline).
                                 let connect = async {
                                     let permit = camera.permit().await?;
@@ -342,14 +354,20 @@ pub(super) async fn make_factory(
                                 };
                                 let (permit, mut media_rx, mut stream_config) = tokio::select! {
                                     _ = cancel_child.cancelled() => {
-                                        log::warn!("{name}::{stream}: client setup cancelled before the camera connected; dropping client");
+                                        log::debug!("{name}::{stream}: client setup cancelled before the camera connected");
+                                        let _ = reply.send(SetupOutcome::Unavailable);
                                         return Ok(());
                                     }
                                     r = tokio::time::timeout(Duration::from_secs(20), connect) => match r {
                                         Ok(Ok(v)) => v,
-                                        Ok(Err(e)) => return Err(e),
+                                        Ok(Err(e)) => {
+                                            log::warn!("{name}::{stream}: camera setup failed: {e:?}");
+                                            let _ = reply.send(SetupOutcome::Unavailable);
+                                            return Ok(());
+                                        }
                                         Err(_) => {
-                                            log::warn!("{name}::{stream}: camera setup did not complete within 20s (camera likely unavailable); dropping client");
+                                            log::warn!("{name}::{stream}: camera setup did not complete within 20s (camera likely unavailable)");
+                                            let _ = reply.send(SetupOutcome::Unavailable);
                                             return Ok(());
                                         }
                                     }
@@ -363,7 +381,8 @@ pub(super) async fn make_factory(
                                 loop {
                                     tokio::select! {
                                         _ = cancel_child.cancelled() => {
-                                            log::warn!("{name}::{stream}: client setup cancelled while learning stream type; dropping client");
+                                            log::debug!("{name}::{stream}: client setup cancelled while learning stream type");
+                                            let _ = reply.send(SetupOutcome::Unavailable);
                                             return Ok(());
                                         }
                                         _ = &mut deadline => {
@@ -420,7 +439,7 @@ pub(super) async fn make_factory(
                                     &stream_config,
                                     &config.splash_pattern.to_string(),
                                 )?;
-                                let _ = reply.send(element);
+                                let _ = reply.send(SetupOutcome::Pipeline(element));
                                 (stream_config, buffer, permit, media_rx, vid_src, aud_src)
                             };
 
@@ -870,16 +889,20 @@ pub(super) async fn make_factory(
 
         log::debug!("Waiting for pipeline element response...");
         match new_element.blocking_recv() {
-            Ok(element) => {
+            Ok(SetupOutcome::Pipeline(element)) => {
                 log::debug!("Factory callback received pipeline element successfully");
                 Ok(Some(element))
             }
+            Ok(SetupOutcome::Unavailable) => {
+                // Expected when the camera is offline; the client's SETUP fails and
+                // it retries. Not an error.
+                log::debug!("Factory callback: camera unavailable, no pipeline served");
+                Ok(None)
+            }
             Err(e) => {
-                log::error!("Failed to receive pipeline element: {:?}", e);
-                Err(anyhow::anyhow!(
-                    "Failed to receive pipeline element: {:?}",
-                    e
-                ))
+                // The setup task ended without replying — a genuine internal fault.
+                log::error!("Factory callback: setup task ended without replying: {e:?}");
+                Err(anyhow::anyhow!("setup task ended without replying: {e:?}"))
             }
         }
     })
