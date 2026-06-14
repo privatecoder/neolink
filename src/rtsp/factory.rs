@@ -58,6 +58,12 @@ pub enum AudioType {
 struct StreamTypeCache {
     vid_type: Option<VideoType>,
     aud_type: Option<AudioType>,
+    // Sizing learned alongside the codec types, so the fast path can build a
+    // correctly-sized pipeline from cache without re-querying the camera.
+    resolution: [u32; 2],
+    bitrate: u32,
+    fps: u32,
+    fps_table: Vec<u32>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -91,6 +97,21 @@ struct StreamConfig {
     buffer_duration_ms: u64,
 }
 impl StreamConfig {
+    /// Build a config from cached stream types + sizing, without contacting the
+    /// camera. Used by the fast path so a previously-seen stream can be served
+    /// immediately even while the camera is offline.
+    fn from_cache(cache: &StreamTypeCache, buffer_duration_ms: u64) -> Self {
+        StreamConfig {
+            resolution: cache.resolution,
+            bitrate: cache.bitrate,
+            fps: cache.fps,
+            fps_table: cache.fps_table.clone(),
+            vid_type: cache.vid_type.clone(),
+            aud_type: cache.aud_type.clone(),
+            buffer_duration_ms,
+        }
+    }
+
     async fn new(
         instance: &NeoInstance,
         name: StreamKind,
@@ -255,194 +276,153 @@ pub(super) async fn make_factory(
                             "{name}::{stream}: Factory received new client, setting up pipeline"
                         );
 
-                        // Bound the camera-connect awaits with a timeout and make
-                        // them cancellation-aware. The gst RTSP callback blocks on
-                        // blocking_recv waiting for `reply`; without this a stalled
-                        // connect (sleeping/offline camera, a relay that never
-                        // answers, or stream_while_live waiting on the camera watch)
-                        // would pin a gst worker thread indefinitely. On timeout or
-                        // generation-cancel we return early, dropping `reply`, so the
-                        // callback gets a bounded error instead of hanging.
-                        log::debug!(
-                            "{name}::{stream}: Acquiring permit to trigger camera connection"
-                        );
-                        let connect = async {
-                            // IMPORTANT: permit must be moved into the blocking sender
-                            // thread later to keep the camera connection alive.
-                            let permit = camera.permit().await?;
-                            log::debug!("{name}::{stream}: Permit acquired successfully");
-                            let config = camera.config().await?.borrow().clone();
-                            let media_rx = camera.stream_while_live(stream).await?;
-                            log::info!("{name}::{stream}: Camera relay established");
-                            let stream_config =
-                                StreamConfig::new(&camera, stream, config.buffer_duration).await?;
-                            AnyResult::Ok((permit, config, media_rx, stream_config))
-                        };
-                        let (permit, config, mut media_rx, mut stream_config) = tokio::select! {
-                            _ = cancel_child.cancelled() => {
-                                log::warn!("{name}::{stream}: client setup cancelled before the camera connected; dropping client");
-                                return Ok(());
-                            }
-                            r = tokio::time::timeout(Duration::from_secs(20), connect) => match r {
-                                Ok(Ok(v)) => v,
-                                Ok(Err(e)) => return Err(e),
-                                Err(_) => {
-                                    log::warn!("{name}::{stream}: camera connect did not complete within 20s; dropping client");
-                                    return Ok(());
-                                }
-                            }
-                        };
-
-                        log::info!("{name}::{stream}: Learning camera stream type");
-                        // Learn the camera data type
-                        let mut buffer = vec![];
-                        let mut frame_count = 0usize;
-
+                        // Camera config is local (it does not require the camera to be
+                        // online), so fetch it up front for the cache key and splash.
+                        let config = camera.config().await?.borrow().clone();
                         let camera_id = config
                             .camera_uid
                             .clone()
                             .unwrap_or_else(|| config.name.clone());
                         let cache_key = StreamCacheKey { camera_id, stream };
+                        let cached = cached_stream_types(&cache_key).await;
 
-                        if let Some(cached) = cached_stream_types(&cache_key).await {
-                            if cached.vid_type.is_some() || cached.aud_type.is_some() {
+                        let (stream_config, mut buffer, permit, mut media_rx, vid_src, aud_src) =
+                            if let Some(cached) = cached.filter(|c| c.vid_type.is_some()) {
+                                // ===== Fast path: stream type is cached =====
+                                // Build the pipeline from cached caps and return it to
+                                // gstreamer immediately, so the RTSP callback unblocks and
+                                // the client can reach PLAY without the camera being online.
+                                // Then connect in the background and feed the appsrc. The
+                                // stream layer (run_passive_task) keeps media_rx open across
+                                // camera drops, so once an offline camera (re)connects the
+                                // frames flow into the existing session with no client
+                                // reconnect.
                                 log::info!(
-                                    "{name}::{stream}: Using cached stream types: video={:?}, audio={:?}",
-                                    cached.vid_type,
-                                    cached.aud_type
+                                    "{name}::{stream}: Using cached stream types (serving immediately): video={:?}, audio={:?}",
+                                    cached.vid_type, cached.aud_type
                                 );
-                            }
-                            stream_config.vid_type = cached.vid_type;
-                            stream_config.aud_type = cached.aud_type;
-                        }
-                        let cached_both =
-                            stream_config.vid_type.is_some() && stream_config.aud_type.is_some();
-                        let cached_any =
-                            stream_config.vid_type.is_some() || stream_config.aud_type.is_some();
-                        let buffer_target = if cached_both {
-                            1
-                        } else if cached_any {
-                            4
-                        } else {
-                            15
-                        };
-                        // Always bound the learn phase. With no cached stream type a
-                        // silent/offline camera would otherwise never send media, and the
-                        // gst RTSP callback (which blocks waiting for the pipeline reply)
-                        // would hold its worker thread forever. 15s is generous for a cold
-                        // start; on timeout we fall through to the fallback pipeline.
-                        let learn_timeout = if cached_both {
-                            Some(Duration::from_secs(2))
-                        } else if cached_any {
-                            Some(Duration::from_secs(4))
-                        } else {
-                            Some(Duration::from_secs(15))
-                        };
+                                let stream_config =
+                                    StreamConfig::from_cache(&cached, config.buffer_duration);
+                                let (vid_src, aud_src) = build_sources(
+                                    &element,
+                                    &stream_config,
+                                    &config.splash_pattern.to_string(),
+                                )?;
+                                let _ = reply.send(element);
 
-                        log::info!("{name}::{stream}: Waiting for media frames from camera");
-                        if let Some(timeout) = learn_timeout {
-                            let deadline = tokio::time::sleep(timeout);
-                            tokio::pin!(deadline);
-                            loop {
-                                tokio::select! {
+                                // permit() + stream_while_live() return promptly even while
+                                // the camera is mid-outage; media_rx stays empty until the
+                                // camera is reachable.
+                                let connect = async {
+                                    let permit = camera.permit().await?;
+                                    let media_rx = camera.stream_while_live(stream).await?;
+                                    log::info!("{name}::{stream}: Camera relay established");
+                                    AnyResult::Ok((permit, media_rx))
+                                };
+                                let (permit, media_rx) = tokio::select! {
+                                    _ = cancel_child.cancelled() => return Ok(()),
+                                    r = connect => r?,
+                                };
+                                (stream_config, Vec::new(), permit, media_rx, vid_src, aud_src)
+                            } else {
+                                // ===== Slow path: stream type not cached =====
+                                // We must reach the camera to learn the codec before the
+                                // pipeline can be built, so the gst callback stays blocked on
+                                // the reply. Bound it and make it cancellation-aware; on
+                                // timeout/cancel we drop the reply (rare: only a first-ever
+                                // connect to a camera that is currently offline).
+                                let connect = async {
+                                    let permit = camera.permit().await?;
+                                    let media_rx = camera.stream_while_live(stream).await?;
+                                    log::info!("{name}::{stream}: Camera relay established");
+                                    let stream_config =
+                                        StreamConfig::new(&camera, stream, config.buffer_duration)
+                                            .await?;
+                                    AnyResult::Ok((permit, media_rx, stream_config))
+                                };
+                                let (permit, mut media_rx, mut stream_config) = tokio::select! {
                                     _ = cancel_child.cancelled() => {
-                                        log::warn!("{name}::{stream}: client setup cancelled while learning stream type; dropping client");
+                                        log::warn!("{name}::{stream}: client setup cancelled before the camera connected; dropping client");
                                         return Ok(());
                                     }
-                                    _ = &mut deadline => {
-                                        log::info!("{name}::{stream}: Stream type timeout, proceeding with cached types");
-                                        break;
+                                    r = tokio::time::timeout(Duration::from_secs(20), connect) => match r {
+                                        Ok(Ok(v)) => v,
+                                        Ok(Err(e)) => return Err(e),
+                                        Err(_) => {
+                                            log::warn!("{name}::{stream}: camera setup did not complete within 20s (camera likely unavailable); dropping client");
+                                            return Ok(());
+                                        }
                                     }
-                                    media = media_rx.recv() => {
-                                        let Some(media) = media else { break; };
-                                        log::debug!("{name}::{stream}: Received media frame #{}", frame_count);
-                                        stream_config.update_from_media(&media);
-                                        buffer.push(media);
-                                        frame_count += 1;
-                                        if frame_count >= buffer_target
-                                            || (frame_count >= 10
-                                                && stream_config.vid_type.is_some()
-                                                && stream_config.aud_type.is_some())
-                                        {
-                                            log::info!("{name}::{stream}: Stream type learned: video={:?}, audio={:?}",
-                                                stream_config.vid_type, stream_config.aud_type);
+                                };
+
+                                log::info!("{name}::{stream}: Learning camera stream type");
+                                let mut buffer = vec![];
+                                let mut frame_count = 0usize;
+                                let deadline = tokio::time::sleep(Duration::from_secs(15));
+                                tokio::pin!(deadline);
+                                loop {
+                                    tokio::select! {
+                                        _ = cancel_child.cancelled() => {
+                                            log::warn!("{name}::{stream}: client setup cancelled while learning stream type; dropping client");
+                                            return Ok(());
+                                        }
+                                        _ = &mut deadline => {
+                                            log::info!("{name}::{stream}: Stream type timeout, building fallback pipeline");
                                             break;
+                                        }
+                                        media = media_rx.recv() => {
+                                            let Some(media) = media else { break; };
+                                            stream_config.update_from_media(&media);
+                                            buffer.push(media);
+                                            frame_count += 1;
+                                            if frame_count >= 15
+                                                || (frame_count >= 10
+                                                    && stream_config.vid_type.is_some()
+                                                    && stream_config.aud_type.is_some())
+                                            {
+                                                log::info!("{name}::{stream}: Stream type learned: video={:?}, audio={:?}",
+                                                    stream_config.vid_type, stream_config.aud_type);
+                                                break;
+                                            }
                                         }
                                     }
                                 }
-                            }
-                        }
 
-                        if stream_config.vid_type.is_none() && stream_config.aud_type.is_none() {
-                            log::warn!("{name}::{stream}: No media received from camera, building fallback pipeline");
-                        } else {
-                            store_stream_types(
-                                cache_key.clone(),
-                                StreamTypeCache {
-                                    vid_type: stream_config.vid_type.clone(),
-                                    aud_type: stream_config.aud_type.clone(),
-                                },
-                            )
-                            .await;
-                        }
+                                if stream_config.vid_type.is_none()
+                                    && stream_config.aud_type.is_none()
+                                {
+                                    log::warn!("{name}::{stream}: No media received from camera, building fallback pipeline");
+                                } else {
+                                    store_stream_types(
+                                        cache_key.clone(),
+                                        StreamTypeCache {
+                                            vid_type: stream_config.vid_type.clone(),
+                                            aud_type: stream_config.aud_type.clone(),
+                                            resolution: stream_config.resolution,
+                                            bitrate: stream_config.bitrate,
+                                            fps: stream_config.fps,
+                                            fps_table: stream_config.fps_table.clone(),
+                                        },
+                                    )
+                                    .await;
+                                }
 
-                        let sizing_bytes = buffer_size_bytes(&stream_config);
-                        log::info!(
-                            "{name}::{stream}: Stream sizing: bitrate={}bps fps={} buffer_ms={} -> buffer_bytes={}",
-                            stream_config.bitrate,
-                            stream_config.fps,
-                            stream_config.buffer_duration_ms,
-                            sizing_bytes
-                        );
-                        log::trace!("{name}::{stream}: Building the pipeline");
-                        // Build the right video pipeline
-                        let vid_src = match stream_config.vid_type.as_ref() {
-                            Some(VideoType::H264) => {
-                                let src = build_h264(&element, &stream_config)?;
-                                AnyResult::Ok(Some(src))
-                            }
-                            Some(VideoType::H265) => {
-                                let src = build_h265(&element, &stream_config)?;
-                                AnyResult::Ok(Some(src))
-                            }
-                            None => {
-                                build_unknown(&element, &config.splash_pattern.to_string())?;
-                                AnyResult::Ok(None)
-                            }
-                        }?;
-
-                        // Build the right audio pipeline
-                        let aud_src = match stream_config.aud_type.as_ref() {
-                            Some(AudioType::Aac) => {
-                                let src = build_aac(&element, &stream_config)?;
-                                AnyResult::Ok(Some(src))
-                            }
-                            Some(AudioType::Adpcm(block_size)) => {
-                                let src = build_adpcm(&element, *block_size, &stream_config)?;
-                                AnyResult::Ok(Some(src))
-                            }
-                            None => AnyResult::Ok(None),
-                        }?;
-
-                        if let Some(app) = vid_src.as_ref() {
-                            app.set_callbacks(
-                                AppSrcCallbacks::builder()
-                                    .seek_data(move |_, _seek_pos| true)
-                                    .build(),
-                            );
-                        }
-                        if let Some(app) = aud_src.as_ref() {
-                            app.set_callbacks(
-                                AppSrcCallbacks::builder()
-                                    .seek_data(move |_, _seek_pos| true)
-                                    .build(),
-                            );
-                        }
-
-                        log::trace!("{name}::{stream}: Sending pipeline to gstreamer");
-                        // Send the pipeline back to the fac
-                        // tory so it can start
-                        let _ = reply.send(element);
+                                let sizing_bytes = buffer_size_bytes(&stream_config);
+                                log::info!(
+                                    "{name}::{stream}: Stream sizing: bitrate={}bps fps={} buffer_ms={} -> buffer_bytes={}",
+                                    stream_config.bitrate,
+                                    stream_config.fps,
+                                    stream_config.buffer_duration_ms,
+                                    sizing_bytes
+                                );
+                                let (vid_src, aud_src) = build_sources(
+                                    &element,
+                                    &stream_config,
+                                    &config.splash_pattern.to_string(),
+                                )?;
+                                let _ = reply.send(element);
+                                (stream_config, buffer, permit, media_rx, vid_src, aud_src)
+                            };
 
                         // ---- Clean fix: keep tokio receiver async; forward into bounded std channel ----
                         let queue_capacity = media_queue_capacity(&stream_config);
@@ -1297,6 +1277,44 @@ fn clear_bin(bin: &Element) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Build the video + audio appsrc pipelines into `bin` from a (possibly cached)
+/// StreamConfig, returning the appsrc handles to feed. A `None` video type builds
+/// the splash / "unknown" pipeline instead and yields no video appsrc.
+fn build_sources(
+    bin: &Element,
+    stream_config: &StreamConfig,
+    splash_pattern: &str,
+) -> AnyResult<(Option<AppSrc>, Option<AppSrc>)> {
+    let vid_src = match stream_config.vid_type.as_ref() {
+        Some(VideoType::H264) => Some(build_h264(bin, stream_config)?),
+        Some(VideoType::H265) => Some(build_h265(bin, stream_config)?),
+        None => {
+            build_unknown(bin, splash_pattern)?;
+            None
+        }
+    };
+    let aud_src = match stream_config.aud_type.as_ref() {
+        Some(AudioType::Aac) => Some(build_aac(bin, stream_config)?),
+        Some(AudioType::Adpcm(block_size)) => Some(build_adpcm(bin, *block_size, stream_config)?),
+        None => None,
+    };
+    if let Some(app) = vid_src.as_ref() {
+        app.set_callbacks(
+            AppSrcCallbacks::builder()
+                .seek_data(move |_, _seek_pos| true)
+                .build(),
+        );
+    }
+    if let Some(app) = aud_src.as_ref() {
+        app.set_callbacks(
+            AppSrcCallbacks::builder()
+                .seek_data(move |_, _seek_pos| true)
+                .build(),
+        );
+    }
+    Ok((vid_src, aud_src))
 }
 
 fn build_unknown(bin: &Element, pattern: &str) -> Result<()> {
