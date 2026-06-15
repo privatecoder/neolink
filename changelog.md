@@ -82,9 +82,9 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 - **High-bitrate streams no longer under-deliver / "constantly buffer".**
   High-bitrate streams (e.g. a 4 Mbit/s 4K main stream) would start, stutter, and
   stall because the camera's adaptive bitrate downshifted. Root cause: the UDP ACK
-  `maybe_latency` field is **not latency** — it is the **receiver's measured
-  throughput in bytes/second**, which the camera's CUBIC rate-controller uses as its
-  bandwidth estimate.
+  field originally reverse-engineered upstream as `maybe_latency` is **not latency** —
+  it is the **receiver's measured throughput in bytes/second**, which the camera's
+  CUBIC rate-controller uses as its bandwidth estimate.
   - A miscomputed ACK-inter-arrival value originally pinned the bitrate to a
     ~340 kbps floor; an interim fix reported a constant `0`, which cleared that
     floor but left some models/remote paths capped at ~2 Mbit/s of a 4 Mbit/s feed.
@@ -95,6 +95,9 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
     against a packet capture of the official client (ratio ≈ 1.0). See
     [docs/connection-and-bandwidth.md](docs/connection-and-bandwidth.md) and
     [docs/reolink.md](docs/reolink.md).
+  - **Renamed:** now that its purpose is known, the `UdpAck` field is called
+    `recv_bytes_per_sec` in the code (it was the upstream guess `maybe_latency`). This
+    is a source-only rename — the on-the-wire packet and behaviour are unchanged.
 
 - **Audio/video drift eliminated.** Audio ran progressively ahead of video
   (~0.4 s on the main stream) because every frame was timestamped by its *arrival*

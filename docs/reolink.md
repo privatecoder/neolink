@@ -7,7 +7,8 @@ established empirically (disassembly + packet capture).
 
 Cross-references:
 
-- Connection paths, regions, bandwidth, the `maybe_latency` field, the `UdpAck` wire
+- Connection paths, regions, bandwidth, the receiver-rate ACK field
+  (`recv_bytes_per_sec`, reverse-engineered as `maybe_latency`), the `UdpAck` wire
   format, and diagnostics → [connection-and-bandwidth.md](connection-and-bandwidth.md)
 - The UDP discovery message catalog and negotiation sequences →
   [discovery-handshake.md](discovery-handshake.md)
@@ -37,7 +38,8 @@ The camera is the reliable-transport **sender** running **CUBIC**. Its send rate
 governed by receiver feedback in the p2p_udt ACK (the same packet as Neolink's
 `UdpAck`, magic `0x2a87cf20`).
 
-- **`maybe_latency` (offset `0x14`) is the bandwidth lever** — it is the receiver's
+- **The receiver-rate field at offset `0x14` is the bandwidth lever** — reverse-engineered
+  as `maybe_latency` (and named `recv_bytes_per_sec` in the code), it is the receiver's
   measured throughput in **bytes per second**, not latency. The receiver reports its
   actual received bytes over a ~1-second window; this lets CUBIC ramp a high-bitrate
   stream to full rate. (Field-level detail and the camera-response table:
@@ -55,8 +57,9 @@ governed by receiver feedback in the p2p_udt ACK (the same packet as Neolink's
 
 - Size reassembly limits for the main stream's ~240 KB I-frame bursts (~200 packets);
   see [media-streams.md](media-streams.md).
-- Report measured received bytes per second in the ACK `maybe_latency` field
-  (latched ~1 Hz) so the camera ramps to full bitrate — it is the receiver's job to
+- Report measured received bytes per second in the ACK receiver-rate field
+  (`recv_bytes_per_sec`, reverse-engineered as `maybe_latency`, latched ~1 Hz) so the
+  camera ramps to full bitrate — it is the receiver's job to
   feed the sender a truthful delivery-rate estimate.
 - Do not assume the relay path is in use; direct P2P may carry the stream even when a
   relay is available.

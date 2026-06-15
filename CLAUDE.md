@@ -143,10 +143,12 @@ overview). Read the relevant page before touching that area:
 These bit hard during the P2P-bitrate investigation; keep them in mind when
 touching `crates/core/src/bc_protocol/connection/udpsource.rs`:
 
-- **`maybe_latency` is the camera's bitrate lever — report your measured
-  received-bytes/second there, not `0`.** Despite the name it is NOT latency: it is
+- **`recv_bytes_per_sec` (the `UdpAck` field reverse-engineered upstream as
+  `maybe_latency`) is the camera's bitrate lever — report your measured
+  received-bytes/second there, not `0`.** Despite the old name it is NOT latency: it is
   the receiver's measured throughput (bytes/s) that the camera's CUBIC uses as its
-  bandwidth estimate. History: a miscomputed ACK-inter-arrival value originally
+  bandwidth estimate. (It was renamed from `maybe_latency` once its purpose was known;
+  source-only, wire format unchanged.) History: a miscomputed ACK-inter-arrival value originally
   pinned the bitrate to ~340 kbps; reporting a constant `0` cleared that floor but
   left the camera on a conservative default that capped some models / remote paths
   at ~2 Mbit/s of a 4 Mbit/s feed; **Neolink now reports the real

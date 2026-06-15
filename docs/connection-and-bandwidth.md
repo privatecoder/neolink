@@ -105,11 +105,13 @@ The camera is the reliable-UDP **sender** and runs **CUBIC** congestion control.
 Its send rate is governed by receiver feedback carried in every UDP ACK
 (`UdpAck`, magic `0x2a87cf20`).
 
-### `maybe_latency` (receiver-rate feedback)
+### Receiver-rate feedback — `recv_bytes_per_sec` (reverse-engineered upstream as `maybe_latency`)
 
-Despite its name, the `maybe_latency` field is **not latency**. It is the
-**receiver's measured throughput in bytes per second**, which the camera's CUBIC
-controller consumes as its bandwidth estimate.
+This ACK field is **not latency**, despite the `maybe_latency` name it carried upstream
+before its purpose was known. It is the **receiver's measured throughput in bytes per
+second**, which the camera's CUBIC controller consumes as its bandwidth estimate.
+Neolink's code now names it `recv_bytes_per_sec`; the historical name is kept here only
+to explain how it was figured out (and to cross-reference upstream / packet captures).
 
 - Neolink reports its **actual received bytes over the trailing ~1 second**, latched
   once per second (surfaced as `ack_recv_rate` in the heartbeat).
@@ -121,7 +123,7 @@ controller consumes as its bandwidth estimate.
 
 Camera response to the reported value:
 
-| reported `maybe_latency` | camera behaviour |
+| reported `recv_bytes_per_sec` | camera behaviour |
 |---|---|
 | `0` | no estimate → conservative default (full rate on some models, ~2 Mbit/s on others) |
 | a small/fixed value | treats the path as that slow → paces down to it (~340 kbps for a steady ACK-interval-derived value) |
@@ -137,7 +139,7 @@ gap-skip); it is not signalled through this field.
 ```
 magic 0x2a87cf20 | connection_id i32 | unknown_a u32 (0) |
 group_id u32 (hi 30 bits of seq) | packet_id u32 (lo 30 bits of seq) |
-maybe_latency u32 (receiver bytes/sec) | payload_size u32 | payload (selective-ACK bitmap)
+recv_bytes_per_sec u32 (receiver bytes/sec) | payload_size u32 | payload (selective-ACK bitmap)
 ```
 
 - **Cumulative ACK sequence:** `group_id` and `packet_id` form one 64-bit sequence,
@@ -179,7 +181,7 @@ UDP HB: in_pkts=485 in_kbps=4817 delivered=485 resends=0 packets_want=10846 \
 | `reorder_events` | Packets that arrived ahead of the contiguous point this second. `0` = perfectly in-order. |
 | `max_reorder_depth` | Largest gap (in packets) between an out-of-order arrival and `packets_want`. |
 | `max_pending` | Peak depth of the reassembly buffer this second. `1` = each packet delivered immediately. |
-| `ack_recv_rate` | Bytes received in the trailing ~1 s; the value sent to the camera in `maybe_latency`. |
+| `ack_recv_rate` | Bytes received in the trailing ~1 s; the value sent to the camera in `recv_bytes_per_sec`. |
 | `ack_latency_us` | Legacy computed latency value, logged only — not sent to the camera. |
 
 Reading the heartbeat:

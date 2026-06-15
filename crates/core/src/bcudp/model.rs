@@ -68,11 +68,12 @@ pub struct UdpAck {
     pub group_id: u32,
     /// The ID of the last data packet [`UdpData`]
     pub packet_id: u32,
-    /// 4 Bytes Unknown: Observed values `00000000`, `d6010000`, `d7160000`, `09e00000`,
-    ///                                         `0`,    `54785`,    `55062`,     `2528`,
-    ///                  Unknown but seems to change randomly every second
-    /// Might be a latency for the recieved acknoledge packets
-    pub maybe_latency: u32,
+    /// Receiver's measured throughput in **bytes per second**, fed back to the camera
+    /// in every ACK (wire offset `0x14`). The camera's CUBIC rate-controller uses it as
+    /// its bandwidth estimate, so reporting the real received rate lets high-bitrate
+    /// streams ramp to full rate. Originally reverse-engineered as `maybe_latency`
+    /// before its purpose was known — it is **not** latency.
+    pub recv_bytes_per_sec: u32,
     // 2 Bytes size of a payload
     //
     /// Payload of `00 01 01 01 01` where `01` is added after every repeat
@@ -89,7 +90,7 @@ impl UdpAck {
             connection_id,
             group_id: 0xffffffff,
             packet_id: 0xffffffff,
-            maybe_latency: 0x0,
+            recv_bytes_per_sec: 0x0,
             payload: vec![],
         }
     }

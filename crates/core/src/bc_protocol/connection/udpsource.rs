@@ -296,9 +296,10 @@ struct UdpPayloadInner {
     stat_reorder_events: u64,
     stat_max_reorder_depth: u32,
     stat_max_pending: u32,
-    // Receiver delivery-rate fed back to the camera in the ACK `maybe_latency`
-    // field: bytes received in the trailing ~1s, latched once per second. The
-    // camera's CUBIC sender uses it as its bandwidth estimate (see build_send_ack).
+    // Receiver delivery-rate fed back to the camera in the ACK `recv_bytes_per_sec`
+    // field (the field reverse-engineered upstream as `maybe_latency`): bytes received
+    // in the trailing ~1s, latched once per second. The camera's CUBIC sender uses it
+    // as its bandwidth estimate (see build_send_ack).
     ack_recv_rate: u32,
     /// Offical Client does ack every 10ms if we don't also do this the camera
     /// seems to think we have a poor connection and will abort
@@ -635,7 +636,7 @@ impl UdpPayloadInner {
             let win = self.stat_last_report.elapsed();
             let kbps = (self.stat_bytes_in as f64 * 8.0 / 1000.0) / win.as_secs_f64().max(0.001);
             // Latch the trailing ~1s received-byte count as the delivery-rate we report
-            // to the camera in every ACK's `maybe_latency` field (bytes/second).
+            // to the camera in every ACK's `recv_bytes_per_sec` field (bytes/second).
             self.ack_recv_rate = self.stat_bytes_in.min(u32::MAX as u64) as u32;
             log::debug!(
                 "UDP HB: in_pkts={} in_kbps={:.0} delivered={} resends={} packets_want={} sent_unacked={} recieved_pending={} reorder_events={} max_reorder_depth={} max_pending={} ack_recv_rate={} ack_latency_us={} since_delivery={:?} win={:?}",
@@ -715,7 +716,7 @@ impl UdpPayloadInner {
                 // An earlier attempt sent bytes-per-100ms here (10x too small), which the
                 // camera read as a slow path and throttled — the unit must be bytes/SECOND.
                 // We report our own measured received-bytes/s (`ack_recv_rate`).
-                maybe_latency: self.ack_recv_rate,
+                recv_bytes_per_sec: self.ack_recv_rate,
                 payload: missing_ids,
             }
         } else {

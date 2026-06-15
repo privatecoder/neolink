@@ -104,7 +104,8 @@ fn udp_ack(buf: &[u8]) -> IResult<&[u8], UdpAck> {
     .parse(buf)?;
     let (buf, packet_id) = error_context("Missing packet_id", le_u32).parse(buf)?; // This is the point at which the camera has contigious
                                                                                    // packets to
-    let (buf, maybe_latency) = error_context("ACK: Missing Maybe Latency", le_u32).parse(buf)?;
+    let (buf, recv_bytes_per_sec) =
+        error_context("ACK: Missing receiver rate", le_u32).parse(buf)?;
     let (buf, payload_size) = error_context("ACK: Missing payload_size", le_u32).parse(buf)?;
     let (buf, payload) = if payload_size > 0 {
         let (buf, t_payload) = take(payload_size)(buf)?; // It is a binary payload of
@@ -121,7 +122,7 @@ fn udp_ack(buf: &[u8]) -> IResult<&[u8], UdpAck> {
         connection_id,
         packet_id,
         group_id,
-        maybe_latency,
+        recv_bytes_per_sec,
         payload,
     };
     Ok((buf, data))
