@@ -65,6 +65,11 @@ struct StreamTypeCache {
     bitrate: u32,
     fps: u32,
     fps_table: Vec<u32>,
+    // AAC params (0 if unknown / not audio), so the fast path can encode keepalive
+    // silence at the camera's exact sample rate — the audio RTP clock-rate is fixed
+    // in the SDP, so a mismatch would break the handoff to real audio.
+    aud_rate: u32,
+    aud_channels: u32,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -86,6 +91,10 @@ async fn store_stream_types(key: StreamCacheKey, types: StreamTypeCache) {
     cache.insert(key, types);
 }
 
+/// Monotonic per-client-connection counter so overlapping client retries can be told
+/// apart in the logs (the per-client label becomes e.g. `cam#7::subStream`).
+static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Clone, Debug)]
 struct StreamConfig {
     #[allow(dead_code)]
@@ -96,6 +105,10 @@ struct StreamConfig {
     vid_type: Option<VideoType>,
     aud_type: Option<AudioType>,
     buffer_duration_ms: u64,
+    // AAC sample rate / channels learned from the stream (0 if unknown), used to
+    // encode matching keepalive silence.
+    aud_rate: u32,
+    aud_channels: u32,
 }
 impl StreamConfig {
     /// Build a config from cached stream types + sizing, without contacting the
@@ -110,6 +123,8 @@ impl StreamConfig {
             vid_type: cache.vid_type.clone(),
             aud_type: cache.aud_type.clone(),
             buffer_duration_ms,
+            aud_rate: cache.aud_rate,
+            aud_channels: cache.aud_channels,
         }
     }
 
@@ -176,6 +191,8 @@ impl StreamConfig {
             vid_type: None,
             aud_type: None,
             buffer_duration_ms,
+            aud_rate: 0,
+            aud_channels: 0,
         })
     }
 
@@ -188,8 +205,16 @@ impl StreamConfig {
         match media {
             BcMedia::InfoV1(BcMediaInfoV1 { fps, .. })
             | BcMedia::InfoV2(BcMediaInfoV2 { fps, .. }) => self.update_fps(*fps as u32),
-            BcMedia::Aac(_) => {
+            BcMedia::Aac(aac) => {
                 self.aud_type = Some(AudioType::Aac);
+                // Capture the AAC sample rate / channels so the fast path can encode
+                // keepalive silence that matches (the audio RTP clock-rate is fixed).
+                if let Some(info) = aac.duration_info() {
+                    if info.sample_rate > 0 {
+                        self.aud_rate = info.sample_rate;
+                        self.aud_channels = (info.channel_config as u32).max(1);
+                    }
+                }
             }
             BcMedia::Adpcm(adpcm) => {
                 if let Some(block_size) = adpcm.block_size() {
@@ -280,7 +305,13 @@ pub(super) async fn make_factory(
                 ClientMsg::NewClient { element, reply } => {
                     log::debug!("NewClient message received for {name}::{stream}");
                     let camera = camera.clone();
-                    let name = name.clone();
+                    // Tag the per-client log label with a session id so overlapping
+                    // client retries are distinguishable (this `name` is log-only here).
+                    let name = format!(
+                        "{}#{}",
+                        name,
+                        SESSION_COUNTER.fetch_add(1, Ordering::Relaxed)
+                    );
                     let cancel_child = child_cancel.clone();
                     let task_label = format!("{name}::{stream} client");
                     spawn_logged(task_label, async move {
@@ -422,6 +453,8 @@ pub(super) async fn make_factory(
                                             bitrate: stream_config.bitrate,
                                             fps: stream_config.fps,
                                             fps_table: stream_config.fps_table.clone(),
+                                            aud_rate: stream_config.aud_rate,
+                                            aud_channels: stream_config.aud_channels,
                                         },
                                     )
                                     .await;
@@ -610,6 +643,19 @@ pub(super) async fn make_factory(
                             } else {
                                 None
                             };
+                            // Matching silent AAC, so the negotiated audio track also
+                            // produces RTP during keepalive (encoded at the cached rate).
+                            let keepalive_audio = if use_keepalive {
+                                match stream_config.aud_type {
+                                    Some(AudioType::Aac) => keepalive_audio_frame(
+                                        stream_config.aud_rate,
+                                        stream_config.aud_channels,
+                                    ),
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
                             // If keepalive is disabled (slow path, no video, or encode
                             // failed), treat the stream as already live so real frames flow
                             // immediately with no gating.
@@ -619,6 +665,7 @@ pub(super) async fn make_factory(
                             // stalled. The frame is a tiny black IDR, so the bitrate is trivial.
                             let keepalive_step = Duration::from_millis(100);
                             let mut keepalive_pushed = 0u64;
+                            let mut keepalive_audio_pushed = 0u64;
                             let mut keepalive_notlinked = 0u64;
                             let mut last_keepalive_report = Instant::now();
 
@@ -670,26 +717,44 @@ pub(super) async fn make_factory(
                                             // from here.
                                             stats.vid_pts_us = start.elapsed().as_micros() as u64;
                                             vid_ts = stats.vid_pts_us;
-                                            match push_keepalive_frame(
-                                                app,
-                                                bytes,
-                                                Duration::from_micros(vid_ts),
-                                                keepalive_step,
-                                            ) {
-                                                PushOutcome::Gone => {
-                                                    log::info!("{stream_label}: Client disconnected during keepalive ({keepalive_pushed} pushed, {keepalive_notlinked} not-linked), stopping camera relay");
-                                                    break;
-                                                }
+                                            let pts = Duration::from_micros(vid_ts);
+                                            let mut gone = false;
+                                            match push_keepalive_frame(app, bytes, pts, keepalive_step) {
+                                                PushOutcome::Gone => gone = true,
                                                 PushOutcome::Pushed => keepalive_pushed += 1,
                                                 PushOutcome::NotLinked => keepalive_notlinked += 1,
+                                            }
+                                            // Keep the negotiated AAC track producing RTP too —
+                                            // go2rtc drops a session whose declared audio track is
+                                            // silent, even while video flows.
+                                            if !gone {
+                                                if let (Some(abytes), Some(aapp)) =
+                                                    (keepalive_audio.as_ref(), aud_src.as_ref())
+                                                {
+                                                    match push_keepalive_frame(
+                                                        aapp,
+                                                        abytes,
+                                                        pts,
+                                                        keepalive_step,
+                                                    ) {
+                                                        PushOutcome::Gone => gone = true,
+                                                        PushOutcome::Pushed => {
+                                                            keepalive_audio_pushed += 1
+                                                        }
+                                                        PushOutcome::NotLinked => {}
+                                                    }
+                                                }
+                                            }
+                                            if gone {
+                                                log::info!("{stream_label}: Client disconnected during keepalive ({keepalive_pushed} vid / {keepalive_audio_pushed} aud pushed, {keepalive_notlinked} not-linked), stopping camera relay");
+                                                break;
                                             }
                                             next_keepalive = now + keepalive_step;
                                             if now.duration_since(last_keepalive_report)
                                                 >= Duration::from_secs(2)
                                             {
                                                 log::info!(
-                                                    "{stream_label}: keepalive active: pushed={keepalive_pushed} not_linked={keepalive_notlinked} pts={:?}",
-                                                    Duration::from_micros(vid_ts)
+                                                    "{stream_label}: keepalive active: vid_pushed={keepalive_pushed} aud_pushed={keepalive_audio_pushed} not_linked={keepalive_notlinked} pts={pts:?}"
                                                 );
                                                 last_keepalive_report = now;
                                             }
@@ -1558,6 +1623,84 @@ fn contains_keyframe_nals(bytes: &[u8], vid_type: VideoType) -> bool {
         VideoType::H264 => has_idr && has_sps && has_pps,
         VideoType::H265 => has_idr && has_vps && has_sps && has_pps,
     }
+}
+
+static KEEPALIVE_AUDIO_CACHE: Lazy<std::sync::Mutex<HashMap<(u32, u32), Arc<Vec<u8>>>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// A silent AAC (ADTS) frame at the given rate/channels, pushed during keepalive so
+/// the negotiated audio track keeps producing RTP (go2rtc drops a session whose
+/// declared audio track never sends any). Encoded once per (rate, channels) and
+/// cached. Returns None if rate/channels are unknown or encoding/validation fails.
+fn keepalive_audio_frame(rate: u32, channels: u32) -> Option<Arc<Vec<u8>>> {
+    if rate == 0 || channels == 0 {
+        return None;
+    }
+    let key = (rate, channels);
+    if let Ok(cache) = KEEPALIVE_AUDIO_CACHE.lock() {
+        if let Some(bytes) = cache.get(&key) {
+            return Some(bytes.clone());
+        }
+    }
+    match encode_silent_aac(rate, channels) {
+        Ok(bytes) => {
+            let arc = Arc::new(bytes);
+            if let Ok(mut cache) = KEEPALIVE_AUDIO_CACHE.lock() {
+                cache.insert(key, arc.clone());
+            }
+            log::info!("keepalive: encoded silent AAC {rate}Hz {channels}ch placeholder frame");
+            Some(arc)
+        }
+        Err(e) => {
+            log::warn!(
+                "keepalive: could not build a silent AAC {rate}Hz {channels}ch frame ({e:?}); audio keepalive disabled"
+            );
+            None
+        }
+    }
+}
+
+/// One-shot encode of a single silent AAC ADTS frame via gstreamer (avenc_aac).
+fn encode_silent_aac(rate: u32, channels: u32) -> AnyResult<Vec<u8>> {
+    let desc = format!(
+        "audiotestsrc wave=silence num-buffers=10 ! \
+         audio/x-raw,rate={rate},channels={channels} ! audioconvert ! \
+         avenc_aac ! aacparse ! audio/mpeg,mpegversion=4,stream-format=adts ! \
+         appsink name=sink"
+    );
+    let pipeline = gstreamer::parse::launch(&desc)
+        .context("keepalive: parse audio encode pipeline")?
+        .downcast::<gstreamer::Pipeline>()
+        .map_err(|_| anyhow!("keepalive: audio encode pipeline is not a Pipeline"))?;
+    struct NullGuard(gstreamer::Pipeline);
+    impl Drop for NullGuard {
+        fn drop(&mut self) {
+            let _ = self.0.set_state(gstreamer::State::Null);
+        }
+    }
+    let _guard = NullGuard(pipeline.clone());
+    let sink = pipeline
+        .by_name("sink")
+        .context("keepalive: audio appsink missing")?
+        .downcast::<AppSink>()
+        .map_err(|_| anyhow!("keepalive: audio sink is not an AppSink"))?;
+    pipeline.set_state(gstreamer::State::Playing)?;
+    for _ in 0..12 {
+        let sample = match sink.try_pull_sample(Some(ClockTime::from_seconds(2))) {
+            Some(s) => s,
+            None => break,
+        };
+        if let Some(buf) = sample.buffer() {
+            if let Ok(map) = buf.map_readable() {
+                let bytes = map.as_slice().to_vec();
+                // A valid ADTS frame starts with the 12-bit sync word 0xFFF.
+                if bytes.len() >= 7 && bytes[0] == 0xFF && (bytes[1] & 0xF0) == 0xF0 {
+                    return Ok(bytes);
+                }
+            }
+        }
+    }
+    Err(anyhow!("keepalive: no valid silent AAC frame produced"))
 }
 
 /// Build the video + audio appsrc pipelines into `bin` from a (possibly cached)
