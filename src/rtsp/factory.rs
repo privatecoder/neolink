@@ -618,7 +618,6 @@ pub(super) async fn make_factory(
                             // ~10 fps during the outage; some clients treat a 1 fps stream as
                             // stalled. The frame is a tiny black IDR, so the bitrate is trivial.
                             let keepalive_step = Duration::from_millis(100);
-                            let mut keepalive_pacer: Option<PacerState> = None;
                             let mut keepalive_pushed = 0u64;
                             let mut keepalive_notlinked = 0u64;
                             let mut last_keepalive_report = Instant::now();
@@ -671,16 +670,12 @@ pub(super) async fn make_factory(
                                             // from here.
                                             stats.vid_pts_us = start.elapsed().as_micros() as u64;
                                             vid_ts = stats.vid_pts_us;
-                                            match send_to_appsrc(
+                                            match push_keepalive_frame(
                                                 app,
-                                                &stream_label,
-                                                bytes.as_ref().clone(),
+                                                bytes,
                                                 Duration::from_micros(vid_ts),
-                                                Some(keepalive_step),
-                                                &mut pools,
-                                                false,
-                                                &mut keepalive_pacer,
-                                            )? {
+                                                keepalive_step,
+                                            ) {
                                                 PushOutcome::Gone => {
                                                     log::info!("{stream_label}: Client disconnected during keepalive ({keepalive_pushed} pushed, {keepalive_notlinked} not-linked), stopping camera relay");
                                                     break;
@@ -1224,6 +1219,34 @@ fn bucket_size_for(n: usize) -> Option<usize> {
         b = MIN_BUCKET;
     }
     Some(b)
+}
+
+/// Push one placeholder keepalive buffer using a freshly-allocated GstBuffer, NOT the
+/// shared buffer pool. The pool is finite (max 64) and `acquire_buffer(None)` blocks
+/// when exhausted, so if a stalled client stops consuming, a pooled keepalive push
+/// would block forever in acquire (before push_buffer, so no push-timing warning) and
+/// freeze the keepalive — which is exactly the ~64-push plateau we saw. Placeholder
+/// frames are tiny and infrequent, so a plain allocation per push is cheap and can
+/// never block on the pool.
+fn push_keepalive_frame(
+    appsrc: &AppSrc,
+    data: &[u8],
+    pts: Duration,
+    duration: Duration,
+) -> PushOutcome {
+    let mut buffer = gstreamer::Buffer::from_slice(data.to_vec());
+    if let Some(b) = buffer.get_mut() {
+        let ts = ClockTime::from_nseconds(pts.as_nanos() as u64);
+        b.set_pts(ts);
+        b.set_dts(ts);
+        b.set_duration(ClockTime::from_nseconds(duration.as_nanos() as u64));
+    }
+    match appsrc.push_buffer(buffer) {
+        Ok(_) => PushOutcome::Pushed,
+        Err(gstreamer::FlowError::NotLinked) => PushOutcome::NotLinked,
+        Err(gstreamer::FlowError::Flushing) => PushOutcome::Gone,
+        Err(_) => PushOutcome::Gone,
+    }
 }
 
 fn acquire_pooled_buffer(
