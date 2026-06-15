@@ -665,11 +665,11 @@ pub(super) async fn make_factory(
                                     {
                                         let now = Instant::now();
                                         if now >= next_keepalive {
-                                            // Advance the shared video clock so the eventual
-                                            // real frame continues monotonically from here.
-                                            stats.vid_pts_us = stats
-                                                .vid_pts_us
-                                                .saturating_add(keepalive_step.as_micros() as u64);
+                                            // Tie the placeholder PTS to wall-clock elapsed so the
+                                            // video clock doesn't drift (keeps lag ~0 at the
+                                            // handoff); the first real frame continues monotonically
+                                            // from here.
+                                            stats.vid_pts_us = start.elapsed().as_micros() as u64;
                                             vid_ts = stats.vid_pts_us;
                                             match send_to_appsrc(
                                                 app,
@@ -834,8 +834,18 @@ pub(super) async fn make_factory(
                                     stats.reset_aud_stats();
                                 }
 
-                                // Receive next frame (or timeout to keep loop responsive)
-                                let timed = match std_rx.recv_timeout(Duration::from_millis(200)) {
+                                // Receive next frame (or timeout to keep loop responsive). While
+                                // keepalive is active, only block until the next placeholder push
+                                // is due, so the cadence stays accurate instead of being capped to
+                                // ~5 fps by a fixed 200ms wait.
+                                let recv_wait = if !seen_real_keyframe {
+                                    next_keepalive
+                                        .saturating_duration_since(Instant::now())
+                                        .min(Duration::from_millis(200))
+                                } else {
+                                    Duration::from_millis(200)
+                                };
+                                let timed = match std_rx.recv_timeout(recv_wait) {
                                     Ok(d) => d,
                                     Err(RecvTimeoutError::Timeout) => {
                                         // no frame right now; loop continues (heartbeat/disconnect still works)
