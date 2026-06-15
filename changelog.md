@@ -170,6 +170,17 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
   the camera — while the camera connection is made in the background; a stream that
   drops resumes into the same session without the client reconnecting.
 
+- **Live view survives a camera reboot / connects while the camera is offline.** When
+  a client opens a cached stream while the camera is down (or the camera reboots while
+  a card is open), a low-rate placeholder is generated and streamed — a black video
+  keyframe plus matching silent audio, encoded once at the stream's cached resolution
+  and AAC rate — so the negotiated video *and* audio tracks keep producing RTP and the
+  viewer (e.g. go2rtc/Home Assistant) doesn't time out. When the camera returns, the
+  session hands off to live video on its own, with no reconnect. Without the audio
+  placeholder, players that negotiated an audio track dropped the session after ~20 s
+  even though video was flowing. If the placeholder can't be built, the stream falls
+  back to its previous behaviour.
+
 - **Hardened media/control parsing against malformed input.** The control-codec
   resync is now bounded (it gives up after a sane byte budget instead of scanning
   indefinitely), AAC duration parsing validates frame length before counting

@@ -85,6 +85,24 @@ card cycling modes and go2rtc renegotiating, not Neolink stalling. The same appl
 the stream is on-demand (`connect_mode: on_demand`): every probe re-triggers a relay
 setup/teardown, adding to the churn.
 
+## Opening an offline camera / surviving a reboot
+
+If a stream's codec has already been seen once (it's cached), Neolink serves the
+pipeline **immediately** from cache and connects to the camera in the background — so
+a card opened while the camera is offline, or a camera that reboots while a card is
+open, no longer fails or times out. During the gap Neolink streams a low-rate
+placeholder (a black video frame plus matching silent audio, encoded once at the
+camera's resolution / AAC rate) so the viewer keeps both negotiated tracks alive; when
+the camera comes back the session **hands off to live video on its own, with no
+reconnect**. In the add-on log you'll see `…: keepalive: encoded …` when it starts and
+`…: first camera keyframe received; switching from keepalive to live` on recovery.
+
+One prerequisite: the codec/rate are only cached after a *successful* view, so the
+**first** open of a camera after the add-on (re)starts must happen while the camera is
+online. After that, offline opens and reboots recover automatically. The silent-audio
+part needs an AAC stream; if it can't be built, the stream falls back to the previous
+behaviour (video keepalive only, which some players still drop during a long outage).
+
 ## Recommended configurations
 
 ### Pin the playback mode (biggest win for H265)

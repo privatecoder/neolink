@@ -647,10 +647,23 @@ pub(super) async fn make_factory(
                             // produces RTP during keepalive (encoded at the cached rate).
                             let keepalive_audio = if use_keepalive {
                                 match stream_config.aud_type {
-                                    Some(AudioType::Aac) => keepalive_audio_frame(
-                                        stream_config.aud_rate,
-                                        stream_config.aud_channels,
-                                    ),
+                                    Some(AudioType::Aac) => {
+                                        let frame = keepalive_audio_frame(
+                                            stream_config.aud_rate,
+                                            stream_config.aud_channels,
+                                        );
+                                        if frame.is_none()
+                                            && (stream_config.aud_rate == 0
+                                                || stream_config.aud_channels == 0)
+                                        {
+                                            log::warn!(
+                                                "{stream_label}: audio keepalive unavailable: AAC params not cached (rate={}, channels={}); the client may still drop during a long outage",
+                                                stream_config.aud_rate,
+                                                stream_config.aud_channels
+                                            );
+                                        }
+                                        frame
+                                    }
                                     _ => None,
                                 }
                             } else {
@@ -753,7 +766,7 @@ pub(super) async fn make_factory(
                                             if now.duration_since(last_keepalive_report)
                                                 >= Duration::from_secs(2)
                                             {
-                                                log::info!(
+                                                log::debug!(
                                                     "{stream_label}: keepalive active: vid_pushed={keepalive_pushed} aud_pushed={keepalive_audio_pushed} not_linked={keepalive_notlinked} pts={pts:?}"
                                                 );
                                                 last_keepalive_report = now;
@@ -1328,7 +1341,7 @@ fn acquire_pooled_buffer(
             cfg.set_params(None, bucket as u32, 8, 64);
             pool.set_config(cfg).expect("pool config failed");
             pool.set_active(true).expect("activate pool");
-            log::info!("New BufferPool (Bucket) allocated: size={bucket}");
+            log::debug!("New BufferPool (Bucket) allocated: size={bucket}");
             pool
         });
 
