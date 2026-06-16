@@ -83,7 +83,7 @@ Top-level options (outside any `[[cameras]]` block) configure the RTSP server:
 
 ```toml
 bind = "0.0.0.0"          # interface to bind the RTSP server to (default 0.0.0.0)
-bind_port = 8554          # RTSP port (default 8554)
+bind_port = 8554          # RTSP port (range 0-65535, default 8554)
 offline_timeout_secs = 0  # global default: seconds an RTSP viewer is served the
                           # offline placeholder (no real camera frames) before that
                           # session is torn down. 0 = never (default; held
@@ -114,6 +114,9 @@ permitted_users = ["me"]   # default: all users may view
 With users defined, connect like
 `rtsp://me:mepass@<host>:8554/Camera01` (or `rtsps://…` when TLS is enabled).
 
+`name` (alias `username`) must be non-empty; the reserved names `anyone` and
+`anonymous` are rejected. `pass` (alias `password`) is the user's password.
+
 ### Connection / Discovery Methods
 
 Neolink reaches a camera over the proprietary Baichuan protocol, and there are
@@ -130,6 +133,7 @@ server** (`relay`, which forwards traffic on your behalf).
 
 | Method   | What it does | Media path | Bandwidth |
 |----------|--------------|------------|-----------|
+| `none`   | Forbid all UID discovery | Direct TCP only | Only works with a known `address`; no Reolink lookup. |
 | `local`  | LAN broadcast | **Direct P2P** on the LAN | Full. Same network only. |
 | `remote` | Connect to the camera's `dev` address | **Direct P2P** | Full, if the `dev` address is routable from the host. |
 | `map`    | Hole-punch to the camera's public (`dmap`) address | **Direct P2P** | Full, works through NAT. No relay fallback. |
@@ -238,7 +242,7 @@ Status Messages:
 - `/status/pir` Sent in reply to a `/query/pir` an XML encoded version of the
   pir status
 - `/status/motion` Contains the motion detection alarm status. `on` for motion
-  and `off` for still, only published when `enable_moton` is true in the config
+  and `off` for still, only published when `enable_motion` is true in the config
 - `/status/ptz/preset` Sent in reply to a `/query/ptz/preset` an XML encoded
   version of the PTZ presets
 - `/status/preview` a base64 encoded camera image updated every 2s. Not
@@ -334,13 +338,13 @@ enable_battery = false       # battery updates in `/status/battery_level`
                              #
 enable_preview = false       # preview image in `/status/preview`
                              #
-enable_floodlight = false    # preview image in `/status/floodlight_tasks`
+enable_floodlight = false    # floodlight tasks status in `/status/floodlight_tasks`
                              #
-battery_update = 2000        # Number of ms between `/status/battery_level` updates
+battery_update = 2000        # Number of ms between `/status/battery_level` updates (min 500)
                              #
-preview_update = 2000        # Number of ms between `/status/preview` updates
+preview_update = 2000        # Number of ms between `/status/preview` updates (min 500)
                              #
-floodlight_update = 2000     # Number of ms between `/status/floodlight_tasks` updates
+floodlight_update = 2000     # Number of ms between `/status/floodlight_tasks` updates (min 500)
 ```
 
 #### MQTT Discovery
@@ -359,21 +363,23 @@ must be manually specified.
 
 Available features are:
 
-- `floodlight`: This adds a light control to home assistant
-- `camera`: This adds a camera preview to home assistant. It is only updated
-  every 0.5s and cannot be much more than that since it is updated over mqtt
-  not over RTSP. Not every camera supports the snapshot command needed for
-  this. In such cases there will be no `/status/preview` message.
+- `floodlight` (alias `light`): This adds a light control to home assistant
+- `camera` (aliases `preview`, `Preview`): This adds a camera preview to home
+  assistant. It is updated every 2s by default (configurable via `preview_update`;
+  minimum 0.5s) and cannot be much more frequent than 0.5s since it is updated
+  over mqtt not over RTSP. Not every camera supports the snapshot command needed
+  for this. In such cases there will be no `/status/preview` message.
 - `led`: This adds a switch to chage the LED status light on/off to home
   assistant
 - `ir`: This adds a selection switch to chage the IR light on/off/auto to home
   assistant
-- `motion`: This adds a motion detection binary sensor to home assistant
+- `motion` (aliases `md`, `pir`): This adds a motion detection binary sensor to
+  home assistant
 - `reboot`: This adds a reboot button to home assistant
 - `pt`: This adds a selection of buttons to control the pan and tilt of the
   camera
-- `battery`: This adds a battery level sensor to home assistant
-- `siren`: Adds a siren button to home assistant
+- `battery` (alias `power`): This adds a battery level sensor to home assistant
+- `siren` (alias `alarm`): Adds a siren button to home assistant
 
 ### Extra Camera Settings
 
@@ -414,19 +420,19 @@ All per-camera options (under `[[cameras]]`), with defaults. Sub-tables
 | `username` | *(required)* | Camera login user. |
 | `password` (alias `pass`) | – | Camera login password. |
 | `stream` | `All` | Streams to serve: `Main`, `Sub`, `Both`, `All`, `Extern`, `None`. |
-| `channel_id` (alias `channel`) | `0` | Channel on an NVR; `0` for a standalone camera. |
+| `channel_id` (alias `channel`) | `0` | Channel on an NVR (range 0–31); `0` for a standalone camera. |
 | `permitted_users` | *(all)* | List of `[[users]]` names allowed to view this camera. |
 | `discovery` | `relay` | How to find/connect the camera — see [Connection / Discovery Methods](#connection--discovery-methods). |
 | `relay_server_region` (alias `relay_region`) | – | Reolink lookup region, e.g. `"Europe (France)"`. |
-| `connect_mode` (alias `connect`) | `always` | `always` or `on_demand` — see [Connection Modes](#connection-modes). |
-| `idle_timeout_secs` (alias `idle_timeout`) | `0` | In `always` mode: disconnect after N s idle (`0` = never). Ignored in `on_demand`. |
-| `offline_timeout_secs` (alias `offline_timeout`) | *(inherits global)* | Seconds an RTSP viewer is served the offline placeholder (no real camera frames) before that session is torn down; `0` = never (default; placeholder held indefinitely so it recovers on its own). Unset inherits the top-level global `offline_timeout_secs`; values 1-59 are raised to a 60 s floor. Per-session — the shared camera connection keeps reconnecting for any other viewers. |
-| `relay_warm_seconds` (alias `relay_warm`) | `60` | In `on_demand` mode: keep the connection warm N s after the last client (`0` = disconnect immediately). Ignored in `always`. |
-| `udp_gap_skip_ms` | `120` | Reliable-UDP: how long to wait for a missing packet before skipping it. Raise on lossy links (favours completeness over latency); on a clean link it rarely triggers. |
-| `buffer_duration` (aliases `buffer`, `duration`) | `3000` | Size of Neolink's internal video buffer, expressed as ms of stream. Larger absorbs network jitter/bursts (smoother, more latency); smaller = lower latency, less burst tolerance. |
+| `connect_mode` (aliases `connect`, `connection_mode`) | `always` | `always` (aliases `connected`, `on`) or `on_demand` (aliases `ondemand`, `demand`, `lazy`) — see [Connection Modes](#connection-modes). |
+| `idle_timeout_secs` (aliases `idle_timeout`, `idle_secs`) | `0` | In `always` mode: disconnect after N s idle (range 0–86400; `0` = never). Ignored in `on_demand`. |
+| `offline_timeout_secs` (alias `offline_timeout`) | *(inherits global)* | Seconds an RTSP viewer is served the offline placeholder (no real camera frames) before that session is torn down (range 0–86400); `0` = never (default; placeholder held indefinitely so it recovers on its own). Unset inherits the top-level global `offline_timeout_secs`; values 1-59 are raised to a 60 s floor. Per-session — the shared camera connection keeps reconnecting for any other viewers. |
+| `relay_warm_seconds` (aliases `relay_warm`, `relay_warm_secs`) | `60` | In `on_demand` mode: keep the connection warm N s after the last client (range 0–3600; `0` = disconnect immediately). Ignored in `always`. |
+| `udp_gap_skip_ms` | `500` | Reliable-UDP: how long to wait (ms, range 0–5000) for a missing packet before skipping it. Raise on lossy links (favours completeness over latency); on a clean link it rarely triggers. |
+| `buffer_duration` (aliases `buffer`, `duration`) | `3000` | Size of Neolink's internal video buffer, expressed as ms of stream (range 1–15000). Larger absorbs network jitter/bursts (smoother, more latency); smaller = lower latency, less burst tolerance. |
 | `max_encryption` | `Aes` | `none`, `bcencrypt`, or `aes`. |
 | `strict` | `false` | Error the media stream on unexpected packets instead of tolerating them. |
-| `max_discovery_retries` (alias `retries`) | `10` | Registration attempts per discovery cycle (`0` = infinite). On timeout the whole connect is retried, so it never permanently gives up. Backoff: 1,2,4,8,16,32 s, capped at 60 s. |
+| `max_discovery_retries` (aliases `retries`, `max_retries`) | `10` | Registration attempts per discovery cycle (`0` = infinite). On timeout the whole connect is retried, so it never permanently gives up. Backoff: 1,2,4,8,16,32 s, capped at 60 s. |
 | `update_time` (alias `time`) | `false` | Force-set the camera clock to "now" on connect. |
 | `debug` (alias `verbose`) | `false` | Dump decrypted XML from the camera (noisy; troubleshooting only). |
 | `enabled` (alias `enable`) | `true` | Set `false` to disable a camera without deleting it. |
@@ -452,7 +458,7 @@ uid = "ABCDEF0123456789"
   [cameras.pause]
   on_motion = true    # pause the stream while there is no motion (default false)
   on_disconnect = true # pause while no RTSP client is connected (alias: on_client) (default false)
-  timeout = 2.1       # seconds to wait after motion stops before pausing (alias: motion_timeout) (default 1.0)
+  motion_timeout = 2.1 # seconds to wait after motion stops before pausing (alias: timeout) (default 1.0)
   mode = "still"      # what to show while paused: black | still | test | none (default none)
 ```
 
