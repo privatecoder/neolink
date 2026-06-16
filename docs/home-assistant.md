@@ -97,6 +97,12 @@ the camera comes back the session **hands off to live video on its own, with no
 reconnect**. In the add-on log you'll see `…: keepalive: encoded …` when it starts and
 `…: first camera keyframe received; switching from keepalive to live` on recovery.
 
+The placeholder is held **indefinitely by design** — there is no internal time limit,
+so an always-on wall-dashboard card stays connected through an arbitrarily long outage
+(a multi-minute reboot, a camera powered off overnight) and recovers whenever the
+camera returns. The session only ends when the client itself disconnects (the card is
+closed, or the viewer/go2rtc gives up on its own).
+
 One prerequisite: the codec/rate are only cached after a *successful* view, so the
 **first** open of a camera after the add-on (re)starts must happen while the camera is
 online. After that, offline opens and reboots recover automatically. The silent-audio

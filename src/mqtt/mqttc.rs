@@ -129,7 +129,9 @@ impl Mqtt {
                         backend.run().await
                     }, if mqtt_config.is_some() => {
                         if let Err(e) = &v {
-                            log::error!("MQTT Client Connection Failed: {:?}", e);
+                            // Recoverable: the MQTT connection dropped (broker restart,
+                            // network blip); we reconnect, so this is not an error.
+                            log::warn!("MQTT connection dropped ({e:?}); reconnecting in 2s");
                             sleep(Duration::from_secs(2)).await;
                             continue;
                         }

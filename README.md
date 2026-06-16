@@ -22,6 +22,22 @@ This is a hardened fork of Neolink, with improvements focused on connection
 stability and on-demand connection behavior. It builds on the work of the
 original Neolink authors (credited in `LICENSE` and `Cargo.toml`).
 
+## Documentation
+
+Per-camera configuration options and their defaults are in the
+[Camera Configuration Reference](#camera-configuration-reference) below. Deeper
+technical references live in [`docs/`](docs/) ([index](docs/README.md)):
+
+- [Using Neolink with Home Assistant](docs/home-assistant.md) — go2rtc / WebRTC / MSE
+  / HLS viewing, H264/H265 + AAC, offline-reboot recovery, GOP and CBR/VBR trade-offs.
+- [Connection, discovery & bandwidth](docs/connection-and-bandwidth.md) — discovery
+  methods, regions, the receiver-rate ACK feedback (`recv_bytes_per_sec`), diagnostics.
+- [Connection modes & lifecycle](docs/connection-modes.md), [architecture](docs/architecture.md),
+  [BC protocol](docs/bc-protocol.md), [media streams](docs/media-streams.md),
+  [A/V timestamping](docs/av-timestamping.md), [two-way audio](docs/two-way-audio.md),
+  and [Reolink P2P notes](docs/reolink.md).
+- Curated change history since the fork: [`changelog.md`](changelog.md).
+
 ## Installation
 
 Download from the
