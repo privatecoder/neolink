@@ -43,6 +43,19 @@ pub(crate) struct Config {
     #[serde(default = "default_tls_client_auth")]
     pub(crate) tls_client_auth: String,
 
+    #[validate(range(
+        min = 0,
+        max = 86400,
+        message = "Invalid offline timeout seconds",
+        code = "offline_timeout_secs"
+    ))]
+    /// Global default for how many seconds an RTSP viewer's keepalive placeholder is
+    /// served while the camera is offline before that session is torn down. `0` = never
+    /// (the default: the placeholder is held indefinitely). A per-camera
+    /// `offline_timeout_secs` overrides this. Resolved per camera at load.
+    #[serde(default)]
+    pub(crate) offline_timeout_secs: Option<u32>,
+
     #[validate(nested)]
     #[serde(default)]
     pub(crate) users: Vec<UserConfig>,
@@ -220,6 +233,18 @@ pub(crate) struct CameraConfig {
     /// mode (which uses `relay_warm_seconds`).
     #[serde(default, alias = "idle_timeout", alias = "idle_secs")]
     pub(crate) idle_timeout_secs: u64,
+
+    #[validate(range(
+        min = 0,
+        max = 86400,
+        message = "Invalid offline timeout seconds",
+        code = "offline_timeout_secs"
+    ))]
+    /// Seconds an RTSP viewer's keepalive placeholder is served while this camera is
+    /// offline before that session is torn down. Unset = inherit the global
+    /// `offline_timeout_secs`. `0` = never; values 1-59 are clamped up to the 60s floor.
+    #[serde(default, alias = "offline_timeout")]
+    pub(crate) offline_timeout_secs: Option<u32>,
 
     #[serde(default = "default_maxenc")]
     #[validate(regex(

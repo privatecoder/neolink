@@ -323,6 +323,9 @@ pub(super) async fn make_factory(
                         // Camera config is local (it does not require the camera to be
                         // online), so fetch it up front for the cache key and splash.
                         let config = camera.config().await?.borrow().clone();
+                        // Resolved (per-camera ?? global ?? 0) at config load. 0 = never
+                        // time out the offline keepalive (default).
+                        let offline_timeout_secs = config.offline_timeout_secs.unwrap_or(0);
                         let camera_id = config
                             .camera_uid
                             .clone()
@@ -681,6 +684,11 @@ pub(super) async fn make_factory(
                             let mut keepalive_audio_pushed = 0u64;
                             let mut keepalive_notlinked = 0u64;
                             let mut last_keepalive_report = Instant::now();
+                            // The offline-timeout clock starts at the FIRST placeholder push
+                            // (the moment this session first serves keepalive because no real
+                            // camera frames are available), so only the genuine offline-
+                            // placeholder duration counts — not link-wait / one-shot encode.
+                            let mut keepalive_started_at: Option<Instant> = None;
 
                             // Send buffered frames (no pacing)
                             for buffered in buffer.drain(..) {
@@ -715,6 +723,33 @@ pub(super) async fn make_factory(
                                     break;
                                 }
 
+                                // Optional offline timeout: if this session has been on the
+                                // keepalive placeholder (no real camera frames) for longer than
+                                // offline_timeout_secs, tear down THIS session only. The shared
+                                // camera relay keeps reconnecting for any other clients (the
+                                // sender is per-client). 0 = never (default). The clock is the
+                                // genuine offline-placeholder duration: it runs from the first
+                                // placeholder push (set below) until the first real keyframe, so
+                                // it never counts link-wait/encode, pre-open offline time, or idle.
+                                if !seen_real_keyframe && offline_timeout_secs > 0 {
+                                    if let Some(t0) = keepalive_started_at {
+                                        if t0.elapsed()
+                                            >= Duration::from_secs(offline_timeout_secs as u64)
+                                        {
+                                            log::info!(
+                                                "{stream_label}: offline {offline_timeout_secs}s with no camera frames; tearing down this session (offline_timeout_secs)"
+                                            );
+                                            if let Some(app) = vid_src.as_ref() {
+                                                let _ = app.end_of_stream();
+                                            }
+                                            if let Some(app) = aud_src.as_ref() {
+                                                let _ = app.end_of_stream();
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+
                                 // Keepalive: until the first real camera keyframe, push the
                                 // placeholder at a low rate so the client keeps receiving RTP
                                 // and doesn't time out while the camera is still connecting.
@@ -724,6 +759,10 @@ pub(super) async fn make_factory(
                                     {
                                         let now = Instant::now();
                                         if now >= next_keepalive {
+                                            // Start the offline-timeout clock at the first
+                                            // placeholder push (this is when the session first
+                                            // serves keepalive for lack of real frames).
+                                            keepalive_started_at.get_or_insert(now);
                                             // Tie the placeholder PTS to wall-clock elapsed so the
                                             // video clock doesn't drift (keeps lag ~0 at the
                                             // handoff); the first real frame continues monotonically
