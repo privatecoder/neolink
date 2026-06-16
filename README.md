@@ -84,6 +84,11 @@ Top-level options (outside any `[[cameras]]` block) configure the RTSP server:
 ```toml
 bind = "0.0.0.0"          # interface to bind the RTSP server to (default 0.0.0.0)
 bind_port = 8554          # RTSP port (default 8554)
+offline_timeout_secs = 0  # global default: seconds an RTSP viewer is served the
+                          # offline placeholder (no real camera frames) before that
+                          # session is torn down. 0 = never (default; held
+                          # indefinitely). Per-camera offline_timeout_secs overrides
+                          # this. Values 1-59 are raised to a 60s floor.
 
 # Optional TLS for the RTSP server. With a certificate set, connect with rtsps://.
 # The PEM must contain both the certificate and the private key.
@@ -415,6 +420,7 @@ All per-camera options (under `[[cameras]]`), with defaults. Sub-tables
 | `relay_server_region` (alias `relay_region`) | – | Reolink lookup region, e.g. `"Europe (France)"`. |
 | `connect_mode` (alias `connect`) | `always` | `always` or `on_demand` — see [Connection Modes](#connection-modes). |
 | `idle_timeout_secs` (alias `idle_timeout`) | `0` | In `always` mode: disconnect after N s idle (`0` = never). Ignored in `on_demand`. |
+| `offline_timeout_secs` (alias `offline_timeout`) | *(inherits global)* | Seconds an RTSP viewer is served the offline placeholder (no real camera frames) before that session is torn down; `0` = never (default; placeholder held indefinitely so it recovers on its own). Unset inherits the top-level global `offline_timeout_secs`; values 1-59 are raised to a 60 s floor. Per-session — the shared camera connection keeps reconnecting for any other viewers. |
 | `relay_warm_seconds` (alias `relay_warm`) | `60` | In `on_demand` mode: keep the connection warm N s after the last client (`0` = disconnect immediately). Ignored in `always`. |
 | `udp_gap_skip_ms` | `120` | Reliable-UDP: how long to wait for a missing packet before skipping it. Raise on lossy links (favours completeness over latency); on a clean link it rarely triggers. |
 | `buffer_duration` (aliases `buffer`, `duration`) | `3000` | Size of Neolink's internal video buffer, expressed as ms of stream. Larger absorbs network jitter/bursts (smoother, more latency); smaller = lower latency, less burst tolerance. |

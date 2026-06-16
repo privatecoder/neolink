@@ -184,6 +184,16 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
   even though video was flowing. If the placeholder can't be built, the stream falls
   back to its previous behaviour.
 
+- **Optional offline timeout (`offline_timeout_secs`).** By default the offline
+  placeholder is held indefinitely (`0` = never), which is ideal for always-on
+  dashboards. For operators who would rather a long outage *end* the stream — so the
+  viewer (e.g. Home Assistant) can mark the camera unavailable / trigger an automation
+  — an optional per-camera or global `offline_timeout_secs` tears the session down
+  after N seconds with no real camera frames. It's per-session (the shared camera
+  connection keeps reconnecting for other viewers), the clock counts only genuine
+  offline-placeholder time, and values 1-59 are raised to a 60 s floor (it must exceed
+  your camera's reboot time). Precedence: per-camera, else the global default, else 0.
+
 - **Hardened media/control parsing against malformed input.** The control-codec
   resync is now bounded (it gives up after a sane byte budget instead of scanning
   indefinitely), AAC duration parsing validates frame length before counting
