@@ -59,6 +59,13 @@ pub(crate) struct Config {
     #[validate(nested)]
     #[serde(default)]
     pub(crate) users: Vec<UserConfig>,
+
+    /// Where to persist the learned stream-type cache so a known camera's offline
+    /// placeholder can still be built after a restart. `None` (default) disables
+    /// persistence (in-memory only). Overridable at runtime by the
+    /// `NEOLINK_STREAM_CACHE_PATH` environment variable.
+    #[serde(default)]
+    pub(crate) stream_cache_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Validate, PartialEq, Eq)]
