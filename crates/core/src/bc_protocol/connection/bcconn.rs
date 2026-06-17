@@ -7,7 +7,7 @@ use log::*;
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::mpsc::{channel, error::TrySendError, Sender};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
@@ -46,11 +46,17 @@ impl BcConnection {
         let (sinker, sinker_rx) = channel::<Result<Bc>>(500);
         let cancel = CancellationToken::new();
 
-        let (poll_commander, poll_commanded) = channel(200);
+        // Raised from 200 -> 1000 for parity with the now non-blocking poll loop:
+        // the poller never awaits a slow subscriber, so the only place backpressure
+        // can build is this command queue; a deeper queue tolerates short bursts of
+        // camera traffic without dropping inbound packets at the source stream.
+        let (poll_commander, poll_commanded) = channel(1000);
         let mut poller = Poller {
             subscribers: Default::default(),
             sink: sinker.clone(),
             reciever: ReceiverStream::new(poll_commanded),
+            last_full_warn: None,
+            dropped_full: 0,
         };
 
         let mut rx_thread = JoinSet::<Result<()>>::new();
@@ -220,6 +226,12 @@ struct Poller {
     subscribers: Subscriber,
     sink: Sender<Result<Bc>>,
     reciever: ReceiverStream<PollCommand>,
+    /// Last time we emitted a "subscriber channel full" warning. Delivery to
+    /// subscribers is non-blocking (see `run`), so a stalled consumer makes us
+    /// drop its messages; this rate-limits the resulting log spam.
+    last_full_warn: Option<std::time::Instant>,
+    /// Count of messages dropped (across all subscribers) since the last warning.
+    dropped_full: u64,
 }
 
 impl Poller {
@@ -303,25 +315,60 @@ impl Poller {
                                         None
                                     };
                                     if let Some(sender) = sender {
-                                        if sender.capacity() == 0 {
-                                            warn!("Reaching limit of channel");
-                                            warn!(
-                                                "Remaining: {} of {} message space for {} (ID: {})",
-                                                sender.capacity(),
-                                                sender.max_capacity(),
-                                                &msg_num,
-                                                &msg_id
-                                            );
-                                        } else {
-                                            trace!(
-                                                "Remaining: {} of {} message space for {} (ID: {})",
-                                                sender.capacity(),
-                                                sender.max_capacity(),
-                                                &msg_num,
-                                                &msg_id
-                                            );
+                                        // Non-blocking delivery: the poll loop must NEVER await a
+                                        // single consumer. A slow/stalled subscriber (e.g. an
+                                        // overwhelmed RTSP client's video subscription) would
+                                        // otherwise block this loop and starve camera
+                                        // keepalive/control traffic, causing the camera to drop
+                                        // the session and forcing a reconnect cycle. So we
+                                        // `try_send` and, when the subscriber's channel is full,
+                                        // drop the message for that subscriber (rate-limited warn).
+                                        //
+                                        // Dropping is NOT keyframe-aware here: at this layer the
+                                        // payload is an opaque `Bc` message, so we cannot cheaply
+                                        // tell a keyframe from a P-frame. Keyframe-aware dropping
+                                        // already happens downstream in the RTSP relay
+                                        // (`drop_until_keyframe`); here we only guarantee the poll
+                                        // loop never blocks.
+                                        match sender.try_send(Ok(response)) {
+                                            Ok(()) => {
+                                                trace!(
+                                                    "Remaining: {} of {} message space for {} (ID: {})",
+                                                    sender.capacity(),
+                                                    sender.max_capacity(),
+                                                    &msg_num,
+                                                    &msg_id
+                                                );
+                                            }
+                                            Err(TrySendError::Full(_)) => {
+                                                self.dropped_full += 1;
+                                                let now = std::time::Instant::now();
+                                                let should_warn = self
+                                                    .last_full_warn
+                                                    .map(|t| {
+                                                        now.duration_since(t)
+                                                            >= std::time::Duration::from_secs(5)
+                                                    })
+                                                    .unwrap_or(true);
+                                                if should_warn {
+                                                    warn!(
+                                                        "Subscriber channel full for num {} (ID: {}); dropped {} message(s) to keep the poll loop responsive (camera keepalive/control must not stall)",
+                                                        &msg_num, &msg_id, self.dropped_full
+                                                    );
+                                                    self.last_full_warn = Some(now);
+                                                    self.dropped_full = 0;
+                                                }
+                                            }
+                                            Err(TrySendError::Closed(_)) => {
+                                                // Subscriber went away; it is removed from the map
+                                                // at the top of the next loop iteration.
+                                                trace!(
+                                                    "Subscriber channel closed for num {} (ID: {})",
+                                                    &msg_num,
+                                                    &msg_id
+                                                );
+                                            }
                                         }
-                                        let _ = sender.send(Ok(response)).await;
                                     } else {
                                         trace!(
                                             "Ignoring uninteresting message id {} (number: {})",
@@ -342,9 +389,12 @@ impl Poller {
                             }
                         }
                         Err(e) => {
+                            // Terminal: broadcast the error and tear down. Use try_send so a
+                            // full subscriber channel can't block teardown either; any
+                            // subscriber that misses this will observe the channel close.
                             for sub in self.subscribers.num.values() {
                                 for sender in sub.values() {
-                                    let _ = sender.send(Err(e.clone())).await;
+                                    let _ = sender.try_send(Err(e.clone()));
                                 }
                             }
                             self.subscribers.num.clear();
@@ -392,5 +442,87 @@ impl Poller {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bc::model::{Bc, BcBody, BcMeta, ModernMsg};
+    use tokio::time::{timeout, Duration};
+
+    fn make_bc(msg_id: u32, msg_num: u16) -> Bc {
+        Bc {
+            meta: BcMeta {
+                msg_id,
+                channel_id: 0,
+                stream_type: 0,
+                response_code: 0,
+                msg_num,
+                class: 0x6614,
+            },
+            body: BcBody::ModernMsg(ModernMsg::default()),
+        }
+    }
+
+    /// Regression test for the keepalive-starvation bug (upstream #399): a
+    /// subscriber whose channel is full must NOT block the poll loop. We feed
+    /// many messages to an undrained (capacity-1) subscriber and assert that
+    /// `Poller::run` still drains its command queue and returns promptly. With
+    /// the old blocking `sender.send().await`, the second message would wedge
+    /// the loop forever and the timeout below would fire.
+    #[tokio::test]
+    async fn poller_does_not_block_on_full_subscriber() {
+        let (cmd_tx, cmd_rx) = channel::<PollCommand>(1000);
+        let (sink_tx, _sink_rx) = channel::<Result<Bc>>(500);
+
+        let mut poller = Poller {
+            subscribers: Default::default(),
+            sink: sink_tx,
+            reciever: ReceiverStream::new(cmd_rx),
+            last_full_warn: None,
+            dropped_full: 0,
+        };
+
+        let msg_id = 42u32;
+        let msg_num = 7u16;
+
+        // A capacity-1 subscriber channel we deliberately never drain. Hold the
+        // receiver so the channel stays *open* (not closed) -> the Full path,
+        // not the Closed path, is exercised.
+        let (sub_tx, mut sub_rx) = channel::<Result<Bc>>(1);
+        cmd_tx
+            .send(PollCommand::AddSubscriber(msg_id, Some(msg_num), sub_tx))
+            .await
+            .unwrap();
+
+        // Far more messages than the subscriber can hold.
+        for _ in 0..100 {
+            cmd_tx
+                .send(PollCommand::Bc(Box::new(Ok(make_bc(msg_id, msg_num)))))
+                .await
+                .unwrap();
+        }
+        // Close the command queue so run() terminates once drained.
+        drop(cmd_tx);
+
+        // Must complete well within the timeout; a blocked poll loop never would.
+        let res = timeout(Duration::from_secs(5), poller.run()).await;
+        assert!(
+            res.is_ok(),
+            "Poller::run blocked on a full subscriber channel (keepalive-starvation regression)"
+        );
+        assert!(res.unwrap().is_ok(), "Poller::run returned an error");
+
+        // Exactly one message made it into the capacity-1 channel; the rest were
+        // dropped non-blockingly rather than wedging the loop.
+        let mut received = 0;
+        while sub_rx.try_recv().is_ok() {
+            received += 1;
+        }
+        assert_eq!(
+            received, 1,
+            "expected exactly one buffered message in the full subscriber channel"
+        );
     }
 }
