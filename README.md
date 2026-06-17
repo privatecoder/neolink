@@ -249,6 +249,10 @@ Status Messages:
   pir status
 - `/status/motion` Contains the motion detection alarm status. `on` for motion
   and `off` for still, only published when `enable_motion` is true in the config
+- `/status/doorbell` Published on each doorbell (visitor) press as
+  `{"event_type":"press"}`. A discrete event, not a state: it is not retained and
+  no idle value is published. Only published when `enable_doorbell` is true in the
+  config
 - `/status/ptz/preset` Sent in reply to a `/query/ptz/preset` an XML encoded
   version of the PTZ presets
 - `/status/preview` a base64 encoded camera image updated every 2s. Not
@@ -346,6 +350,10 @@ enable_preview = false       # preview image in `/status/preview`
                              #
 enable_floodlight = false    # floodlight tasks status in `/status/floodlight_tasks`
                              #
+enable_doorbell = false      # doorbell (visitor) presses in `/status/doorbell`
+                             # (default off / opt-in; no-op on cameras without
+                             # a doorbell)
+                             #
 battery_update = 2000        # Number of ms between `/status/battery_level` updates (min 500)
                              #
 preview_update = 2000        # Number of ms between `/status/preview` updates (min 500)
@@ -381,6 +389,9 @@ Available features are:
   assistant
 - `motion` (aliases `md`, `pir`): This adds a motion detection binary sensor to
   home assistant
+- `doorbell` (aliases `db`, `visitor`): This adds a doorbell event entity
+  (`device_class` `doorbell`, event type `press`) to home assistant. Requires
+  `enable_doorbell` and only fires on cameras that report `visitor` presses
 - `reboot`: This adds a reboot button to home assistant
 - `pt`: This adds a selection of buttons to control the pan and tilt of the
   camera

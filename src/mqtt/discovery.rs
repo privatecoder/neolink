@@ -30,6 +30,8 @@ pub(crate) enum Discoveries {
     Battery,
     #[serde(alias = "siren", alias = "alarm")]
     Siren,
+    #[serde(alias = "doorbell", alias = "db", alias = "visitor")]
+    Doorbell,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +168,24 @@ struct DiscoveryBinarySensor {
     // BinarySensor specific
     payload_off: String,
     payload_on: String,
+    // - State
+    state_topic: String,
+}
+
+/// Home Assistant `event` entity. Used for discrete events (e.g. a doorbell
+/// press) rather than durable state — there is no on/off, just an `event_type`
+/// published to the `state_topic` each time it fires.
+#[derive(Serialize, Debug)]
+struct DiscoveryEvent {
+    name: String,
+    unique_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
+    device: DiscoveryDevice,
+    availability: DiscoveryAvaliablity,
+    // Event specific
+    device_class: String,
+    event_types: Vec<String>,
     // - State
     state_topic: String,
 }
@@ -624,6 +644,43 @@ pub(crate) async fn enable_discovery(
                     )
                 })?;
             }
+            Discoveries::Doorbell => {
+                let config_data = DiscoveryEvent {
+                    // Common across all potential features
+                    device: device.clone(),
+                    availability: availability.clone(),
+
+                    // Identifiers
+                    name: format!("{} Doorbell", friendly_name.as_str()),
+                    unique_id: format!("neolink_{}_doorbell", cam_config.name),
+                    icon: Some("mdi:doorbell".to_string()),
+
+                    // Event specific
+                    device_class: "doorbell".to_string(),
+                    event_types: vec!["press".to_string()],
+                    state_topic: format!("neolink/{}/status/doorbell", cam_config.name),
+                };
+
+                // Each feature needs to be individually registered
+                mqtt.send_message_with_root_topic(
+                    &format!(
+                        "{}/event/{}",
+                        discovery_config.topic, &config_data.unique_id
+                    ),
+                    "config",
+                    &serde_json::to_string(&config_data).with_context(|| {
+                        "Cound not serialise discovery doorbell config into json"
+                    })?,
+                    true,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to publish doorbell auto-discover data on over MQTT for {}",
+                        cam_config.name
+                    )
+                })?;
+            }
         }
     }
 
@@ -634,4 +691,65 @@ pub(crate) async fn enable_discovery(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn doorbell_aliases_parse_to_doorbell() {
+        for alias in [r#""Doorbell""#, r#""doorbell""#, r#""db""#, r#""visitor""#] {
+            let parsed: Discoveries = serde_json::from_str(alias).unwrap();
+            assert_eq!(
+                parsed,
+                Discoveries::Doorbell,
+                "alias {alias} should map to Doorbell"
+            );
+        }
+    }
+
+    fn test_device() -> DiscoveryDevice {
+        DiscoveryDevice {
+            name: "Front".to_string(),
+            connections: vec![],
+            identifiers: vec!["neolink_front".to_string()],
+            manufacturer: Some("Reolink".to_string()),
+            model: Some("Neolink".to_string()),
+            sw_version: Some("0.0.0".to_string()),
+        }
+    }
+
+    fn test_availability() -> DiscoveryAvaliablity {
+        DiscoveryAvaliablity {
+            topic: "neolink/front/status".to_string(),
+            payload_available: Some("connected".to_string()),
+            payload_not_available: None,
+        }
+    }
+
+    #[test]
+    fn doorbell_event_entity_serializes_with_event_shape() {
+        // The event entity is our first non-binary-sensor discovery: a discrete
+        // doorbell event with device_class "doorbell" and event_types ["press"].
+        let config_data = DiscoveryEvent {
+            device: test_device(),
+            availability: test_availability(),
+            name: "Front Doorbell".to_string(),
+            unique_id: "neolink_front_doorbell".to_string(),
+            icon: Some("mdi:doorbell".to_string()),
+            device_class: "doorbell".to_string(),
+            event_types: vec!["press".to_string()],
+            state_topic: "neolink/front/status/doorbell".to_string(),
+        };
+
+        let value = serde_json::to_value(&config_data).unwrap();
+        assert_eq!(value["device_class"], "doorbell");
+        assert_eq!(value["event_types"], json!(["press"]));
+        assert_eq!(value["state_topic"], "neolink/front/status/doorbell");
+        assert_eq!(value["unique_id"], "neolink_front_doorbell");
+        assert_eq!(value["name"], "Front Doorbell");
+        assert_eq!(value["icon"], "mdi:doorbell");
+    }
 }

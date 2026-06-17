@@ -1,6 +1,9 @@
 use super::{BcCamera, Error, Result};
 use crate::bc::{model::*, xml::*};
 use std::time::{Duration, Instant};
+use tokio::sync::broadcast::{
+    channel as broadcast_channel, Receiver as BroadcastReceiver, Sender as BroadcastSender,
+};
 use tokio::sync::mpsc::{channel, error::TryRecvError, Receiver};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -16,6 +19,63 @@ pub enum MotionStatus {
     NoChange(Instant),
 }
 
+/// A single decoded event from the camera's alarm/motion stream.
+///
+/// A single camera message can yield several of these: a `"visitor,MD"` status
+/// produces both a [`Doorbell`](DecodedAlarm::Doorbell) and a
+/// [`MotionStart`](DecodedAlarm::MotionStart). They are returned in order and
+/// never collapsed to a single outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodedAlarm {
+    /// A motion-type status began (`"MD"`, `"PIR"`, an `AItype`, ...)
+    MotionStart,
+    /// All statuses cleared (`"none"`) — motion stopped
+    MotionStop,
+    /// A doorbell / visitor press
+    Doorbell,
+}
+
+/// Decode the alarm events in `list` that target `channel_id`.
+///
+/// The camera reports alarm status on the existing motion stream. A status of
+/// `"visitor"` is a doorbell press, `"none"` is motion clearing, and any other
+/// non-empty status (or a non-`"none"` `AItype`) is motion. Statuses may be
+/// comma separated (e.g. `"visitor,MD"`), in which case every component is
+/// decoded independently. Events on other channels are ignored.
+///
+/// At most one motion outcome is emitted per `AlarmEvent` (start takes
+/// precedence over stop, matching the previous "any active status = motion"
+/// semantics), but doorbell presses are always surfaced alongside it.
+pub fn decode_alarm_events(list: &AlarmEventList, channel_id: u8) -> Vec<DecodedAlarm> {
+    let mut decoded = Vec::new();
+    for event in &list.alarm_events {
+        if event.channel_id != channel_id {
+            continue;
+        }
+        let mut motion_start = false;
+        let mut motion_stop = false;
+        for token in event.status.split(',') {
+            match token.trim() {
+                "" => {}
+                "visitor" => decoded.push(DecodedAlarm::Doorbell),
+                "none" => motion_stop = true,
+                _ => motion_start = true,
+            }
+        }
+        // A non-"none" AItype is motion, preserving the existing semantics where
+        // an AI detection counts even if the raw status is "none".
+        if event.ai_type.as_deref().is_some_and(|ai| ai != "none") {
+            motion_start = true;
+        }
+        if motion_start {
+            decoded.push(DecodedAlarm::MotionStart);
+        } else if motion_stop {
+            decoded.push(DecodedAlarm::MotionStop);
+        }
+    }
+    decoded
+}
+
 /// A handle on current motion related events comming from the camera
 ///
 /// When this object is dropped the motion events are stopped
@@ -24,9 +84,20 @@ pub struct MotionData {
     cancel: CancellationToken,
     rx: Receiver<Result<MotionStatus>>,
     last_update: MotionStatus,
+    doorbell: BroadcastSender<Instant>,
 }
 
 impl MotionData {
+    /// Subscribe to doorbell ("visitor") presses decoded from the same alarm
+    /// stream that drives motion.
+    ///
+    /// Doorbell presses are discrete events rather than durable state, so they
+    /// are delivered over a broadcast channel separate from the motion methods.
+    /// The returned receiver only sees presses that arrive after it is created.
+    pub fn doorbell(&self) -> BroadcastReceiver<Instant> {
+        self.doorbell.subscribe()
+    }
+
     /// Get if motion has been detected. Returns None if
     /// no motion data has yet been recieved from the camera
     ///
@@ -211,6 +282,8 @@ impl BcCamera {
         // After start_motion_query (MSG_ID 31) the camera sends motion messages
         // when whenever motion is detected.
         let (tx, rx) = channel(20);
+        let (doorbell, _) = broadcast_channel(50);
+        let doorbell_task = doorbell.clone();
 
         let mut set = JoinSet::new();
         let channel_id = self.channel_id;
@@ -236,24 +309,33 @@ impl BcCamera {
                                     ..
                                 }) = motion_msg.body
                                 {
-                                    let mut result = MotionStatus::NoChange(Instant::now());
-                                    for alarm_event in &alarm_event_list.alarm_events {
-                                        if alarm_event.channel_id == channel_id {
-                                            if alarm_event.status != "none"
-                                                || alarm_event
-                                                    .ai_type
-                                                    .as_ref()
-                                                    .map(|ai_type| ai_type != "none")
-                                                    .unwrap_or(false)
-                                            {
-                                                result = MotionStatus::Start(Instant::now());
-                                                break;
-                                            } else {
-                                                result = MotionStatus::Stop(Instant::now());
-                                                break;
-                                            }
-                                        }
+                                    let decoded =
+                                        decode_alarm_events(&alarm_event_list, channel_id);
+                                    // Doorbell presses are discrete events: emit
+                                    // one per press on the broadcast channel. A
+                                    // send error just means nobody is listening.
+                                    for _ in decoded
+                                        .iter()
+                                        .filter(|d| matches!(d, DecodedAlarm::Doorbell))
+                                    {
+                                        let _ = doorbell_task.send(Instant::now());
                                     }
+                                    // Motion keeps its single-state-per-message
+                                    // semantics for RTSP gating: any motion start
+                                    // wins, else a stop, else no change.
+                                    let result = if decoded
+                                        .iter()
+                                        .any(|d| matches!(d, DecodedAlarm::MotionStart))
+                                    {
+                                        MotionStatus::Start(Instant::now())
+                                    } else if decoded
+                                        .iter()
+                                        .any(|d| matches!(d, DecodedAlarm::MotionStop))
+                                    {
+                                        MotionStatus::Stop(Instant::now())
+                                    } else {
+                                        MotionStatus::NoChange(Instant::now())
+                                    };
                                     Ok(result)
                                 } else {
                                     Ok(MotionStatus::NoChange(Instant::now()))
@@ -289,6 +371,7 @@ impl BcCamera {
             cancel,
             rx,
             last_update: MotionStatus::NoChange(Instant::now()),
+            doorbell,
         })
     }
 }
@@ -303,5 +386,88 @@ impl Drop for MotionData {
             while handle.join_next().await.is_some() {}
             log::trace!("Dropped MotionData");
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bc::xml::{AlarmEvent, AlarmEventList};
+
+    fn event(channel_id: u8, status: &str) -> AlarmEvent {
+        AlarmEvent {
+            channel_id,
+            status: status.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn list(events: Vec<AlarmEvent>) -> AlarmEventList {
+        AlarmEventList {
+            alarm_events: events,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn visitor_decodes_to_doorbell_only() {
+        let decoded = decode_alarm_events(&list(vec![event(0, "visitor")]), 0);
+        assert_eq!(decoded, vec![DecodedAlarm::Doorbell]);
+    }
+
+    #[test]
+    fn md_decodes_to_motion_start() {
+        let decoded = decode_alarm_events(&list(vec![event(0, "MD")]), 0);
+        assert_eq!(decoded, vec![DecodedAlarm::MotionStart]);
+    }
+
+    #[test]
+    fn pir_decodes_to_motion_start() {
+        let decoded = decode_alarm_events(&list(vec![event(0, "PIR")]), 0);
+        assert_eq!(decoded, vec![DecodedAlarm::MotionStart]);
+    }
+
+    #[test]
+    fn none_decodes_to_motion_stop() {
+        let decoded = decode_alarm_events(&list(vec![event(0, "none")]), 0);
+        assert_eq!(decoded, vec![DecodedAlarm::MotionStop]);
+    }
+
+    #[test]
+    fn comma_separated_visitor_and_md_are_not_collapsed() {
+        // A doorbell press that arrives alongside motion in a single status
+        // string must surface BOTH a doorbell event and a motion start.
+        let decoded = decode_alarm_events(&list(vec![event(0, "visitor,MD")]), 0);
+        assert_eq!(
+            decoded,
+            vec![DecodedAlarm::Doorbell, DecodedAlarm::MotionStart]
+        );
+    }
+
+    #[test]
+    fn multiple_alarm_events_all_delivered() {
+        // Several AlarmEvents in one message must each be decoded, not collapsed
+        // to the last one.
+        let decoded = decode_alarm_events(&list(vec![event(0, "visitor"), event(0, "MD")]), 0);
+        assert_eq!(
+            decoded,
+            vec![DecodedAlarm::Doorbell, DecodedAlarm::MotionStart]
+        );
+    }
+
+    #[test]
+    fn events_on_other_channels_are_ignored() {
+        let decoded = decode_alarm_events(&list(vec![event(1, "visitor"), event(2, "MD")]), 0);
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn ai_type_counts_as_motion_start() {
+        // Preserve existing motion semantics: a non-"none" AItype is motion even
+        // when the status itself is "none".
+        let mut ev = event(0, "none");
+        ev.ai_type = Some("people".to_string());
+        let decoded = decode_alarm_events(&list(vec![ev]), 0);
+        assert_eq!(decoded, vec![DecodedAlarm::MotionStart]);
     }
 }

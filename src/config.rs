@@ -353,6 +353,13 @@ pub(crate) struct MqttConfig {
     #[serde(default = "default_2000")]
     pub(crate) floodlight_update: u64,
 
+    /// Publish doorbell ("visitor") presses as discrete events.
+    ///
+    /// Explicit opt-in: defaults to off. Cameras without a doorbell simply never
+    /// emit a "visitor" status, so enabling this is a graceful no-op for them.
+    #[serde(default = "default_false")]
+    pub(crate) enable_doorbell: bool,
+
     #[serde(default)]
     pub(crate) discovery: Option<MqttDiscoveryConfig>,
 }
@@ -392,6 +399,7 @@ fn default_mqtt() -> MqttConfig {
         preview_update: 2000,
         enable_floodlight: true,
         floodlight_update: 2000,
+        enable_doorbell: false,
         discovery: Default::default(),
     }
 }
@@ -609,5 +617,30 @@ fn validate_camera_config(camera_config: &CameraConfig) -> Result<(), Validation
             "Either camera address or uid must be given",
         )),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enable_doorbell_defaults_to_false() {
+        // Doorbell is explicit opt-in: absent from config means disabled.
+        let config: MqttConfig = toml::from_str("").unwrap();
+        assert!(!config.enable_doorbell);
+    }
+
+    #[test]
+    fn enable_doorbell_can_be_enabled() {
+        let config: MqttConfig = toml::from_str("enable_doorbell = true").unwrap();
+        assert!(config.enable_doorbell);
+    }
+
+    #[test]
+    fn enable_motion_still_defaults_to_true() {
+        // Guard the existing default while adding the new opt-in flag next to it.
+        let config: MqttConfig = toml::from_str("").unwrap();
+        assert!(config.enable_motion);
     }
 }
