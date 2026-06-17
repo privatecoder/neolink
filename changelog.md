@@ -10,6 +10,37 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## 0.7.9
+
+Stability fix for long-running streams: a single slow RTSP client could stall the
+camera's control channel and get the whole session dropped. Backported and adapted
+from upstream #399.
+
+### Poller no longer blocks on a full subscriber channel
+
+- The per-connection poll loop (`crates/core/.../connection/bcconn.rs`) routes every
+  inbound camera message to its subscriber. It used to **`await`** that delivery, so
+  one subscriber whose channel was full — e.g. an overwhelmed RTSP client that had
+  stopped draining its video frames — blocked the entire poll loop. That starved the
+  camera's keepalive/control traffic, the camera dropped the session, and the stream
+  fell into a reconnect cycle (the classic "streams die after hours of running").
+- Delivery is now **non-blocking** (`try_send`): if a subscriber's channel is full,
+  that one message is dropped for that subscriber (with a rate-limited warning) and
+  the loop moves on. Keepalive and control are always processed promptly; the poll
+  loop never waits on a single consumer. Frame dropping here is intentionally not
+  keyframe-aware — that already happens downstream in the RTSP relay.
+- `poll_commander` channel capacity raised `200 → 1000` for headroom, since the loop
+  no longer back-pressures on slow subscribers.
+
+### Audio buffer overflow no longer tears down the relay
+
+- An audio appsrc that filled up returned `FlowError::Flushing`, which the relay
+  treated as a hard disconnect and tore the whole session down. The relay now applies
+  the same high-watermark drop strategy it already uses for video: at/above 80% of the
+  audio buffer it drops the audio frame (while still advancing the audio clock) instead
+  of overflowing, and a residual `Flushing` is treated as a dropped audio frame rather
+  than a teardown whenever video is still flowing.
+
 ## 0.7.8
 
 ### Persistent stream-type cache

@@ -878,6 +878,7 @@ pub(super) async fn make_factory(
                                         "{stream_label}: HB elapsed={:?} vid_ts={:?} aud_ts={:?} \
                                         vid_buf={}/{} aud_buf={}/{} last_media={:?} \
                                         vid_push={} aud_push={} dropP_pressure={} dropP_backpressure={} \
+                                        dropA_pressure={} dropA_flushing={} \
                                         fps={} frame_us={} av_drift_ms={} \
                                         aud_avg_us={} aud_min_us={} aud_max_us={} aud_last_us={} aud_rate={} \
                                         aud_adts_frames={} aud_raw_blocks={} aud_profile={} aud_samp_idx={} aud_ch={} \
@@ -893,6 +894,7 @@ pub(super) async fn make_factory(
                                         since_last_media,
                                         stats.vid_pushed, stats.aud_pushed,
                                         stats.p_dropped_pressure, stats.p_dropped_backpressure,
+                                        stats.aud_dropped_pressure, stats.aud_dropped_flushing,
                                         stream_config.fps,
                                         frame_step_us,
                                         av_drift_ms,
@@ -1205,6 +1207,85 @@ enum PushOutcome {
     Gone,
 }
 
+/// Audio appsrc high-watermark, as a percentage of `max_bytes`. At or above this
+/// fill level we drop the audio frame (while still advancing the audio clock)
+/// instead of pushing it, so the audio buffer can never overflow into
+/// `FlowError::Flushing` — which maps to `PushOutcome::Gone` and would tear down
+/// the whole relay. Mirrors the video P-frame pressure-drop (also 80%, see the
+/// `BcMedia::Pframe` arm) so audio and video shed load at the same fill level.
+const AUDIO_DROP_WATERMARK_PCT: u64 = 80;
+
+/// Whether an audio appsrc currently holding `level` bytes (capacity `max`) is
+/// at/above the high watermark and its next frame should be dropped. `max == 0`
+/// means no byte limit is configured, so we never drop on this basis. Pure so it
+/// can be unit-tested without a live gstreamer pipeline.
+fn audio_over_watermark(level: u64, max: u64) -> bool {
+    max > 0 && level >= max * AUDIO_DROP_WATERMARK_PCT / 100
+}
+
+/// Push one audio frame to the audio appsrc, mirroring the video relay's
+/// load-shedding strategy instead of letting the audio buffer overflow and tear
+/// the whole relay down:
+///
+/// 1. High-watermark drop: if the audio appsrc is at/above
+///    [`AUDIO_DROP_WATERMARK_PCT`] of `max_bytes`, drop this frame. The caller
+///    still advances the audio clock, so timing stays coherent.
+/// 2. Graceful Flushing: if a push still returns `Gone` (e.g. a transient
+///    `FlowError::Flushing`) and video is present, treat it as a dropped audio
+///    frame rather than tearing the relay down. Video independently returns
+///    `Gone` on a real client disconnect, so teardown still happens when it
+///    should — just driven by video, not by an audio hiccup.
+#[allow(clippy::too_many_arguments)]
+fn push_audio_frame(
+    aud_src: &AppSrc,
+    vid_present: bool,
+    stream_label: &str,
+    data: Vec<u8>,
+    ts_us: u64,
+    dur: Duration,
+    pools: &mut HashMap<usize, gstreamer::BufferPool>,
+    pace: bool,
+    aud_pacer: &mut Option<PacerState>,
+    stats: &mut StreamStats,
+) -> AnyResult<PushOutcome> {
+    let level = aud_src.current_level_bytes();
+    let max = aud_src.max_bytes();
+    if audio_over_watermark(level, max) {
+        stats.aud_dropped_pressure += 1;
+        log::trace!(
+            "{stream_label}: dropping audio frame due to buffer pressure ({level}/{max} bytes, {}%)",
+            level * 100 / max
+        );
+        return Ok(PushOutcome::Pushed);
+    }
+
+    let outcome = send_to_appsrc(
+        aud_src,
+        stream_label,
+        data,
+        Duration::from_micros(ts_us),
+        Some(dur),
+        pools,
+        pace,
+        aud_pacer,
+    )?;
+
+    Ok(match outcome {
+        PushOutcome::Pushed => {
+            stats.aud_pushed += 1;
+            PushOutcome::Pushed
+        }
+        PushOutcome::Gone if vid_present => {
+            stats.aud_dropped_flushing += 1;
+            log::debug!(
+                "{stream_label}: audio push returned Gone (likely Flushing); dropping audio frame, keeping relay alive (video drives teardown)"
+            );
+            PushOutcome::Pushed
+        }
+        other => other,
+    })
+}
+
 fn send_to_sources(
     data: BcMedia,
     stream_label: &str,
@@ -1242,19 +1323,20 @@ fn send_to_sources(
                 }
                 let ts_us = *aud_ts;
                 log::debug!("Sending AAC: {:?}", Duration::from_micros(ts_us));
-                let outcome = send_to_appsrc(
+                let outcome = push_audio_frame(
                     aud_src,
+                    vid_src.is_some(),
                     stream_label,
                     aac.data,
-                    Duration::from_micros(ts_us),
-                    Some(dur),
+                    ts_us,
+                    dur,
                     pools,
                     pace,
                     aud_pacer,
+                    stats,
                 )?;
-                if matches!(outcome, PushOutcome::Pushed) {
-                    stats.aud_pushed += 1;
-                }
+                // Advance the audio clock regardless of whether the frame was
+                // pushed or dropped, so timing stays coherent across drops.
                 *aud_ts = ts_us + info.duration_us as u64;
                 outcome
             } else {
@@ -1276,19 +1358,19 @@ fn send_to_sources(
                 }
                 let ts_us = *aud_ts;
                 log::trace!("Sending ADPCM: {:?}", Duration::from_micros(ts_us));
-                let outcome = send_to_appsrc(
+                let outcome = push_audio_frame(
                     aud_src,
+                    vid_src.is_some(),
                     stream_label,
                     adpcm.data,
-                    Duration::from_micros(ts_us),
-                    Some(dur),
+                    ts_us,
+                    dur,
                     pools,
                     pace,
                     aud_pacer,
+                    stats,
                 )?;
-                if matches!(outcome, PushOutcome::Pushed) {
-                    stats.aud_pushed += 1;
-                }
+                // Advance the audio clock regardless of push/drop (see AAC arm).
                 *aud_ts = ts_us + duration as u64;
                 return Ok(outcome);
             }
@@ -2233,6 +2315,12 @@ struct StreamStats {
     aud_pushed: u64,
     p_dropped_pressure: u64,
     p_dropped_backpressure: u64,
+    /// Audio frames dropped because the audio appsrc was at/above the high
+    /// watermark (mirrors `p_dropped_pressure` for video).
+    aud_dropped_pressure: u64,
+    /// Audio frames dropped because the push returned `Gone`/Flushing and we
+    /// chose to keep the relay alive instead of tearing it down.
+    aud_dropped_flushing: u64,
 
     tryrecv_ok: u64,
 
@@ -2282,6 +2370,8 @@ impl StreamStats {
             aud_pushed: 0,
             p_dropped_pressure: 0,
             p_dropped_backpressure: 0,
+            aud_dropped_pressure: 0,
+            aud_dropped_flushing: 0,
             tryrecv_ok: 0,
             aud_last_us: 0,
             aud_last_rate: 0,
@@ -2493,4 +2583,38 @@ fn media_queue_capacity(stream_config: &StreamConfig) -> usize {
     };
     let target = base.saturating_mul(4) as usize;
     target.max(min_capacity).min(5000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_watermark_drops_at_or_above_threshold() {
+        // 1 MiB cap; watermark is AUDIO_DROP_WATERMARK_PCT (80%) -> 838860 bytes.
+        let max = 1024 * 1024;
+        let threshold = max * AUDIO_DROP_WATERMARK_PCT / 100;
+
+        assert!(!audio_over_watermark(0, max), "empty buffer must not drop");
+        assert!(
+            !audio_over_watermark(threshold - 1, max),
+            "just below the watermark must not drop"
+        );
+        assert!(
+            audio_over_watermark(threshold, max),
+            "exactly at the watermark must drop"
+        );
+        assert!(
+            audio_over_watermark(max, max),
+            "full buffer must drop (avoids overflow -> Flushing -> relay teardown)"
+        );
+    }
+
+    #[test]
+    fn audio_watermark_disabled_when_no_byte_limit() {
+        // max_bytes()==0 means the appsrc has no byte cap configured; never drop
+        // on a watermark basis (there is nothing to overflow).
+        assert!(!audio_over_watermark(0, 0));
+        assert!(!audio_over_watermark(10_000_000, 0));
+    }
 }
