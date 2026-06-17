@@ -203,3 +203,42 @@ structs (`src/config.rs`) use serde defaults + the `validator` crate; `main.rs` 
 channel, and publishing to MQTT `neolink/config` updates it at runtime (see README MQTT
 section). See `sample_config.toml` for the full set of options and README.md for usage of
 each subcommand and the MQTT topic surface.
+
+## Releasing / release-notes format
+
+Cutting a release: bump the version in **both** `Cargo.toml` and
+`crates/core/Cargo.toml` (keep them in sync), add the matching `## <version>` entry to
+`changelog.md`, then tag the merge commit `<version>` (unprefixed, e.g. `0.7.8`). Pushing
+the tag triggers `.github/workflows/docker.yml`, which builds and publishes the multi-arch
+image `ghcr.io/${owner}/neolink:<version>`. The startup version string comes from
+`git describe --tags`, so the tag must exist for it to be meaningful. The companion
+`neolink-ha-addon` pins a specific image via `build_from`, so release core first and let
+its image publish before bumping the add-on.
+
+**GitHub release notes follow a consistent structure** (all `0.7.x` releases use it — match
+it for new ones). Lead with a one-line summary sentence, then these `##` sections **in this
+order**, omitting any that have no content (except Docker image, which is always present):
+
+```markdown
+<one-line summary of the release>
+
+## What's new / changed
+- New features and behaviour/default changes (omit for pure fix releases).
+
+## Fixes
+- Bug fixes (omit if none).
+
+## Notes
+- Caveats, compatibility/migration notes, "no config change needed", verification results.
+
+## References
+- Link relevant [docs/](docs/) pages by topic, and always the full [`changelog.md`](changelog.md).
+
+## Docker image
+```bash
+docker pull ghcr.io/privatecoder/neolink:<version>
+```
+```
+
+Keep `changelog.md` as the authoritative full history; the GitHub release notes are the
+human-facing summary that links back to it and to the relevant `docs/` page(s).
