@@ -117,6 +117,24 @@ impl Default for NeoMediaFactoryImpl {
     }
 }
 
+/// Last-resort "Stream not Ready" splash pipeline. Built when the per-client
+/// callback cannot produce a real pipeline from scratch (no codec learned yet
+/// and the camera is unreachable). Returning `None`/an empty bin there makes
+/// GStreamer emit CRITICALs and the client gets nothing, so we always hand back
+/// this valid, self-contained pipeline instead; the session reconciles once the
+/// camera comes up. Mirrors the default factory launch string.
+const SPLASH_FALLBACK_LAUNCH: &str = "videotestsrc pattern=\"snow\" ! video/x-raw,width=896,height=512,framerate=25/1 ! textoverlay name=\"inittextoverlay\" text=\"Stream not Ready\" valignment=top halignment=left font-desc=\"Sans, 32\" ! jpegenc ! rtpjpegpay name=pay0";
+
+fn build_splash_fallback() -> Option<Element> {
+    match gstreamer::parse::launch(SPLASH_FALLBACK_LAUNCH) {
+        Ok(element) => Some(element),
+        Err(e) => {
+            log::error!("Failed to build splash fallback pipeline: {e:?}");
+            None
+        }
+    }
+}
+
 impl NeoMediaFactoryImpl {
     async fn set_callback<F>(&self, callback: F)
     where
@@ -189,17 +207,39 @@ impl RTSPMediaFactoryImpl for NeoMediaFactoryImpl {
         let element = bin.upcast::<Element>();
 
         match self.build_pipeline(element) {
-            Ok(result) => {
-                if result.is_none() {
-                    log::warn!("build_pipeline returned None from scratch");
-                }
-                result
+            Ok(Some(result)) => Some(result),
+            Ok(None) => {
+                // Defensive: never return None/empty from the from-scratch path.
+                // That triggers GStreamer CRITICALs and serves the client nothing.
+                // Hand back the splash placeholder instead.
+                log::warn!(
+                    "build_pipeline returned None from scratch; serving splash placeholder"
+                );
+                build_splash_fallback()
             }
             Err(e) => {
-                log::error!("build_pipeline from scratch failed: {:?}", e);
-                None
+                log::error!(
+                    "build_pipeline from scratch failed: {:?}; serving splash placeholder",
+                    e
+                );
+                build_splash_fallback()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splash_fallback_builds_a_valid_element() {
+        gstreamer::init().expect("gstreamer init");
+        let element = build_splash_fallback();
+        assert!(
+            element.is_some(),
+            "from-scratch fallback must build a splash element, never None"
+        );
     }
 }
 

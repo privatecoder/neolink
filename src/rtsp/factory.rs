@@ -16,7 +16,6 @@ use std::future::Future;
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use tokio::sync::mpsc as tokio_mpsc;
-use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -49,47 +48,9 @@ where
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, TrySendError};
 
-#[derive(Clone, Debug)]
-pub enum AudioType {
-    Aac,
-    Adpcm(u32),
-}
-
-#[derive(Clone, Debug)]
-struct StreamTypeCache {
-    vid_type: Option<VideoType>,
-    aud_type: Option<AudioType>,
-    // Sizing learned alongside the codec types, so the fast path can build a
-    // correctly-sized pipeline from cache without re-querying the camera.
-    resolution: [u32; 2],
-    bitrate: u32,
-    fps: u32,
-    fps_table: Vec<u32>,
-    // AAC params (0 if unknown / not audio), so the fast path can encode keepalive
-    // silence at the camera's exact sample rate — the audio RTP clock-rate is fixed
-    // in the SDP, so a mismatch would break the handoff to real audio.
-    aud_rate: u32,
-    aud_channels: u32,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct StreamCacheKey {
-    camera_id: String,
-    stream: StreamKind,
-}
-
-static STREAM_TYPE_CACHE: Lazy<RwLock<HashMap<StreamCacheKey, StreamTypeCache>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
-
-async fn cached_stream_types(key: &StreamCacheKey) -> Option<StreamTypeCache> {
-    let cache = STREAM_TYPE_CACHE.read().await;
-    cache.get(key).cloned()
-}
-
-async fn store_stream_types(key: StreamCacheKey, types: StreamTypeCache) {
-    let mut cache = STREAM_TYPE_CACHE.write().await;
-    cache.insert(key, types);
-}
+// Stream-type cache types and persistence live in `stream_cache`; factory only
+// constructs keys/values and calls `stream_cache::get`/`store`.
+use super::stream_cache::{self, reconcile, AudioType, Reconcile, StreamCacheKey, StreamTypeCache};
 
 /// Monotonic per-client-connection counter so overlapping client retries can be told
 /// apart in the logs (the per-client label becomes e.g. `cam#7::subStream`).
@@ -125,6 +86,20 @@ impl StreamConfig {
             buffer_duration_ms,
             aud_rate: cache.aud_rate,
             aud_channels: cache.aud_channels,
+        }
+    }
+
+    /// Snapshot the learned codec + sizing into a cacheable value.
+    fn to_cache(&self) -> StreamTypeCache {
+        StreamTypeCache {
+            vid_type: self.vid_type.clone(),
+            aud_type: self.aud_type.clone(),
+            resolution: self.resolution,
+            bitrate: self.bitrate,
+            fps: self.fps,
+            fps_table: self.fps_table.clone(),
+            aud_rate: self.aud_rate,
+            aud_channels: self.aud_channels,
         }
     }
 
@@ -326,14 +301,18 @@ pub(super) async fn make_factory(
                         // Resolved (per-camera ?? global ?? 0) at config load. 0 = never
                         // time out the offline keepalive (default).
                         let offline_timeout_secs = config.offline_timeout_secs.unwrap_or(0);
-                        let camera_id = config
-                            .camera_uid
-                            .clone()
-                            .unwrap_or_else(|| config.name.clone());
-                        let cache_key = StreamCacheKey { camera_id, stream };
-                        let cached = cached_stream_types(&cache_key).await;
+                        // Stable identity for the persistent cache key: uid ?? address ?? name,
+                        // plus the NVR channel (two channels of one NVR share a uid).
+                        let cache_key = StreamCacheKey::new(
+                            config.camera_uid.as_deref(),
+                            config.camera_addr.as_deref(),
+                            &config.name,
+                            config.channel_id,
+                            stream,
+                        );
+                        let cached = stream_cache::get(&cache_key);
 
-                        let (stream_config, mut buffer, permit, mut media_rx, vid_src, aud_src, use_keepalive) =
+                        let (stream_config, mut buffer, permit, mut media_rx, vid_src, aud_src, use_keepalive, reconcile_baseline) =
                             if let Some(cached) = cached.filter(|c| c.vid_type.is_some()) {
                                 // ===== Fast path: stream type is cached =====
                                 // Build the pipeline from cached caps and return it to
@@ -370,7 +349,9 @@ pub(super) async fn make_factory(
                                     _ = cancel_child.cancelled() => return Ok(()),
                                     r = connect => r?,
                                 };
-                                (stream_config, Vec::new(), permit, media_rx, vid_src, aud_src, true)
+                                // The cached value is the reconcile baseline: confirm the live
+                                // stream still matches it once frames flow (see the live loop).
+                                (stream_config, Vec::new(), permit, media_rx, vid_src, aud_src, true, Some(cached))
                             } else {
                                 // ===== Slow path: stream type not cached =====
                                 // We must reach the camera to learn the codec before the
@@ -447,20 +428,7 @@ pub(super) async fn make_factory(
                                 {
                                     log::warn!("{name}::{stream}: No media received from camera, building fallback pipeline");
                                 } else {
-                                    store_stream_types(
-                                        cache_key.clone(),
-                                        StreamTypeCache {
-                                            vid_type: stream_config.vid_type.clone(),
-                                            aud_type: stream_config.aud_type.clone(),
-                                            resolution: stream_config.resolution,
-                                            bitrate: stream_config.bitrate,
-                                            fps: stream_config.fps,
-                                            fps_table: stream_config.fps_table.clone(),
-                                            aud_rate: stream_config.aud_rate,
-                                            aud_channels: stream_config.aud_channels,
-                                        },
-                                    )
-                                    .await;
+                                    stream_cache::store(cache_key.clone(), stream_config.to_cache());
                                 }
 
                                 let sizing_bytes = buffer_size_bytes(&stream_config);
@@ -477,7 +445,9 @@ pub(super) async fn make_factory(
                                     &config.splash_pattern.to_string(),
                                 )?;
                                 let _ = reply.send(SetupOutcome::Pipeline(element));
-                                (stream_config, buffer, permit, media_rx, vid_src, aud_src, false)
+                                // Slow path learned types from the live stream, so there is
+                                // nothing to reconcile against.
+                                (stream_config, buffer, permit, media_rx, vid_src, aud_src, false, None)
                             };
 
                         // ---- Clean fix: keep tokio receiver async; forward into bounded std channel ----
@@ -570,6 +540,8 @@ pub(super) async fn make_factory(
                         // Move permit into this thread to keep it alive for the session duration
                         let sender_label = stream_label.clone();
                         let cancel_send = cancel_child.clone();
+                        // Cache key for the fast-path reconcile inside the loop.
+                        let cache_key_loop = cache_key.clone();
                         spawn_blocking_logged(sender_label, move || {
                             use std::time::{Duration, Instant};
 
@@ -689,6 +661,17 @@ pub(super) async fn make_factory(
                             // camera frames are available), so only the genuine offline-
                             // placeholder duration counts — not link-wait / one-shot encode.
                             let mut keepalive_started_at: Option<Instant> = None;
+
+                            // Fast-path reconcile state: the pipeline was built from cached
+                            // caps (a hint). Observe the first live frames and, once we've
+                            // confirmed the codec (and audio, if the cache had any), compare.
+                            // `observed` is seeded from the cached config so unseen fields keep
+                            // their cached value and don't register as spurious changes.
+                            let mut observed = stream_config.clone();
+                            let mut observed_video = false;
+                            let mut observed_audio = false;
+                            let mut reconcile_done = reconcile_baseline.is_none();
+                            let mut reconcile_frames = 0u32;
 
                             // Send buffered frames (no pacing)
                             for buffered in buffer.drain(..) {
@@ -973,6 +956,74 @@ pub(super) async fn make_factory(
 
                                 stats.tryrecv_ok += 1;
                                 stats.last_media_instant = Instant::now();
+
+                                // ---- Fast-path reconcile (cached caps vs. live stream) ----
+                                // Observe early frames; once the codec (and audio, if cached)
+                                // is confirmed, compare against the baseline. A caps-breaking
+                                // change (codec, audio format/rate/channels) means the SDP we
+                                // already built is wrong, so refresh the cache and EOS this
+                                // session — the client reconnects and rebuilds correctly. A
+                                // sizing-only drift just refreshes the cache silently.
+                                if !reconcile_done {
+                                    if let Some(baseline) = reconcile_baseline.as_ref() {
+                                        observed.update_from_media(&timed.media);
+                                        match &timed.media {
+                                            BcMedia::Iframe(_) | BcMedia::Pframe(_) => {
+                                                observed_video = true
+                                            }
+                                            BcMedia::Aac(_) | BcMedia::Adpcm(_) => {
+                                                observed_audio = true
+                                            }
+                                            _ => {}
+                                        }
+                                        reconcile_frames += 1;
+                                        let audio_settled =
+                                            observed_audio || baseline.aud_type.is_none();
+                                        if (observed_video && audio_settled)
+                                            || reconcile_frames >= 30
+                                        {
+                                            reconcile_done = true;
+                                            // Sizing fields are not carried in frames; keep the
+                                            // baseline's so only codec/audio can read as caps-
+                                            // breaking (resolution/bitrate drift is reconciled
+                                            // by the slow path on a future cold cache).
+                                            let learned = StreamTypeCache {
+                                                vid_type: observed.vid_type.clone(),
+                                                aud_type: observed.aud_type.clone(),
+                                                aud_rate: observed.aud_rate,
+                                                aud_channels: observed.aud_channels,
+                                                fps: observed.fps,
+                                                resolution: baseline.resolution,
+                                                bitrate: baseline.bitrate,
+                                                fps_table: baseline.fps_table.clone(),
+                                            };
+                                            match reconcile(baseline, &learned) {
+                                                Reconcile::Identical => {}
+                                                Reconcile::DriftOnly => {
+                                                    log::info!("{stream_label}: live fps/sizing drifted from cache; refreshing cache");
+                                                    stream_cache::store(
+                                                        cache_key_loop.clone(),
+                                                        learned,
+                                                    );
+                                                }
+                                                Reconcile::CapsBreaking => {
+                                                    log::warn!("{stream_label}: live stream caps differ from cache (codec/audio changed); refreshing cache and tearing down this session so the client reconnects to a correct pipeline");
+                                                    stream_cache::store(
+                                                        cache_key_loop.clone(),
+                                                        learned,
+                                                    );
+                                                    if let Some(app) = vid_src.as_ref() {
+                                                        let _ = app.end_of_stream();
+                                                    }
+                                                    if let Some(app) = aud_src.as_ref() {
+                                                        let _ = app.end_of_stream();
+                                                    }
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
 
                                 // Keepalive handoff: until the first real camera keyframe, drop
                                 // real frames (P-frames / audio) and keep serving the placeholder.

@@ -10,6 +10,46 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## 0.7.8
+
+### Persistent stream-type cache
+
+- Neolink learns each stream's codec and sizing on the first client connection and
+  caches it so a later client can be served the offline placeholder immediately,
+  without first re-learning the codec from the camera. That cache can now be
+  persisted to disk.
+- New top-level `stream_cache_path` option. Default is unset = in-memory only
+  (unchanged behaviour). When set, the cache is loaded at startup and written
+  on-change (atomic temp-file + rename) to that path. The
+  `NEOLINK_STREAM_CACHE_PATH` environment variable overrides the config value; an
+  empty value disables persistence.
+- Effect: after a restart, a client that connects while a known camera is still
+  offline gets the "stream not ready" placeholder built from the persisted types,
+  instead of nothing. (The Home Assistant add-on points this at its persistent
+  `/data` volume.)
+- The on-disk format is versioned (`version = 1`) and decoupled from internal
+  types; an unreadable, corrupt, or unknown-version file is ignored and rebuilt,
+  and a single malformed entry is skipped rather than discarding the file.
+- Disk entries are treated as a hint, not the truth: on the first connection the
+  cached types are reconciled against the live stream. A caps-breaking change
+  (video codec, audio format, audio sample-rate / channel count, or — treated
+  conservatively — resolution) refreshes the cache and tears the session down so
+  the client reconnects to a correctly-built pipeline; a sizing-only drift
+  (bitrate / fps) refreshes the cache silently.
+
+### Defensive splash fallback
+
+- When a client connected before any codec had been learned and the camera was
+  unreachable, the per-client pipeline callback could return nothing, which left
+  GStreamer with an empty element and produced CRITICALs
+  (`g_object_force_floating`, "could not create element") — the client received no
+  stream.
+- The from-scratch pipeline path now always falls back to the existing "Stream not
+  Ready" splash pipeline instead of returning nothing, so the client gets a valid
+  placeholder and the session reconciles when the camera comes back.
+
+---
+
 ## Highlights
 
 - **On-demand connections** — cameras can now stay completely dark until something

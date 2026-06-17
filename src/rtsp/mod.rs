@@ -65,6 +65,7 @@ mod cmdline;
 mod factory;
 mod gst;
 mod stream;
+mod stream_cache;
 
 use crate::common::{NeoInstance, NeoReactor};
 use factory::*;
@@ -81,6 +82,18 @@ type AnyResult<T> = anyhow::Result<T, anyhow::Error>;
 /// Opt is the command line options
 pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
     let rtsp = Arc::new(NeoRtspServer::new()?);
+
+    // Initialise the persistent stream-type cache once, before any factory runs.
+    // Disabled (in-memory only) unless `stream_cache_path` is set (or the
+    // NEOLINK_STREAM_CACHE_PATH env override).
+    {
+        let cfg = reactor.config().await?.borrow().clone();
+        let path = stream_cache::resolve_path(cfg.stream_cache_path.as_deref());
+        if let Some(p) = path.as_ref() {
+            log::info!("Persisting learned stream types to {p:?}");
+        }
+        stream_cache::init(path);
+    }
 
     let global_cancel = CancellationToken::new();
 

@@ -108,7 +108,7 @@ pub(super) const MAGIC_HEADER_BCMEDIA_IFRAME: u32 = 0x63643030;
 pub(super) const MAGIC_HEADER_BCMEDIA_IFRAME_LAST: u32 = 0x63643039;
 
 /// Video Types for I/PFrame
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoType {
     /// H264 video data
     H264,

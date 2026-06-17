@@ -90,6 +90,12 @@ offline_timeout_secs = 0  # global default: seconds an RTSP viewer is served the
                           # indefinitely). Per-camera offline_timeout_secs overrides
                           # this. Values 1-59 are raised to a 60s floor.
 
+# Persist learned camera stream types to disk so that, after a restart, a known
+# camera's "stream not ready" placeholder can still be built before the camera is
+# reachable. Unset (default) = in-memory only. Overridable at runtime by the
+# NEOLINK_STREAM_CACHE_PATH environment variable (empty value disables it).
+# stream_cache_path = "/var/lib/neolink/stream-cache.json"
+
 # Optional TLS for the RTSP server. With a certificate set, connect with rtsps://.
 # The PEM must contain both the certificate and the private key.
 # certificate = "/path/to/server.pem"
