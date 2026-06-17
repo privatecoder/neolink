@@ -62,7 +62,7 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use std::collections::{HashMap, HashSet};
 use tokio::{
-    sync::mpsc::channel as mpsc,
+    sync::{broadcast, mpsc::channel as mpsc},
     task::JoinSet,
     time::{interval, sleep, Duration, MissedTickBehavior},
 };
@@ -347,6 +347,9 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                 let camera_motion = camera.clone();
                 let mqtt_motion = mqtt_instance.resubscribe().await?;
 
+                let camera_doorbell = camera.clone();
+                let mqtt_doorbell = mqtt_instance.resubscribe().await?;
+
                 let camera_snap = camera.clone();
                 let mqtt_snap = mqtt_instance.resubscribe().await?;
 
@@ -487,6 +490,35 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                             }?;
                         }
                     }, if config.enable_motion => v,
+                    // Handle the doorbell (visitor) presses
+                    v = async {
+                        let mut doorbell = camera_doorbell.doorbell_events().await?;
+                        loop {
+                            let v = async {
+                                match doorbell.recv().await {
+                                    Ok(_press) => {
+                                        // Discrete event, not state: publish one
+                                        // press, no retain, no idle/unknown.
+                                        mqtt_doorbell.send_message("status/doorbell", r#"{"event_type":"press"}"#, false).await.with_context(|| {
+                                            format!("{}: Failed to publish doorbell press", camera_name)
+                                        })?;
+                                    }
+                                    // Presses are rare; if we lag just carry on.
+                                    Err(broadcast::error::RecvError::Lagged(_)) => {},
+                                    Err(broadcast::error::RecvError::Closed) => {
+                                        return Err(anyhow!("{}: Doorbell channel closed", camera_name));
+                                    }
+                                }
+                                AnyResult::Ok(())
+                            }.await;
+                            match v.map_err(|e| e.downcast::<neolink_core::Error>()) {
+                                Err(Ok(neolink_core::Error::UnintelligibleReply{..})) => futures::future::pending().await,
+                                Ok(()) => AnyResult::Ok(()),
+                                Err(Ok(e)) => Err(e.into()),
+                                Err(Err(e)) => Err(e),
+                            }?;
+                        }
+                    }, if config.enable_doorbell => v,
                     // Handle the SNAP (image preview)
                     v = async {
                         let mut wait = IntervalStream::new({

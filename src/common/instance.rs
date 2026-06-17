@@ -9,13 +9,14 @@ use futures::TryFutureExt;
 use std::sync::{Arc, Weak};
 use tokio::{
     sync::{
-        mpsc::Sender as MpscSender, oneshot::channel as oneshot, watch::Receiver as WatchReceiver,
+        broadcast::Receiver as BroadcastReceiver, mpsc::Sender as MpscSender,
+        oneshot::channel as oneshot, watch::Receiver as WatchReceiver,
     },
     time::{sleep, Duration},
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{MdState, NeoCamCommand, Permit};
+use super::{DoorbellEvent, MdState, NeoCamCommand, Permit};
 use crate::{config::CameraConfig, AnyResult, Result};
 use neolink_core::bc_protocol::BcCamera;
 
@@ -238,6 +239,20 @@ impl NeoInstance {
         let (instance_tx, instance_rx) = oneshot();
         self.camera_control
             .send(NeoCamCommand::Motion(instance_tx))
+            .await?;
+        Ok(instance_rx.await?)
+    }
+
+    /// Subscribe to doorbell ("visitor") presses.
+    ///
+    /// These are decoded from the same alarm stream as motion and forwarded by
+    /// the single motion-detection thread, so this does not open a second
+    /// subscription to the camera. The returned receiver only sees presses that
+    /// arrive after it is created.
+    pub(crate) async fn doorbell_events(&self) -> Result<BroadcastReceiver<DoorbellEvent>> {
+        let (instance_tx, instance_rx) = oneshot();
+        self.camera_control
+            .send(NeoCamCommand::Doorbell(instance_tx))
             .await?;
         Ok(instance_rx.await?)
     }

@@ -5,6 +5,10 @@ use anyhow::Context;
 use std::sync::Arc;
 use tokio::{
     sync::{
+        broadcast::{
+            channel as broadcast, error::RecvError as BroadcastRecvError,
+            Receiver as BroadcastReceiver, Sender as BroadcastSender,
+        },
         mpsc::Receiver as MpscReceiver,
         oneshot::Sender as OneshotSender,
         watch::{channel as watch, Receiver as WatchReceiver, Sender as WatchSender},
@@ -25,8 +29,20 @@ pub(crate) enum MdState {
     Unknown,
 }
 
+/// A discrete doorbell ("visitor") press.
+///
+/// Unlike [`MdState`], doorbell presses are events rather than durable state, so
+/// they are delivered over a broadcast channel and never modelled as a watch.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DoorbellEvent {
+    /// When the press was observed
+    #[allow(dead_code)]
+    pub(crate) when: Instant,
+}
+
 pub(crate) struct NeoCamMdThread {
     md_watcher: Arc<WatchSender<MdState>>,
+    doorbell_sender: Arc<BroadcastSender<DoorbellEvent>>,
     md_request_rx: MpscReceiver<MdRequest>,
     cancel: CancellationToken,
     instance: NeoInstance,
@@ -39,8 +55,11 @@ impl NeoCamMdThread {
     ) -> Result<Self> {
         let (md_watcher, _) = watch(MdState::Unknown);
         let md_watcher = Arc::new(md_watcher);
+        let (doorbell_sender, _) = broadcast(50);
+        let doorbell_sender = Arc::new(doorbell_sender);
         Ok(Self {
             md_watcher,
+            doorbell_sender,
             md_request_rx,
             cancel: CancellationToken::new(),
             instance,
@@ -50,6 +69,7 @@ impl NeoCamMdThread {
     pub(crate) async fn run(&mut self) -> Result<()> {
         let thread_cancel = self.cancel.clone();
         let watcher = self.md_watcher.clone();
+        let doorbell_sender = self.doorbell_sender.clone();
         let md_instance = self.instance.clone();
         tokio::select! {
             _ = thread_cancel.cancelled() => {
@@ -63,6 +83,11 @@ impl NeoCamMdThread {
                         } => {
                           let _ = sender.send(self.md_watcher.subscribe());
                         },
+                        MdRequest::GetDoorbell {
+                            sender
+                        } => {
+                          let _ = sender.send(self.doorbell_sender.subscribe());
+                        },
                     }
                 }
                 Ok(())
@@ -71,23 +96,49 @@ impl NeoCamMdThread {
                 loop {
                     let r: AnyResult<()> = md_instance.run_passive_task(|cam| {
                         let watcher = watcher.clone();
+                        let doorbell_sender = doorbell_sender.clone();
                         Box::pin(
                         async move {
                             let mut md = cam.listen_on_motion().await.with_context(|| "Error in getting MD listen_on_motion")?;
+                            // Doorbell presses ride the same camera subscription:
+                            // they are decoded from the alarm stream alongside
+                            // motion, so there is no second subscription here.
+                            let mut doorbell = md.doorbell();
                             loop {
-                                let event = md.next_motion().await.with_context(|| "Error in getting MD next_motion")?;
-                                match event {
-                                    MotionStatus::Start(at) => {
-                                        watcher.send_replace(
-                                            MdState::Start(at.into())
-                                        );
+                                tokio::select! {
+                                    event = md.next_motion() => {
+                                        let event = event.with_context(|| "Error in getting MD next_motion")?;
+                                        match event {
+                                            MotionStatus::Start(at) => {
+                                                watcher.send_replace(
+                                                    MdState::Start(at.into())
+                                                );
+                                            }
+                                            MotionStatus::Stop(at) => {
+                                                watcher.send_replace(
+                                                    MdState::Stop(at.into())
+                                                );
+                                            }
+                                            MotionStatus::NoChange(_) => {},
+                                        }
                                     }
-                                    MotionStatus::Stop(at) => {
-                                        watcher.send_replace(
-                                            MdState::Stop(at.into())
-                                        );
+                                    press = doorbell.recv() => {
+                                        match press {
+                                            Ok(when) => {
+                                                // No subscribers is fine; the
+                                                // press is simply dropped.
+                                                let _ = doorbell_sender.send(DoorbellEvent { when: when.into() });
+                                            }
+                                            // Rare presses mean lagging is
+                                            // unlikely; if it happens, skip on.
+                                            Err(BroadcastRecvError::Lagged(_)) => {},
+                                            // The motion stream ended; surface it
+                                            // so the task restarts like next_motion.
+                                            Err(BroadcastRecvError::Closed) => {
+                                                return Err(anyhow::anyhow!("Doorbell stream closed"));
+                                            }
+                                        }
                                     }
-                                    MotionStatus::NoChange(_) => {},
                                 }
                             }
                         }
@@ -112,5 +163,8 @@ impl Drop for NeoCamMdThread {
 pub(crate) enum MdRequest {
     Get {
         sender: OneshotSender<WatchReceiver<MdState>>,
+    },
+    GetDoorbell {
+        sender: OneshotSender<BroadcastReceiver<DoorbellEvent>>,
     },
 }

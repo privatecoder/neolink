@@ -9,6 +9,7 @@ use futures::stream::StreamExt;
 use std::sync::Weak;
 use tokio::{
     sync::{
+        broadcast::Receiver as BroadcastReceiver,
         mpsc::{channel as mpsc, Sender as MpscSender},
         oneshot::{channel as oneshot, Sender as OneshotSender},
         watch::{channel as watch, Receiver as WatchReceiver, Sender as WatchSender},
@@ -20,8 +21,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    MdRequest, MdState, NeoCamMdThread, NeoCamThread, NeoCamThreadState, NeoInstance, Permit,
-    UseCounter,
+    DoorbellEvent, MdRequest, MdState, NeoCamMdThread, NeoCamThread, NeoCamThreadState,
+    NeoInstance, Permit, UseCounter,
 };
 use crate::{
     config::{CameraConfig, ConnectMode},
@@ -34,6 +35,7 @@ pub(crate) enum NeoCamCommand {
     HangUp,
     Instance(OneshotSender<Result<NeoInstance>>),
     Motion(OneshotSender<WatchReceiver<MdState>>),
+    Doorbell(OneshotSender<BroadcastReceiver<DoorbellEvent>>),
     Config(OneshotSender<WatchReceiver<CameraConfig>>),
     Disconnect(OneshotSender<()>),
     Connect(OneshotSender<()>),
@@ -102,6 +104,13 @@ impl NeoCam {
                             NeoCamCommand::Motion(sender) => {
                                 md_request_tx.send(
                                     MdRequest::Get {
+                                        sender,
+                                    }
+                                ).await?;
+                            },
+                            NeoCamCommand::Doorbell(sender) => {
+                                md_request_tx.send(
+                                    MdRequest::GetDoorbell {
                                         sender,
                                     }
                                 ).await?;

@@ -10,6 +10,40 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## 0.7.10
+
+Doorbell (visitor) button-press detection, reported separately from motion.
+
+### Doorbell events split out of the motion/alarm stream
+
+- Reolink cameras report a doorbell press as a `visitor` status on the same
+  alarm stream that carries motion. The alarm decoder now distinguishes these:
+  `visitor` is decoded as a doorbell press, motion statuses (`MD`, `PIR`, AI
+  types) as motion start, and `none` as motion stop. Statuses that arrive
+  comma-separated in a single message (for example `visitor,MD`) are decoded
+  independently rather than collapsed, so a press that coincides with motion
+  surfaces both. Existing motion behaviour for RTSP gating is unchanged.
+- Doorbell presses are routed out of the existing motion-detection thread on a
+  separate channel, so no additional camera subscription is opened.
+
+### Per-camera `enable_doorbell` toggle (opt-in)
+
+- New `[cameras.mqtt]` option `enable_doorbell`, default `false`. When enabled,
+  each press publishes `{"event_type":"press"}` to
+  `neolink/{camera}/status/doorbell`. It is a discrete event, not a state: the
+  message is not retained and no idle/clear value is published. Cameras without a
+  doorbell never emit a `visitor` status, so enabling the option is a no-op for
+  them.
+
+### Home Assistant discovery for doorbell
+
+- New `doorbell` discovery feature (aliases `db`, `visitor`) published as a Home
+  Assistant `event` entity with `device_class` `doorbell` and `event_types`
+  `["press"]`, added via `features = ["doorbell"]` under
+  `[cameras.mqtt.discovery]`.
+
+---
+
 ## 0.7.9
 
 Stability fix for long-running streams: a single slow RTSP client could stall the
