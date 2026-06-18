@@ -60,16 +60,18 @@ pub enum Error {
     #[error("Camera responded with Err during login")]
     CameraLoginFail,
 
-    /// Raised when an assembled snapshot is shorter than the size the camera
-    /// declared, i.e. a binary chunk was lost during the transfer and the JPEG
-    /// is truncated. The caller should retry the snap rather than use the
-    /// partial image.
-    #[error("Incomplete snapshot: got {actual} of {expected} bytes")]
+    /// Raised when an assembled snapshot is not a structurally complete JPEG
+    /// (missing the SOI/EOI markers), i.e. the camera returned a truncated
+    /// image. The byte count alone cannot detect this because the camera may
+    /// declare the truncated length as the full `picture_size`, so completeness
+    /// is judged from the JPEG markers instead. The caller should retry the snap
+    /// rather than use the partial image.
+    #[error("Incomplete snapshot ({actual} bytes): {reason}")]
     IncompleteSnapshot {
-        /// The size the camera declared for the snapshot
-        expected: usize,
         /// The number of bytes actually assembled
         actual: usize,
+        /// Why the snapshot was judged incomplete, e.g. "missing EOI marker"
+        reason: &'static str,
     },
 
     /// Raised when a connection is dropped.

@@ -548,8 +548,8 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                                         // is transient. Skip this update, keep the last retained good
                                         // frame, and try again on the next interval rather than tearing
                                         // down the preview loop.
-                                        Ok(neolink_core::Error::IncompleteSnapshot{expected, actual}) => {
-                                            log::debug!("{}: incomplete snapshot ({} of {} bytes), keeping last preview", camera_name, actual, expected);
+                                        Ok(neolink_core::Error::IncompleteSnapshot{actual, reason}) => {
+                                            log::debug!("{}: incomplete snapshot ({} bytes: {}), keeping last preview", camera_name, actual, reason);
                                             continue;
                                         },
                                         Ok(e) => Err(e.into()),
