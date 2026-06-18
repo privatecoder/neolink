@@ -119,12 +119,7 @@ impl BcCamera {
                         channel_id: self.channel_id,
                         logic_channel: Some(self.channel_id),
                         time: 0,
-                        // Request the complete full-resolution frame. With
-                        // full_frame=0 the camera returns a truncated ~15 KB
-                        // preview slice (no EOI marker) yet declares that
-                        // truncated length as picture_size, so it cannot be
-                        // detected by byte count alone.
-                        full_frame: Some(1),
+                        full_frame: Some(0),
                         stream_type: Some("main".to_string()),
                         ..Default::default()
                     }),

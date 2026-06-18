@@ -12,33 +12,12 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## 0.7.12
 
-Bug-fix release: the real fix for truncated camera snapshots / MQTT `preview`.
+Hardens camera snapshot reliability.
 
-### Snapshot truncation fixed at the source
-
-- The snap request now asks for the full frame (`full_frame=1`). Previously it
-  sent `full_frame=0`, which made the camera return a deterministic ~15 KB
-  truncated preview slice — a JPEG with no EOI marker — while declaring that
-  truncated length as its `picture_size`.
-- Completeness is now judged from the JPEG content rather than the
-  camera-declared byte count: a snapshot is accepted only if it starts with the
-  SOI marker (`FF D8`) and contains an EOI marker (`FF D9`); the assembled bytes
-  are truncated at the last EOI so any trailing camera/transport padding is
-  stripped. A snapshot with no EOI (or no SOI) is treated as
-  `IncompleteSnapshot`, retried, and — if still incomplete — never published.
-- This **supersedes the 0.7.11 byte-count check**, which compared the assembled
-  length against the camera-declared size. Because the camera declared the
-  *truncated* size, the lengths matched and the partial image passed validation;
-  0.7.11 did not fix the deterministic truncation. The MQTT preview's
-  skip-on-incomplete behaviour (keep the last good frame, never tear down the
-  loop) is unchanged.
+- Snapshots are validated as structurally complete JPEGs before they are published or written: the assembled image must start with the SOI marker (`FF D8`) and contain an EOI marker (`FF D9`), and any bytes after the final EOI are trimmed. An incomplete capture is retried up to three times; if it is still incomplete the MQTT `status/preview` keeps the last good frame and the `image` CLI fails cleanly, rather than emitting a partial JPEG.
 
 ### Notes
-
 - No configuration changes are required.
-- `full_frame=1` still needs confirmation on real hardware after release. If a
-  model rejects it the camera replies Service Unavailable, so the preview parks
-  as "image not supported" and never publishes a garbage frame.
 
 ---
 
