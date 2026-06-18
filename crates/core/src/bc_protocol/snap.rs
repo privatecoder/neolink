@@ -2,10 +2,63 @@
 
 use super::{BcCamera, Error, Result};
 use crate::bc::{model::*, xml::*};
+use std::time::Duration;
+
+/// Number of times a short (truncated) snapshot is retried before giving up.
+const SNAP_MAX_ATTEMPTS: usize = 3;
+/// Delay between snapshot retries, giving a transient packet loss time to clear.
+const SNAP_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Decide whether an assembled snapshot is complete.
+///
+/// The camera declares the JPEG size up front (`expected`). A lost binary chunk
+/// during the transfer (e.g. a UDP gap-skip) leaves us with fewer bytes than
+/// declared, producing a truncated image that still decodes to only a fraction
+/// of the frame. Treat any short result as an error so the caller can retry
+/// rather than publish a partial preview. Extra trailing bytes (padding) are
+/// tolerated.
+fn check_snapshot_complete(actual: usize, expected: usize) -> Result<()> {
+    if actual < expected {
+        Err(Error::IncompleteSnapshot { expected, actual })
+    } else {
+        Ok(())
+    }
+}
 
 impl BcCamera {
     /// Get the snapshot image
+    ///
+    /// A snapshot is assembled from binary chunks sent by the camera; if one is
+    /// lost mid-transfer the result is a truncated JPEG. When that happens the
+    /// whole snap is retried a few times before returning
+    /// [`Error::IncompleteSnapshot`], so callers never receive a partial image.
     pub async fn get_snapshot(&self) -> Result<Vec<u8>> {
+        let mut last_err = None;
+        for attempt in 0..SNAP_MAX_ATTEMPTS {
+            if attempt > 0 {
+                log::debug!(
+                    "Retrying snapshot (attempt {} of {})",
+                    attempt + 1,
+                    SNAP_MAX_ATTEMPTS
+                );
+                tokio::time::sleep(SNAP_RETRY_DELAY).await;
+            }
+            match self.get_snapshot_once().await {
+                Err(e @ Error::IncompleteSnapshot { .. }) => {
+                    log::debug!("{}", e);
+                    last_err = Some(e);
+                    continue;
+                }
+                other => return other,
+            }
+        }
+        // All attempts came back short.
+        Err(last_err.expect("SNAP_MAX_ATTEMPTS is non-zero so a result was recorded"))
+    }
+
+    /// Perform a single snapshot fetch. Returns [`Error::IncompleteSnapshot`] if
+    /// the assembled image is shorter than the camera-declared size.
+    async fn get_snapshot_once(&self) -> Result<Vec<u8>> {
         let connection = self.get_connection();
         let msg_num = self.new_message_num();
         let mut sub_get = connection.subscribe(MSG_ID_SNAP, msg_num).await?;
@@ -124,9 +177,7 @@ impl BcCamera {
                         result.len(),
                         expected_size
                     );
-                    if result.len() != expected_size {
-                        log::debug!("Snap did not recieve expected number of bytes");
-                    }
+                    check_snapshot_complete(result.len(), expected_size)?;
                 } else {
                     return Err(Error::UnintelligibleReply {
                         reply: std::sync::Arc::new(Box::new(msg)),
@@ -156,5 +207,34 @@ impl BcCamera {
                 why: "Expected Snap xml but it was not recieved",
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complete_when_exact() {
+        assert!(check_snapshot_complete(1024, 1024).is_ok());
+    }
+
+    #[test]
+    fn complete_when_extra_trailing_bytes() {
+        // Cameras occasionally append padding; more bytes than declared is not
+        // a truncated image, so it is not an error.
+        assert!(check_snapshot_complete(1030, 1024).is_ok());
+    }
+
+    #[test]
+    fn errors_when_short() {
+        let err = check_snapshot_complete(512, 1024);
+        assert!(matches!(
+            err,
+            Err(Error::IncompleteSnapshot {
+                expected: 1024,
+                actual: 512
+            })
+        ));
     }
 }

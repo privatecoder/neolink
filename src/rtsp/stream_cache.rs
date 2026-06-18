@@ -194,7 +194,10 @@ fn audio_from_dto(a: AudioDto) -> AudioType {
 /// AAC audio missing its rate/channels has the audio dropped (video kept).
 fn dto_to_entry(dto: CacheEntryDto) -> Option<(StreamCacheKey, StreamTypeCache)> {
     let Some(stream) = str_to_stream(&dto.stream) else {
-        log::warn!("stream cache: dropping entry with unknown stream {:?}", dto.stream);
+        log::warn!(
+            "stream cache: dropping entry with unknown stream {:?}",
+            dto.stream
+        );
         return None;
     };
     let vid_type = match dto.video.as_deref() {
@@ -477,9 +480,7 @@ fn resolve_path_from(env: Option<&str>, config_value: Option<&str>) -> Option<Pa
             Some(PathBuf::from(env))
         };
     }
-    config_value
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
+    config_value.filter(|s| !s.is_empty()).map(PathBuf::from)
 }
 
 #[cfg(test)]
@@ -515,7 +516,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        p.push(format!("neolink-stream-cache-test-{tag}-{}-{nanos}", std::process::id()));
+        p.push(format!(
+            "neolink-stream-cache-test-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&p).unwrap();
         p
     }
@@ -713,7 +717,10 @@ mod tests {
         atomic_write(&path, &serialize_map(&written)).unwrap();
 
         let reloaded = StreamCache::load(Some(path.clone()));
-        assert_eq!(reloaded.get(&key("cam-uid-1", 0, StreamKind::Main)), Some(sample()));
+        assert_eq!(
+            reloaded.get(&key("cam-uid-1", 0, StreamKind::Main)),
+            Some(sample())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -728,7 +735,10 @@ mod tests {
         std::fs::write(dir.join("cache.json.tmp"), "garbage not json").unwrap();
 
         let reloaded = StreamCache::load(Some(path));
-        assert_eq!(reloaded.get(&key("cam-uid-1", 0, StreamKind::Main)), Some(sample()));
+        assert_eq!(
+            reloaded.get(&key("cam-uid-1", 0, StreamKind::Main)),
+            Some(sample())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -747,7 +757,10 @@ mod tests {
 
         // Original file must be untouched and still valid.
         let reloaded = StreamCache::load(Some(path));
-        assert_eq!(reloaded.get(&key("cam-uid-1", 0, StreamKind::Main)), Some(sample()));
+        assert_eq!(
+            reloaded.get(&key("cam-uid-1", 0, StreamKind::Main)),
+            Some(sample())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -838,7 +851,8 @@ mod tests {
     #[test]
     fn key_prefers_uid_then_address_then_name() {
         assert_eq!(
-            StreamCacheKey::new(Some("uid1"), Some("1.2.3.4"), "name", 0, StreamKind::Main).camera_id,
+            StreamCacheKey::new(Some("uid1"), Some("1.2.3.4"), "name", 0, StreamKind::Main)
+                .camera_id,
             "uid1"
         );
         assert_eq!(

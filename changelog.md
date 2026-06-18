@@ -10,6 +10,42 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## 0.7.11
+
+Bug-fix release: snapshots/MQTT preview no longer truncate, and the dead
+`status/notification` MQTT topic is removed.
+
+### Snapshot no longer returns a truncated JPEG
+
+- `get_snapshot` assembles the snapshot from binary chunks the camera streams.
+  If a chunk was lost mid-transfer (for example a UDP gap-skip during the one-shot
+  fetch), the assembled image was shorter than the size the camera declared, and
+  the partial JPEG was returned anyway — decoding to only the top fraction of the
+  frame. This surfaced as a truncated MQTT `status/preview` image and as truncated
+  files written by the `image` CLI subcommand.
+- `get_snapshot` now treats a short result as an error: it retries the whole snap
+  up to three times (with a short delay) and, if every attempt is still short,
+  returns a new `IncompleteSnapshot` error instead of `Ok(partial)`. The
+  completeness check tolerates extra trailing padding bytes.
+- The MQTT preview loop treats `IncompleteSnapshot` as a transient skip: it keeps
+  the last retained good frame and tries again on the next interval rather than
+  tearing down the preview task.
+
+### Removed the dead `status/notification` MQTT topic
+
+- `status/notification` was a vestige of the push-notification feature removed in
+  0.7.0 (Google FCM shutdown). Nothing has updated it since, yet it published a
+  retained `"unknown"` that persisted on the broker indefinitely. Neolink now
+  publishes a retained empty payload to that topic once at startup, which clears
+  the stale retained value, and never publishes it again. No other behaviour
+  depended on the topic.
+
+### Notes
+
+- No configuration changes are required.
+
+---
+
 ## 0.7.10
 
 Doorbell (visitor) button-press detection, reported separately from motion.
