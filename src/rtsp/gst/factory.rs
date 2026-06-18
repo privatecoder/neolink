@@ -212,9 +212,7 @@ impl RTSPMediaFactoryImpl for NeoMediaFactoryImpl {
                 // Defensive: never return None/empty from the from-scratch path.
                 // That triggers GStreamer CRITICALs and serves the client nothing.
                 // Hand back the splash placeholder instead.
-                log::warn!(
-                    "build_pipeline returned None from scratch; serving splash placeholder"
-                );
+                log::warn!("build_pipeline returned None from scratch; serving splash placeholder");
                 build_splash_fallback()
             }
             Err(e) => {
