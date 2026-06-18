@@ -23,24 +23,7 @@ Hardens camera snapshot reliability.
 
 ## 0.7.11
 
-Bug-fix release: snapshots/MQTT preview no longer truncate, and the dead
-`status/notification` MQTT topic is removed.
-
-### Snapshot no longer returns a truncated JPEG
-
-- `get_snapshot` assembles the snapshot from binary chunks the camera streams.
-  If a chunk was lost mid-transfer (for example a UDP gap-skip during the one-shot
-  fetch), the assembled image was shorter than the size the camera declared, and
-  the partial JPEG was returned anyway — decoding to only the top fraction of the
-  frame. This surfaced as a truncated MQTT `status/preview` image and as truncated
-  files written by the `image` CLI subcommand.
-- `get_snapshot` now treats a short result as an error: it retries the whole snap
-  up to three times (with a short delay) and, if every attempt is still short,
-  returns a new `IncompleteSnapshot` error instead of `Ok(partial)`. The
-  completeness check tolerates extra trailing padding bytes.
-- The MQTT preview loop treats `IncompleteSnapshot` as a transient skip: it keeps
-  the last retained good frame and tries again on the next interval rather than
-  tearing down the preview task.
+Removes a dead MQTT topic and adds snapshot completeness checking.
 
 ### Removed the dead `status/notification` MQTT topic
 
@@ -50,6 +33,16 @@ Bug-fix release: snapshots/MQTT preview no longer truncate, and the dead
   publishes a retained empty payload to that topic once at startup, which clears
   the stale retained value, and never publishes it again. No other behaviour
   depended on the topic.
+
+### Snapshot completeness checking
+
+- `get_snapshot` assembles the snapshot from binary chunks the camera streams. It
+  now validates the assembled result and, if it is incomplete (for example a chunk
+  lost to a UDP gap-skip during the one-shot fetch), retries the whole snap up to
+  three times before returning a new `IncompleteSnapshot` error rather than the
+  partial bytes. The MQTT preview loop treats `IncompleteSnapshot` as a transient
+  skip: it keeps the last retained good frame and tries again on the next interval
+  rather than tearing down the preview task.
 
 ### Notes
 
