@@ -69,3 +69,26 @@ impl Decoder for BcUdpCodex {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assert_matches::assert_matches;
+
+    #[test]
+    fn foreign_datagram_decodes_to_nom_error() {
+        // A real captured stray datagram beginning with "NEXU". Its first 4 bytes
+        // match none of the three BCUDP magics (0x2a87cf3a / 0x2a87cf20 /
+        // 0x2a87cf10), so the magic `verify` fails and decoding rejects it as a
+        // NomError (not NomIncomplete, since the failure is at the 4-byte magic).
+        let bytes = [
+            0x4E, 0x45, 0x58, 0x55, 0x01, 0x01, 0x0C, 0xC5, 0x74, 0xEF, 0x60, 0xF3, 0xE1, 0x14,
+            0x00, 0x00,
+        ];
+        let mut buf = BytesMut::from(&bytes[..]);
+
+        let result = BcUdpCodex::new().decode(&mut buf);
+
+        assert_matches!(result, Err(Error::NomError(_)));
+    }
+}
