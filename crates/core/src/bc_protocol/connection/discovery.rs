@@ -36,6 +36,18 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tokio_util::udp::UdpFramed;
 
+/// Returns true if `e` is a foreign/corrupt datagram that should be skipped
+/// rather than treated as fatal. `UdpFramed` decodes each datagram
+/// independently, so a single unparseable packet (e.g. a NAT keepalive, an
+/// internet scanner, or another protocol arriving on the discovery socket
+/// during P2P hole-punching) does not desync the stream — only a Baichuan
+/// magic mismatch, surfaced as `Error::NomError`, lands here. Every other
+/// error kind (relay/camera terminate signals, real socket IO failures) stays
+/// fatal so the reader loop tears down as before.
+fn is_unparseable_datagram(e: &Error) -> bool {
+    matches!(e, Error::NomError(_))
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RegisterResult {
     reg: SocketAddr,
@@ -227,6 +239,16 @@ impl Discoverer {
                             Some(Ok(bcudp)) => {
                                 // Only discovery packets should be possible atm
                                 log::debug!("Got non Discovery during discovery: {:?}", bcudp);
+                            }
+                            Some(Err(e)) if is_unparseable_datagram(&e) => {
+                                // A foreign/corrupt datagram (not Baichuan) landed on
+                                // the discovery socket. UdpFramed decodes each datagram
+                                // independently, so skipping it does not desync the
+                                // stream; drop it and keep reading instead of aborting
+                                // discovery.
+                                log::debug!(
+                                    "Ignoring unparseable datagram on discovery socket: {e:?}"
+                                );
                             }
                             Some(Err(e)) => {
                                 log::error!("Error on discovery socket: {:?}", e);
@@ -1776,3 +1798,26 @@ async fn connect() -> Result<UdpSocket> {
     ```
 
 */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nom_error_is_an_unparseable_datagram() {
+        // A foreign/corrupt datagram surfaces as NomError and should be skipped.
+        assert!(is_unparseable_datagram(&Error::NomError(
+            "Magic is invalid".to_string()
+        )));
+    }
+
+    #[test]
+    fn meaningful_errors_are_not_unparseable_datagrams() {
+        // Relay/camera terminate signals and real socket failures must stay fatal.
+        assert!(!is_unparseable_datagram(&Error::RelayTerminate));
+        assert!(!is_unparseable_datagram(&Error::CameraTerminate));
+        assert!(!is_unparseable_datagram(&Error::Io(Arc::new(
+            std::io::Error::other("boom")
+        ))));
+    }
+}
