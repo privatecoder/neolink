@@ -323,10 +323,14 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                     .send_message("status/motion", "unknown", true)
                     .await
                     .with_context(|| format!("Failed to publish motion unknown for {}", camera_name))?;
+                // `status/notification` is a vestige of the push-notification feature removed in
+                // 0.7.0 (Google FCM shutdown); nothing updates it anymore. It used to publish a
+                // retained "unknown", which persists on the broker forever. Publish a retained
+                // empty payload once to clear that stale retained message, then never touch it again.
                 mqtt_instance
-                    .send_message("status/notification", "unknown", true)
+                    .send_message("status/notification", "", true)
                     .await
-                    .with_context(|| format!("Failed to publish push notification unknown for {}", camera_name))?;
+                    .with_context(|| format!("Failed to clear retained notification for {}", camera_name))?;
                 let _drop_message2 = mqtt_instance.last_will("status/motion", "unknown").await?;
 
                 if let Some(discovery_config) = config.discovery.as_ref() {
@@ -539,6 +543,14 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                                         Ok(neolink_core::Error::CameraServiceUnavailable{..}) => {
                                             log::debug!("Image not supported");
                                             futures::future::pending().await
+                                        },
+                                        // A truncated snapshot (a binary chunk was lost mid-transfer)
+                                        // is transient. Skip this update, keep the last retained good
+                                        // frame, and try again on the next interval rather than tearing
+                                        // down the preview loop.
+                                        Ok(neolink_core::Error::IncompleteSnapshot{expected, actual}) => {
+                                            log::debug!("{}: incomplete snapshot ({} of {} bytes), keeping last preview", camera_name, actual, expected);
+                                            continue;
                                         },
                                         Ok(e) => Err(e.into()),
                                         Err(e) => Err(e),

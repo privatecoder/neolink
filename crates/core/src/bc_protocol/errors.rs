@@ -60,6 +60,18 @@ pub enum Error {
     #[error("Camera responded with Err during login")]
     CameraLoginFail,
 
+    /// Raised when an assembled snapshot is shorter than the size the camera
+    /// declared, i.e. a binary chunk was lost during the transfer and the JPEG
+    /// is truncated. The caller should retry the snap rather than use the
+    /// partial image.
+    #[error("Incomplete snapshot: got {actual} of {expected} bytes")]
+    IncompleteSnapshot {
+        /// The size the camera declared for the snapshot
+        expected: usize,
+        /// The number of bytes actually assembled
+        actual: usize,
+    },
+
     /// Raised when a connection is dropped.
     #[error("Dropped connection")]
     DroppedConnection,
