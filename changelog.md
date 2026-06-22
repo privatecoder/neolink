@@ -10,6 +10,65 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## 0.7.14
+
+Security and robustness release: hardens the protocol parsers against malformed
+camera/network input, fixes several MQTT / Home Assistant integration bugs,
+improves connection recovery and RTSP cleanup, fixes a handful of CLI issues,
+and includes an internal cleanup pass. From a multi-round audit, independently
+reviewed.
+
+### Hardening (untrusted input)
+
+- The BC, BC-media and BC-UDP parsers now bounds-check every wire-supplied
+  length/offset before slicing, subtracting, or buffering: oversized declared
+  bodies/frames are rejected (16 MiB cap) instead of buffered toward a huge
+  allocation, length underflows return a parse error, and a malformed
+  UDP-discovery checksum is a skippable parse error rather than a panic. A
+  malformed packet can no longer crash neolink or exhaust memory.
+
+### Fixes — MQTT / Home Assistant
+
+- Command acknowledgements for **reboot**, **ptz/preset** and **ptz/assign**
+  went to `control/ir`; they now reply on their own topics. The
+  `query/ptz/preset` data and ack now use `status/ptz/preset` / `query/ptz/preset`.
+- Removing a camera from the config now clears its retained Home Assistant
+  discovery entities (previously they lingered as ghosts), and re-adding a
+  removed camera now restarts it (a stale internal entry used to block it).
+- The floodlight light entity now reflects real state in Home Assistant, and
+  `control/wakeup` validates/caps its input.
+
+### Fixes — connection / RTSP lifecycle
+
+- A camera that fails login now recovers on a config reload (e.g. after fixing a
+  wrong password) instead of staying dead until a restart.
+- Runtime config reloads apply the offline-timeout safety floor and inheritance
+  identically to startup.
+- RTSP per-client cleanup is prompt (no leaked forwarder/stream subscription when
+  a client disconnects while its camera is quiet), gstreamer buffer pools are
+  deactivated on every exit path, a pipeline-setup failure serves the splash
+  placeholder instead of a hard error, and the video clock keeps advancing across
+  forwarder-queue frame drops (avoiding a PTS jump / A-V drift).
+
+### Fixes — CLI
+
+- `ptz control … <speed 0>` no longer panics; non-UTF-8 / spaced snapshot paths
+  work; the `image` snapshot no longer leaves a 0-byte file on failure;
+  `services … port` is validated as a 16-bit port; on/off arguments are
+  case-insensitive; `tls_client_auth` accepts the `requested`/`required`
+  spellings the sample config documents.
+
+### Notes
+
+- No configuration changes are required.
+- Internal cleanup only (no behaviour change): named constants for duplicated
+  literals, clippy cleanup, and a spelling pass over log/error messages.
+- Verified: `cargo build`, `cargo test`, `cargo clippy`, `cargo fmt` all clean.
+- The video-clock change touches the single-media-clock path; a quick A/V-sync
+  sanity check after deploying is worthwhile.
+
+---
+
 ## 0.7.13
 
 Robustness fixes and a code-quality pass.
