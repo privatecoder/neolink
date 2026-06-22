@@ -168,9 +168,11 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
                 PortAction::Set { enabled, .. } => Some(*enabled),
                 _ => None,
             };
+            // CLI ports are validated as u16 (rejecting > 65535); the camera
+            // service methods take u32, so widen here.
             let port = match &action {
-                PortAction::Port { port } => Some(*port),
-                PortAction::Set { port, .. } => Some(*port),
+                PortAction::Port { port } => Some(u32::from(*port)),
+                PortAction::Set { port, .. } => Some(u32::from(*port)),
                 _ => None,
             };
             match opt.service {

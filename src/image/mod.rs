@@ -32,6 +32,9 @@ mod gst;
 use crate::common::NeoReactor;
 pub(crate) use cmdline::Opt;
 
+/// Buffer capacity for the media-frame mpsc channel feeding a consumer.
+const MEDIA_CHANNEL_CAP: usize = 500;
+
 /// Entry point for the image subcommand
 ///
 /// Opt is the command line options
@@ -39,7 +42,7 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
     let camera = reactor.get(&opt.camera).await?;
 
     if opt.use_stream {
-        let (stream_data_tx, mut stream_data_rx) = tokio::sync::mpsc::channel(500);
+        let (stream_data_tx, mut stream_data_rx) = tokio::sync::mpsc::channel(MEDIA_CHANNEL_CAP);
 
         // Spawn a video stream
         let thread_camera = camera.clone();
@@ -82,7 +85,7 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
         let buf = stream_data_rx
             .recv()
             .await
-            .ok_or(anyhow!("No frames recieved"))?;
+            .ok_or(anyhow!("No frames received"))?;
 
         let mut sender = gst::from_input(vid_type, &opt.file_path).await?;
         sender.send(buf).await?; // Send first iframe
@@ -108,7 +111,9 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
         // Simply use the snap command
         debug!("Using the snap command");
         let file_path = opt.file_path.with_extension("jpeg");
-        let mut buffer = File::create(file_path).await?;
+        // Fetch the snapshot BEFORE touching the filesystem. Creating the file
+        // first would truncate any existing file (and leave a 0-byte file behind)
+        // if the snapshot fetch then fails.
         let jpeg_data = camera
             .run_task(|camera| Box::pin(async move { Ok(camera.get_snapshot().await?) }))
             .await;
@@ -116,6 +121,7 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
             log::debug!("jpeg_data: {:?}", jpeg_data);
         }
         let jpeg_data = jpeg_data?;
+        let mut buffer = File::create(file_path).await?;
         buffer.write_all(jpeg_data.as_slice()).await?;
     }
 

@@ -12,7 +12,7 @@
 //! ---
 //!
 //! # Payloads
-//! Messages contain one-two payloads seperated by the payload_offset in the header
+//! Messages contain one-two payloads separated by the payload_offset in the header
 //!
 //! ## Extension Payload
 //! The first payload prior to the payload_offset is the extension xml

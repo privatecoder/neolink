@@ -73,7 +73,16 @@ fn udp_disc(buf: &[u8]) -> IResult<&[u8], UdpDiscovery> {
     let (buf, enc_data_slice) = take(payload_size)(buf)?;
 
     let actual_checksum = calc_crc(enc_data_slice);
-    assert_eq!(checksum, actual_checksum);
+    if checksum != actual_checksum {
+        // A malformed/foreign UDP discovery datagram (wire-supplied checksum and
+        // payload) must be rejected as a parse error so the caller can skip it,
+        // not panic the whole process via `assert_eq!`.
+        return Err(Err::Error(make_error(
+            buf,
+            "DISC: checksum mismatch",
+            ErrorKind::Verify,
+        )));
+    }
 
     let decrypted_payload = decrypt(tid, enc_data_slice);
     let payload = UdpXml::try_parse(decrypted_payload.as_slice()).map_err(|e| {
@@ -283,6 +292,25 @@ mod tests {
                 payload: payload_data
             })) if payload_data.len() == 1176
         );
+    }
+
+    #[test]
+    // A discovery datagram whose checksum does not match the CRC of its payload
+    // (malformed / foreign datagram) must be rejected as a parse error so the
+    // caller can skip it, rather than panicking via `assert_eq!`.
+    fn rejects_bad_discovery_checksum() {
+        init();
+
+        let mut sample = include_bytes!("samples/udp_negotiate_disc.bin").to_vec();
+        // The checksum field sits at bytes 16..20 (after magic, payload_size,
+        // unknown_a and tid). Corrupt it so it no longer matches.
+        sample[16] ^= 0xFF;
+
+        match BcUdp::deserialize(&mut BytesMut::from(&sample[..])) {
+            Ok(_) => panic!("expected a parse error"),
+            Err(Error::NomIncomplete(_)) => panic!("expected a hard error, got incomplete"),
+            Err(_) => {}
+        }
     }
 
     #[test]

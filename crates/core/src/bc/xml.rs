@@ -42,7 +42,7 @@ pub struct BcXml {
     #[serde(rename = "SystemGeneral", skip_serializing_if = "Option::is_none")]
     /// SystemGeneral xml is sent or recieved as part of the clock get/setting
     pub system_general: Option<SystemGeneral>,
-    /// Received as part of the Genral system info request
+    /// Received as part of the General system info request
     #[serde(rename = "Norm", skip_serializing_if = "Option::is_none")]
     pub norm: Option<Norm>,
     /// Received as part of the LEDState info request
@@ -75,19 +75,19 @@ pub struct BcXml {
     /// Sent or received for the PTZ preset functionality
     #[serde(rename = "PtzPreset", skip_serializing_if = "Option::is_none")]
     pub ptz_preset: Option<PtzPreset>,
-    /// Recieved on login/low battery events
+    /// Received on login/low battery events
     #[serde(rename = "BatteryList", skip_serializing_if = "Option::is_none")]
     pub battery_list: Option<BatteryList>,
-    /// Recieved on request for battery info
+    /// Received on request for battery info
     #[serde(rename = "BatteryInfo", skip_serializing_if = "Option::is_none")]
     pub battery_info: Option<BatteryInfo>,
-    /// Recieved on request for a users persmissions/capabilitoes
+    /// Received on request for a users permissions/capabilities
     #[serde(rename = "AbilityInfo", skip_serializing_if = "Option::is_none")]
     pub ability_info: Option<AbilityInfo>,
-    /// Recieved on request for a link type
+    /// Received on request for a link type
     #[serde(rename = "LinkType", skip_serializing_if = "Option::is_none")]
     pub link_type: Option<LinkType>,
-    /// Recieved AND send for the snap message
+    /// Received AND send for the snap message
     #[serde(rename = "Snap", skip_serializing_if = "Option::is_none")]
     pub snap: Option<Snap>,
     /// The list of streams and their configuration
@@ -310,7 +310,7 @@ pub struct Extension {
     #[serde(rename = "userName", skip_serializing_if = "Option::is_none")]
     pub user_name: Option<String>,
     /// Certain requests such as `AbilitySupport` require details such as what type of
-    /// abilities are you intested in. This is a comma seperated list such as
+    /// abilities are you interested in. This is a comma separated list such as
     /// `"system, network, alarm, record, video, image"`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
@@ -521,7 +521,7 @@ pub struct AlarmHandle {
 pub struct AlarmHandleItem {
     /// The channel ID
     pub channel: u8,
-    /// The handle type: Known values, comma seperated list of snap,rec,push
+    /// The handle type: Known values, comma separated list of snap,rec,push
     #[serde(rename = "handleType")]
     pub handle_type: String,
 }
@@ -630,7 +630,7 @@ pub struct AlarmEvent {
     /// XML Version
     #[serde(rename = "@version")]
     pub version: String,
-    /// The channel the event occured on. Usually zero unless from an NVR
+    /// The channel the event occurred on. Usually zero unless from an NVR
     #[serde(rename = "channelId")]
     pub channel_id: u8,
     /// Motion status. Known values are `"MD"` or `"none"`
@@ -651,7 +651,7 @@ pub struct PtzControl {
     /// XML Version
     #[serde(rename = "@version")]
     pub version: String,
-    /// The channel the event occured on. Usually zero unless from an NVR
+    /// The channel the event occurred on. Usually zero unless from an NVR
     #[serde(rename = "channelId")]
     pub channel_id: u8,
     /// The amount of movement to perform
@@ -789,7 +789,7 @@ pub struct AbilityInfoSubModule {
     /// The channel the for the camera usually 0
     #[serde(rename = "channelId", skip_serializing_if = "Option::is_none")]
     pub channel_id: Option<u8>,
-    /// The comma seperated list of permissions like this: `general_rw, norm_rw, version_ro`
+    /// The comma separated list of permissions like this: `general_rw, norm_rw, version_ro`
     #[serde(rename = "abilityValue")]
     pub ability_value: String,
 }

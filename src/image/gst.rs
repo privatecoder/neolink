@@ -166,7 +166,7 @@ fn start_pipeline(pipeline: Pipeline) -> Result<()> {
 fn get_source(pipeline: &Pipeline) -> Result<AppSrc> {
     let source = pipeline
         .by_name("thesource")
-        .expect("There shoud be a `thesource`");
+        .expect("There should be a `thesource`");
     source
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot find appsource in gstreamer, check your gstreamer plugins"))
@@ -177,27 +177,24 @@ fn create_pipeline(format: VideoType, file_path: &Path) -> Result<Pipeline> {
         .context("Unable to start gstreamer ensure it and all plugins are installed")?;
     let file_path = file_path.with_extension("jpeg");
 
+    // NOTE: the output path is NOT interpolated into the launch string. The
+    // gst-parse-launch mini-language splits on whitespace and treats `!`, `=`,
+    // etc. specially, so a path containing a space or special character would
+    // break parsing. The filesink is named here and its `location` is set as a
+    // property below instead.
     let launch_str = match format {
-        VideoType::H264 => {
-            format!(
-                "appsrc name=thesource \
+        VideoType::H264 => "appsrc name=thesource \
                 ! h264parse \
                 ! decodebin \
                 ! jpegenc snapshot=TRUE
-                ! filesink location={}",
-                file_path.display()
-            )
-        }
-        VideoType::H265 => {
-            format!(
-                "appsrc name=thesource \
+                ! filesink name=thesink"
+            .to_string(),
+        VideoType::H265 => "appsrc name=thesource \
                 ! h265parse \
                 ! decodebin \
                 ! jpegenc snapshot=TRUE
-                ! filesink location={}",
-                file_path.display()
-            )
-        }
+                ! filesink name=thesink"
+            .to_string(),
     };
 
     log::info!("{}", launch_str);
@@ -210,6 +207,16 @@ fn create_pipeline(format: VideoType, file_path: &Path) -> Result<Pipeline> {
     let pipeline = pipeline.dynamic_cast::<Pipeline>().map_err(|_| {
         anyhow!("Unable to create gstreamer pipeline ensure all gstramer plugins are installed")
     })?;
+
+    // Set the output path as a property (rather than interpolating it into the
+    // launch string) so paths with spaces/special characters work correctly.
+    let location = file_path
+        .to_str()
+        .ok_or_else(|| anyhow!("--file-path is not valid UTF-8: {:?}", file_path))?;
+    pipeline
+        .by_name("thesink")
+        .ok_or_else(|| anyhow!("Could not find filesink 'thesink' in the snapshot pipeline"))?
+        .set_property("location", location);
 
     // let appssource = get_source(&pipeline)?;
 

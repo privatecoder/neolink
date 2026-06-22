@@ -99,7 +99,7 @@ offline_timeout_secs = 0  # global default: seconds an RTSP viewer is served the
 # Optional TLS for the RTSP server. With a certificate set, connect with rtsps://.
 # The PEM must contain both the certificate and the private key.
 # certificate = "/path/to/server.pem"
-# tls_client_auth = "none"   # none | request | require (default none)
+# tls_client_auth = "none"   # none | request(ed) | require(d) (default none)
 ```
 
 To password-protect the RTSP mountpoints, add `[[users]]`. Without any users,

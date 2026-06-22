@@ -340,6 +340,15 @@ impl NeoCam {
         Ok(me)
     }
 
+    /// Whether this camera's task set is still live. A `NeoCam` cancels its
+    /// shared `cancel` token when its tasks stop (notably on a fatal
+    /// `CameraLoginFail`, where every task is torn down). Once cancelled the
+    /// instance is a zombie — its command channel is dead — so the reactor uses
+    /// this to decide whether to recreate it instead of handing it back.
+    pub(crate) fn is_alive(&self) -> bool {
+        !self.cancel.is_cancelled()
+    }
+
     pub(crate) async fn subscribe(&self) -> Result<NeoInstance> {
         NeoInstance::new(
             self.camera_watch.clone(),

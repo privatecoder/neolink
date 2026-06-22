@@ -82,7 +82,7 @@ fn start_pipeline(pipeline: Pipeline) -> Result<()> {
 fn get_sink(pipeline: &Pipeline) -> Result<AppSink> {
     let sink = pipeline
         .by_name("thesink")
-        .expect("There shoud be a `thesink`");
+        .expect("There should be a `thesink`");
     sink.dynamic_cast::<AppSink>()
         .map_err(|_| anyhow!("Cannot find appsink in gstreamer, check your gstreamer plugins"))
 }
@@ -205,8 +205,8 @@ fn create_pipeline(
     })?;
 
     let appsink = get_sink(&pipeline)?;
-    appsink.set_property("max-buffers", &(1u32));
-    appsink.set_property("drop", &true);
+    appsink.set_property("max-buffers", 1u32);
+    appsink.set_property("drop", true);
 
     // Tell the appsink what format we want. It will then be the audiotestsrc's job to
     // provide the format we request.

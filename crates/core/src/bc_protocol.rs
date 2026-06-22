@@ -64,6 +64,9 @@ pub(crate) const CMD_REPLY_TIMEOUT: Duration = Duration::from_millis(500);
 /// Ceiling for the exponential reconnect/registration backoff (seconds).
 const MAX_BACKOFF_SECS: u64 = 60;
 
+/// Default BC control port used when none is configured (and always tried as a fallback).
+const BC_DEFAULT_PORT: u16 = 9000;
+
 #[derive(Clone, Copy)]
 enum ReadKind {
     ReadOnly,
@@ -156,15 +159,15 @@ impl BcCamera {
         if let ConnectionProtocol::Tcp | ConnectionProtocol::TcpUdp = options.protocol {
             let mut sockets = vec![];
             match options.port {
-                Some(9000) | None => {
+                Some(BC_DEFAULT_PORT) | None => {
                     for addr in options.addrs.iter() {
-                        sockets.push(SocketAddr::new(*addr, 9000));
+                        sockets.push(SocketAddr::new(*addr, BC_DEFAULT_PORT));
                     }
                 }
                 Some(n) => {
                     for addr in options.addrs.iter() {
                         sockets.push(SocketAddr::new(*addr, n));
-                        sockets.push(SocketAddr::new(*addr, 9000));
+                        sockets.push(SocketAddr::new(*addr, BC_DEFAULT_PORT));
                     }
                 }
             }

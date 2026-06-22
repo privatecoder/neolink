@@ -154,7 +154,7 @@ impl BcCamera {
             drop(sub_get); // Ensure that we are NOT listening on that msgnum as the reply can come on ANY msgnum
             log::trace!("Got snap XML {} with size {}", filename, expected_size);
             // Messages are now sent on ID 109 but not with the same message ID
-            // preumably because the camera considers it to be a new message rather
+            // presumably because the camera considers it to be a new message rather
             // than a reply
             //
             // This means we need to listen for the next 109 grab the message num and
@@ -242,7 +242,7 @@ impl BcCamera {
             let valid_len = check_snapshot_complete(&result)?;
             result.truncate(valid_len);
             log::trace!(
-                "Snapshot recieved: {} bytes (declared {})",
+                "Snapshot received: {} bytes (declared {})",
                 result.len(),
                 expected_size
             );
@@ -250,7 +250,7 @@ impl BcCamera {
         } else {
             Err(Error::UnintelligibleReply {
                 reply: std::sync::Arc::new(Box::new(msg)),
-                why: "Expected Snap xml but it was not recieved",
+                why: "Expected Snap xml but it was not received",
             })
         }
     }

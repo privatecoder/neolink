@@ -28,6 +28,11 @@ use once_cell::sync::Lazy;
 use std::sync::Mutex;
 use std::time::Instant;
 
+/// MQTT keep-alive interval shared by both backend constructors.
+const MQTT_KEEP_ALIVE: Duration = Duration::from_secs(5);
+/// Pacing applied to rumqttc's pending-request replay (see note at the use site).
+const MQTT_PENDING_THROTTLE: Duration = Duration::from_millis(10);
+
 /// Process-wide gate so the "event loop spinning" warning is logged at most once
 /// per minute, no matter how many MQTT connections (main + per-camera last-will)
 /// hit it or how often they reconnect.
@@ -232,7 +237,7 @@ impl<'a> MqttBackend<'a> {
             mqttoptions.set_credentials(username, password);
         }
 
-        mqttoptions.set_keep_alive(Duration::from_secs(5));
+        mqttoptions.set_keep_alive(MQTT_KEEP_ALIVE);
         // rumqttc replays queued ("pending") requests with `sleep(pending_throttle)`
         // between each; the default is 0, which tight-drains the pending queue. A
         // small non-zero value paces that path. NOTE: `EventLoop::poll()` returns on
@@ -240,7 +245,7 @@ impl<'a> MqttBackend<'a> {
         // branch — not live request traffic. The primary CPU-spin fix is the
         // per-camera MQTT handler restart backoff in `mqtt/mod.rs`; the poll-loop
         // rate limiter (`PollRateLimiter`) is a failsafe.
-        mqttoptions.set_pending_throttle(Duration::from_millis(10));
+        mqttoptions.set_pending_throttle(MQTT_PENDING_THROTTLE);
 
         // On unclean disconnect send this
         mqttoptions.set_last_will(LastWill::new(
@@ -372,8 +377,8 @@ impl<'a> MqttBackend<'a> {
                             _ = thread_cancel.cancelled() => AnyResult::Ok(()),
                             v = async {
                                 match notification {
-                                    Event::Incoming(Incoming::ConnAck(connected)) => {
-                                        if ConnectReturnCode::Success == connected.code {
+                                    Event::Incoming(Incoming::ConnAck(connected))
+                                        if ConnectReturnCode::Success == connected.code => {
                                             // Publish connected now that we are online
                                             client
                                             .publish(
@@ -388,7 +393,6 @@ impl<'a> MqttBackend<'a> {
                                             .subscribe("neolink/#".to_string(), QoS::AtMostOnce)
                                             .await?;
                                         }
-                                    }
                                     Event::Incoming(Incoming::Publish(published_message)) => {
                                         if let Some(sub_topic) = published_message
                                             .topic
@@ -640,7 +644,7 @@ impl LastWillMqtt {
             mqttoptions.set_credentials(username, password);
         }
 
-        mqttoptions.set_keep_alive(Duration::from_secs(5));
+        mqttoptions.set_keep_alive(MQTT_KEEP_ALIVE);
         // rumqttc replays queued ("pending") requests with `sleep(pending_throttle)`
         // between each; the default is 0, which tight-drains the pending queue. A
         // small non-zero value paces that path. NOTE: `EventLoop::poll()` returns on
@@ -648,7 +652,7 @@ impl LastWillMqtt {
         // branch — not live request traffic. The primary CPU-spin fix is the
         // per-camera MQTT handler restart backoff in `mqtt/mod.rs`; the poll-loop
         // rate limiter (`PollRateLimiter`) is a failsafe.
-        mqttoptions.set_pending_throttle(Duration::from_millis(10));
+        mqttoptions.set_pending_throttle(MQTT_PENDING_THROTTLE);
 
         // On unclean disconnect send this
         mqttoptions.set_last_will(LastWill::new(topic, message, QoS::AtLeastOnce, true));

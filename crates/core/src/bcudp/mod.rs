@@ -18,7 +18,7 @@
 //! ---
 //!
 //! **Data**: Contains a Bc packet payload. This is a stream and one Bc Packet may
-//! be split accross multiple UDP Data packets
+//! be split across multiple UDP Data packets
 //!
 
 pub(crate) mod codex;

@@ -48,7 +48,7 @@ impl BcCamera {
         } else {
             Err(Error::UnintelligibleReply {
                 reply: std::sync::Arc::new(Box::new(msg)),
-                why: "Expected LEDState xml but it was not recieved",
+                why: "Expected LEDState xml but it was not received",
             })
         }
     }
@@ -61,7 +61,7 @@ impl BcCamera {
         let msg_num = self.new_message_num();
         let mut sub_set = connection.subscribe(MSG_ID_SET_LED_STATUS, msg_num).await?;
 
-        // led_version is a field recieved from the camera but not sent
+        // led_version is a field received from the camera but not sent
         // we set to None to ensure we don't send it to the camera
         led_state.led_version = None;
         let get = Bc {

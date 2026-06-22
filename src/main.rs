@@ -84,26 +84,10 @@ async fn main() -> Result<()> {
         .validate()
         .with_context(|| format!("Failed to validate the {:?} config file", conf_path))?;
 
-    // Resolve the offline-timeout precedence (per-camera ?? global ?? 0) once, here,
-    // so every consumer reads a single effective value. Config is parsed only at
-    // startup (no runtime reparse), so this is the one place it needs to happen.
-    // Enforce the >=60s safety floor: a value below it would tear a viewer down mid
-    // camera-reboot, the exact failure the keepalive avoids.
-    let global_offline_timeout = config.offline_timeout_secs;
-    for cam in config.cameras.iter_mut() {
-        let mut secs = cam
-            .offline_timeout_secs
-            .or(global_offline_timeout)
-            .unwrap_or(0);
-        if secs > 0 && secs < 60 {
-            warn!(
-                "{}: offline_timeout_secs={secs} is below the 60s floor; clamping to 60 (must exceed your camera's reboot time)",
-                cam.name
-            );
-            secs = 60;
-        }
-        cam.offline_timeout_secs = Some(secs.min(86400));
-    }
+    // Resolve the offline-timeout precedence (per-camera ?? global ?? 0) and the
+    // >=60s safety floor. The same resolution runs on every runtime config reload
+    // (reactor `update_config`), so startup and reload resolve identically.
+    config.resolve_offline_timeouts();
 
     let neo_reactor = NeoReactor::new(config.clone()).await;
 

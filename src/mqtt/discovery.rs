@@ -272,7 +272,12 @@ pub(crate) async fn enable_discovery(
 
                     // State
                     state_topic: Some(format!("neolink/{}/status/floodlight", cam_config.name)),
-                    state_value_template: Some("{{ value_json.state }}".to_string()),
+                    // The publisher sends the plain payloads "on"/"off" to this
+                    // topic (not JSON), so there is no value_json to template
+                    // against — let Home Assistant match the raw payload directly
+                    // against payload_on/payload_off (as the floodlight_tasks
+                    // switch already does).
+                    state_value_template: None,
 
                     // Control
                     command_topic: Some(format!("neolink/{}/control/floodlight", cam_config.name)),
@@ -289,7 +294,7 @@ pub(crate) async fn enable_discovery(
                     ),
                     "config",
                     &serde_json::to_string(&config_data)
-                        .with_context(|| "Cound not serialise discovery light config into json")?,
+                        .with_context(|| "Could not serialise discovery light config into json")?,
                     true,
                 )
                 .await
@@ -334,7 +339,7 @@ pub(crate) async fn enable_discovery(
                     ),
                     "config",
                     &serde_json::to_string(&config_data)
-                        .with_context(|| "Cound not serialise discovery switch config into json")?,
+                        .with_context(|| "Could not serialise discovery switch config into json")?,
                     true,
                 )
                 .await
@@ -369,7 +374,7 @@ pub(crate) async fn enable_discovery(
                     ),
                     "config",
                     &serde_json::to_string(&config_data)
-                        .with_context(|| "Cound not serialise discovery camera config into json")?,
+                        .with_context(|| "Could not serialise discovery camera config into json")?,
                     true,
                 )
                 .await
@@ -408,7 +413,7 @@ pub(crate) async fn enable_discovery(
                     ),
                     "config",
                     &serde_json::to_string(&config_data)
-                        .with_context(|| "Cound not serialise discovery led config into json")?,
+                        .with_context(|| "Could not serialise discovery led config into json")?,
                     true,
                 )
                 .await
@@ -444,7 +449,7 @@ pub(crate) async fn enable_discovery(
                     ),
                     "config",
                     &serde_json::to_string(&config_data)
-                        .with_context(|| "Cound not serialise discovery led config into json")?,
+                        .with_context(|| "Could not serialise discovery led config into json")?,
                     true,
                 )
                 .await
@@ -480,7 +485,7 @@ pub(crate) async fn enable_discovery(
                     ),
                     "config",
                     &serde_json::to_string(&config_data)
-                        .with_context(|| "Cound not serialise discovery motion config into json")?,
+                        .with_context(|| "Could not serialise discovery motion config into json")?,
                     true,
                 )
                 .await
@@ -515,7 +520,7 @@ pub(crate) async fn enable_discovery(
                     ),
                     "config",
                     &serde_json::to_string(&config_data)
-                        .with_context(|| "Cound not serialise discovery reboot config into json")?,
+                        .with_context(|| "Could not serialise discovery reboot config into json")?,
                     true,
                 )
                 .await
@@ -551,7 +556,7 @@ pub(crate) async fn enable_discovery(
                         ),
                         "config",
                         &serde_json::to_string(&config_data)
-                            .with_context(|| "Cound not serialise discovery pt config into json")?,
+                            .with_context(|| "Could not serialise discovery pt config into json")?,
                         true,
                     )
                     .await
@@ -588,7 +593,7 @@ pub(crate) async fn enable_discovery(
                     ),
                     "config",
                     &serde_json::to_string(&config_data).with_context(|| {
-                        "Cound not serialise discovery battery config into json"
+                        "Could not serialise discovery battery config into json"
                     })?,
                     true,
                 )
@@ -624,7 +629,7 @@ pub(crate) async fn enable_discovery(
                     ),
                     "config",
                     &serde_json::to_string(&config_data)
-                        .with_context(|| "Cound not serialise discovery siren config into json")?,
+                        .with_context(|| "Could not serialise discovery siren config into json")?,
                     true,
                 )
                 .await
@@ -660,7 +665,7 @@ pub(crate) async fn enable_discovery(
                     ),
                     "config",
                     &serde_json::to_string(&config_data).with_context(|| {
-                        "Cound not serialise discovery doorbell config into json"
+                        "Could not serialise discovery doorbell config into json"
                     })?,
                     true,
                 )
@@ -681,6 +686,58 @@ pub(crate) async fn enable_discovery(
         friendly_name.as_str()
     );
 
+    Ok(())
+}
+
+/// The full set of Home Assistant discovery entities a camera can publish, as
+/// `(component, unique_id_suffix)` pairs. Kept in sync with [`enable_discovery`]:
+/// every `send_message_with_root_topic("{topic}/{component}/{unique_id}", ...)`
+/// there has a matching entry here so it can be cleared.
+fn discovery_entities(cam_name: &str) -> Vec<(&'static str, String)> {
+    let mut entities = vec![
+        ("light", format!("neolink_{cam_name}_floodlight")),
+        ("switch", format!("neolink_{cam_name}_floodlight_tasks")),
+        ("camera", format!("neolink_{cam_name}_camera")),
+        ("switch", format!("neolink_{cam_name}_led")),
+        ("select", format!("neolink_{cam_name}_ir")),
+        ("binary_sensor", format!("neolink_{cam_name}_md")),
+        ("button", format!("neolink_{cam_name}_reboot")),
+        ("sensor", format!("neolink_{cam_name}_battery")),
+        ("button", format!("neolink_{cam_name}_siren")),
+        ("event", format!("neolink_{cam_name}_doorbell")),
+    ];
+    for dir in ["left", "right", "up", "down"] {
+        entities.push(("button", format!("neolink_{cam_name}_pan_{dir}")));
+    }
+    entities
+}
+
+/// Clears every retained Home Assistant discovery config a camera may have
+/// published, by republishing an empty retained payload to each config topic
+/// (the MQTT-standard way to delete a retained message). Call this when a camera
+/// leaves the configuration so it does not leave ghost entities on the broker.
+///
+/// Clearing the full set unconditionally (rather than only the features that
+/// were enabled) is intentional and safe: an empty-retained publish to a topic
+/// that was never set is a harmless no-op, and it also cleans up entities from a
+/// previous run whose feature set has since changed.
+pub(crate) async fn disable_discovery(
+    discovery_config: &MqttDiscoveryConfig,
+    mqtt: &MqttInstance,
+    cam_name: &str,
+) -> Result<()> {
+    debug!("Disabling MQTT discovery for {cam_name}");
+    for (component, unique_id) in discovery_entities(cam_name) {
+        mqtt.send_message_with_root_topic(
+            &format!("{}/{}/{}", discovery_config.topic, component, unique_id),
+            "config",
+            "",
+            true,
+        )
+        .await
+        .with_context(|| format!("Failed to clear discovery for {cam_name} entity {unique_id}"))?;
+    }
+    debug!("Disabled MQTT discovery for {cam_name}");
     Ok(())
 }
 

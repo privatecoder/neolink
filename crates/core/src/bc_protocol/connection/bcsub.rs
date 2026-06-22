@@ -2,7 +2,7 @@ use super::BcConnection;
 use crate::bcmedia::codex::BcMediaCodex;
 use crate::{bc::model::*, bcmedia::model::*, Error, Result};
 use futures::stream::{Stream, TryStreamExt};
-use std::io::{Error as IoError, ErrorKind, Result as IoResult};
+use std::io::{Error as IoError, Result as IoResult};
 use tokio::sync::mpsc::Receiver;
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tokio_util::codec::FramedRead;
@@ -31,7 +31,7 @@ impl<'a> BcSubscription<'a> {
         if let Some(msg_num) = self.msg_num {
             assert!(bc.meta.msg_num as u32 == msg_num);
         } else {
-            log::debug!("Sending message before msg_num has been aquired");
+            log::debug!("Sending message before msg_num has been acquired");
         }
         self.conn.send(bc).await?;
         Ok(())
@@ -61,7 +61,7 @@ impl<'a> BcSubscription<'a> {
                     }),
             }) => Some(Ok(data)),
             Ok(_) => None,
-            Err(e) => Some(Err(IoError::new(ErrorKind::Other, e))),
+            Err(e) => Some(Err(IoError::other(e))),
         })
     }
 

@@ -28,6 +28,10 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+/// How long to wait when acquiring a write lock on the server's shared state
+/// before giving up.
+const SERVER_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
 glib::wrapper! {
     /// The wrapped RTSPServer
     pub(crate) struct NeoRtspServer(ObjectSubclass<NeoRtspServerImpl>) @extends RTSPServer;
@@ -104,7 +108,7 @@ impl NeoRtspServer {
             drop(main_loop_gaurd);
             AnyResult::Ok(())
         });
-        timeout(Duration::from_secs(5), self.imp().threads.write())
+        timeout(SERVER_LOCK_TIMEOUT, self.imp().threads.write())
             .await
             .with_context(|| "Timeout waiting to lock Server threads")?
             .spawn(async move { handle.await? });
@@ -132,13 +136,13 @@ impl NeoRtspServer {
             }
             AnyResult::Ok(())
         });
-        timeout(Duration::from_secs(5), self.imp().threads.write())
+        timeout(SERVER_LOCK_TIMEOUT, self.imp().threads.write())
             .await
             .with_context(|| "Timeout waiting to lock Server threads")?
             .spawn(async move { handle.await? });
 
         // Put copy of main loop inside the rtsp server
-        timeout(Duration::from_secs(5), self.imp().main_loop.write())
+        timeout(SERVER_LOCK_TIMEOUT, self.imp().main_loop.write())
             .await
             .with_context(|| "Timeout waiting to lock Server main_loop")?
             .replace(main_loop);
@@ -206,7 +210,7 @@ impl NeoRtspServerImpl {
         debug!("Setting up TLS using {}", cert_file);
         let auth = self.obj().auth().unwrap_or_default();
 
-        // We seperate reading the file and changing to a PEM so that we get different error messages.
+        // We separate reading the file and changing to a PEM so that we get different error messages.
         let cert_contents = fs::read_to_string(cert_file).with_context(|| "TLS file not found")?;
         let cert = TlsCertificate::from_pem(&cert_contents)
             .with_context(|| "Not a valid TLS certificate")?;
@@ -219,10 +223,15 @@ impl NeoRtspServerImpl {
 
     pub(crate) fn set_up_tls(&self, config: &Config) -> AnyResult<()> {
         let tls_client_auth = match &config.tls_client_auth as &str {
-            "request" => TlsAuthenticationMode::Requested,
-            "require" => TlsAuthenticationMode::Required,
+            "request" | "requested" => TlsAuthenticationMode::Requested,
+            "require" | "required" => TlsAuthenticationMode::Required,
             "none" => TlsAuthenticationMode::None,
-            _ => unreachable!(),
+            // Config validation (RE_TLS_CLIENT_AUTH) already restricts this to the
+            // arms above; fall back to None rather than panic if the two ever drift.
+            other => {
+                log::warn!("Unknown tls_client_auth '{other}', defaulting to none");
+                TlsAuthenticationMode::None
+            }
         };
         if let Some(cert_path) = &config.certificate {
             self.set_tls(cert_path, tls_client_auth)

@@ -81,7 +81,7 @@ impl StreamConfig {
             bitrate: cache.bitrate,
             fps: cache.fps,
             fps_table: cache.fps_table.clone(),
-            vid_type: cache.vid_type.clone(),
+            vid_type: cache.vid_type,
             aud_type: cache.aud_type.clone(),
             buffer_duration_ms,
             aud_rate: cache.aud_rate,
@@ -92,7 +92,7 @@ impl StreamConfig {
     /// Snapshot the learned codec + sizing into a cacheable value.
     fn to_cache(&self) -> StreamTypeCache {
         StreamTypeCache {
-            vid_type: self.vid_type.clone(),
+            vid_type: self.vid_type,
             aud_type: self.aud_type.clone(),
             resolution: self.resolution,
             bitrate: self.bitrate,
@@ -244,6 +244,31 @@ enum ClientMsg {
 struct TimedMedia {
     recv_at: std::time::Instant,
     media: BcMedia,
+    /// Camera-clock microseconds the video PTS should advance by when this frame is
+    /// handled, accumulated by the forwarder over every video frame it saw on the
+    /// wire since the previous DELIVERED frame — including ones it had to drop when
+    /// the queue was full. Carrying it here (rather than recomputing from the frame's
+    /// absolute camera timestamp in the sender) keeps the single video clock
+    /// continuous across forwarder drops instead of jumping/resetting. 0 for audio /
+    /// non-video frames (they don't drive the video clock).
+    vid_advance_us: u64,
+}
+
+/// Owns a session's per-bucket gstreamer `BufferPool`s and deactivates each one
+/// (`set_active(false)`) when the blocking sender task exits by ANY path —
+/// client disconnect, EOS, offline timeout, error (`?`), or generation cancel.
+/// A pool dropped while still active leaks its preallocated buffers, so without
+/// this the buffers accumulate across every RTSP connect/disconnect cycle.
+struct PoolGuard {
+    pools: HashMap<usize, gstreamer::BufferPool>,
+}
+
+impl Drop for PoolGuard {
+    fn drop(&mut self) {
+        for pool in self.pools.values() {
+            let _ = pool.set_active(false);
+        }
+    }
 }
 
 pub(super) async fn make_factory(
@@ -287,17 +312,38 @@ pub(super) async fn make_factory(
                         name,
                         SESSION_COUNTER.fetch_add(1, Ordering::Relaxed)
                     );
-                    let cancel_child = child_cancel.clone();
+                    // Per-client cancel token: a CHILD of the generation token, so a
+                    // generation cancel (config-change restart) still tears this client
+                    // down, but this client's own disconnect can cancel just its
+                    // forwarder + sender immediately — without waiting for the next
+                    // try_send (which never comes if the camera is quiet/offline).
+                    let cancel_child = child_cancel.child_token();
                     let task_label = format!("{name}::{stream} client");
                     spawn_logged(task_label, async move {
-                        clear_bin(&element)?;
+                        // Every error path BEFORE `reply` is sent must reply once (with
+                        // Unavailable) rather than returning Err with the oneshot unsent.
+                        // A dropped reply makes the gst callback hit its Err arm (logs
+                        // CRITICAL and serves nothing) and bypasses the splash fallback;
+                        // replying Unavailable lets the callback serve the splash cleanly.
+                        if let Err(e) = clear_bin(&element) {
+                            log::warn!("{name}::{stream}: failed to reset pipeline bin: {e:?}; serving unavailable");
+                            let _ = reply.send(SetupOutcome::Unavailable);
+                            return Ok(());
+                        }
                         log::info!(
                             "{name}::{stream}: Factory received new client, setting up pipeline"
                         );
 
                         // Camera config is local (it does not require the camera to be
                         // online), so fetch it up front for the cache key and splash.
-                        let config = camera.config().await?.borrow().clone();
+                        let config = match camera.config().await {
+                            Ok(c) => c.borrow().clone(),
+                            Err(e) => {
+                                log::warn!("{name}::{stream}: failed to read camera config: {e:?}; serving unavailable");
+                                let _ = reply.send(SetupOutcome::Unavailable);
+                                return Ok(());
+                            }
+                        };
                         // Resolved (per-camera ?? global ?? 0) at config load. 0 = never
                         // time out the offline keepalive (default).
                         let offline_timeout_secs = config.offline_timeout_secs.unwrap_or(0);
@@ -329,11 +375,19 @@ pub(super) async fn make_factory(
                                 );
                                 let stream_config =
                                     StreamConfig::from_cache(&cached, config.buffer_duration);
-                                let (vid_src, aud_src) = build_sources(
+                                let (vid_src, aud_src) = match build_sources(
                                     &element,
                                     &stream_config,
                                     &config.splash_pattern.to_string(),
-                                )?;
+                                ) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        // Reply (not Err-return) so the callback serves splash, not CRITICAL.
+                                        log::warn!("{name}::{stream}: failed to build pipeline sources (cached path): {e:?}; serving unavailable");
+                                        let _ = reply.send(SetupOutcome::Unavailable);
+                                        return Ok(());
+                                    }
+                                };
                                 let _ = reply.send(SetupOutcome::Pipeline(element));
 
                                 // permit() + stream_while_live() return promptly even while
@@ -439,11 +493,19 @@ pub(super) async fn make_factory(
                                     stream_config.buffer_duration_ms,
                                     sizing_bytes
                                 );
-                                let (vid_src, aud_src) = build_sources(
+                                let (vid_src, aud_src) = match build_sources(
                                     &element,
                                     &stream_config,
                                     &config.splash_pattern.to_string(),
-                                )?;
+                                ) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        // Reply (not Err-return) so the callback serves splash, not CRITICAL.
+                                        log::warn!("{name}::{stream}: failed to build pipeline sources: {e:?}; serving unavailable");
+                                        let _ = reply.send(SetupOutcome::Unavailable);
+                                        return Ok(());
+                                    }
+                                };
                                 let _ = reply.send(SetupOutcome::Pipeline(element));
                                 // Slow path learned types from the live stream, so there is
                                 // nothing to reconcile against.
@@ -478,12 +540,31 @@ pub(super) async fn make_factory(
                         let label_fwd = stream_label.clone();
                         let cancel_fwd = cancel_child.clone();
 
+                        // The slow-path learning buffer is drained by the sender via
+                        // `video_ts_from_camera`, which advances the video clock up to the
+                        // last buffered video frame's camera timestamp. Seed the forwarder's
+                        // clock authority with that timestamp so the FIRST live frame's delta
+                        // is measured from it. Without this seed `fwd_vid_last` starts `None`,
+                        // the first live frame carries a zero advance, and the PTS stalls/
+                        // duplicates exactly at the buffer→live boundary (one camera delta lost).
+                        let last_buffered_vid_us: Option<u32> =
+                            buffer.iter().rev().find_map(video_microseconds);
+
                         // Forwarder task: runs on tokio, owns media_rx. Stops when the
                         // camera stream ends or the generation is cancelled; dropping
                         // std_tx then disconnects the blocking sender too.
                         tokio::spawn(async move {
                             let mut last_drop_log = std::time::Instant::now();
                             let mut dropped = 0u64;
+                            // Video clock authority for this session: the camera's per-frame
+                            // timestamp accumulated (wrap-safe, with the same >10s reset cap
+                            // as `video_ts_from_camera`) over EVERY video frame seen here.
+                            // `pending_vid_advance_us` carries the camera-time since the last
+                            // DELIVERED frame, so a delivered frame folds in the time of any
+                            // frames dropped before it — the sender then advances the clock by
+                            // that amount and stays continuous across drops.
+                            let mut fwd_vid_last: Option<u32> = last_buffered_vid_us;
+                            let mut pending_vid_advance_us: u64 = 0u64;
                             loop {
                                 let m = tokio::select! {
                                     _ = cancel_fwd.cancelled() => break,
@@ -503,13 +584,47 @@ pub(super) async fn make_factory(
                                     _ => in_other_fwd.fetch_add(1, Ordering::Relaxed),
                                 };
 
+                                // Fold this frame's camera-time delta into the pending advance.
+                                // `vid_advance` is what this frame carries IF it is delivered;
+                                // `is_video` gates committing (resetting) the accumulator on a
+                                // successful send.
+                                let is_video = matches!(&m, BcMedia::Iframe(_) | BcMedia::Pframe(_));
+                                if let Some(us) = video_microseconds(&m) {
+                                    let delta = match fwd_vid_last {
+                                        Some(last) => {
+                                            let d = us.wrapping_sub(last) as u64;
+                                            // >10s => treat as a camera clock reset and skip,
+                                            // mirroring `video_ts_from_camera`.
+                                            if d < 10_000_000 {
+                                                d
+                                            } else {
+                                                0
+                                            }
+                                        }
+                                        None => 0,
+                                    };
+                                    fwd_vid_last = Some(us);
+                                    pending_vid_advance_us = pending_vid_advance_us.saturating_add(delta);
+                                }
+                                let vid_advance = if is_video { pending_vid_advance_us } else { 0 };
+
                                 let timed = TimedMedia {
                                     recv_at: std::time::Instant::now(),
                                     media: m,
+                                    vid_advance_us: vid_advance,
                                 };
                                 match std_tx.try_send(timed) {
-                                    Ok(()) => {}
+                                    Ok(()) => {
+                                        // Delivered: the carried advance is now the sender's to
+                                        // apply, so clear the accumulator (video frames only).
+                                        if is_video {
+                                            pending_vid_advance_us = 0;
+                                        }
+                                    }
                                     Err(TrySendError::Full(_)) => {
+                                        // Dropped: keep this frame's delta in the accumulator so
+                                        // the next delivered video frame still advances the clock
+                                        // over the gap (CLAUDE.md: drop paths must advance it).
                                         match kind {
                                             0 => drop_audio_fwd.fetch_add(1, Ordering::Relaxed),
                                             1 => drop_video_fwd.fetch_add(1, Ordering::Relaxed),
@@ -547,14 +662,20 @@ pub(super) async fn make_factory(
 
                             let start = Instant::now();
                             let _permit = permit; // hold for lifetime
+                            // When this sender returns (disconnect, EOS, timeout, error, or
+                            // generation cancel) cancel the per-client token so the paired
+                            // forwarder's `cancel`-arm fires at once and it stops subscribing
+                            // to the camera stream — instead of leaking until a try_send that
+                            // may never happen on a quiet/offline camera.
+                            let _client_cancel_drop_guard = cancel_send.clone().drop_guard();
 
                             // Wait for the RTSP server to link the pads (client reaches PLAY).
                             let link_deadline = Instant::now() + Duration::from_secs(2);
                             loop {
                                 let vid_linked =
-                                    vid_src.as_ref().map(|s| is_linked(s)).unwrap_or(true);
+                                    vid_src.as_ref().map(is_linked).unwrap_or(true);
                                 let aud_linked =
-                                    aud_src.as_ref().map(|s| is_linked(s)).unwrap_or(true);
+                                    aud_src.as_ref().map(is_linked).unwrap_or(true);
 
                                 if vid_linked && aud_linked {
                                     break;
@@ -571,8 +692,12 @@ pub(super) async fn make_factory(
                             let mut vid_pacer = Some(PacerState::new(start, Duration::ZERO));
                             let mut aud_pacer = Some(PacerState::new(start, Duration::ZERO));
 
-                            let mut pools: HashMap<usize, gstreamer::BufferPool> =
-                                Default::default();
+                            // Pools live behind a guard so every exit path deactivates
+                            // them (see PoolGuard); leaking active pools accumulates
+                            // preallocated buffers across connect/disconnect cycles.
+                            let mut pool_guard = PoolGuard {
+                                pools: Default::default(),
+                            };
                             let mut stats = StreamStats::new(Instant::now());
 
                             let frame_step_us: u64 = {
@@ -678,7 +803,7 @@ pub(super) async fn make_factory(
                                 match send_to_sources(
                                     buffered,
                                     &stream_label,
-                                    &mut pools,
+                                    &mut pool_guard.pools,
                                     &vid_src,
                                     &aud_src,
                                     &mut vid_ts,
@@ -688,6 +813,9 @@ pub(super) async fn make_factory(
                                     &mut vid_pacer,
                                     &mut aud_pacer,
                                     &mut stats,
+                                    None,
+                                    // Buffered frames are contiguous (no forwarder drops among
+                                    // them), so use the camera-timestamp clock directly.
                                     None,
                                 )? {
                                     PushOutcome::Gone => {
@@ -797,13 +925,13 @@ pub(super) async fn make_factory(
                                     }
                                 }
                                 let vid_closed =
-                                    vid_src.as_ref().map(|src| is_closed(src)).unwrap_or(true);
+                                    vid_src.as_ref().map(is_closed).unwrap_or(true);
                                 let aud_closed =
-                                    aud_src.as_ref().map(|src| is_closed(src)).unwrap_or(true);
+                                    aud_src.as_ref().map(is_closed).unwrap_or(true);
                                 let vid_linked =
-                                    vid_src.as_ref().map(|s| is_linked(s)).unwrap_or(false);
+                                    vid_src.as_ref().map(is_linked).unwrap_or(false);
                                 let aud_linked =
-                                    aud_src.as_ref().map(|s| is_linked(s)).unwrap_or(false);
+                                    aud_src.as_ref().map(is_linked).unwrap_or(false);
 
                                 if vid_linked || aud_linked {
                                     if !play_logged {
@@ -942,7 +1070,7 @@ pub(super) async fn make_factory(
                                 } else {
                                     Duration::from_millis(200)
                                 };
-                                let timed = match std_rx.recv_timeout(recv_wait) {
+                                let mut timed = match std_rx.recv_timeout(recv_wait) {
                                     Ok(d) => d,
                                     Err(RecvTimeoutError::Timeout) => {
                                         // no frame right now; loop continues (heartbeat/disconnect still works)
@@ -990,7 +1118,7 @@ pub(super) async fn make_factory(
                                             // breaking (resolution/bitrate drift is reconciled
                                             // by the slow path on a future cold cache).
                                             let learned = StreamTypeCache {
-                                                vid_type: observed.vid_type.clone(),
+                                                vid_type: observed.vid_type,
                                                 aud_type: observed.aud_type.clone(),
                                                 aud_rate: observed.aud_rate,
                                                 aud_channels: observed.aud_channels,
@@ -1030,13 +1158,15 @@ pub(super) async fn make_factory(
                                 // Keepalive handoff: until the first real camera keyframe, drop
                                 // real frames (P-frames / audio) and keep serving the placeholder.
                                 // On the first keyframe, step one frame past the last placeholder
-                                // PTS so the real frame's timestamp is strictly greater, then let
-                                // the normal path timestamp it (vid_cam_last is still None, so
-                                // video_ts_from_camera returns this accumulated value).
+                                // PTS so the real frame's timestamp is strictly greater. That step
+                                // establishes the handoff PTS, so zero this frame's carried advance
+                                // (the placeholder advanced the clock by wall-clock, not by the
+                                // camera deltas the forwarder accumulated during keepalive).
                                 if !seen_real_keyframe {
                                     if is_video(&timed.media) && is_video_keyframe(&timed.media) {
                                         stats.vid_pts_us =
                                             stats.vid_pts_us.saturating_add(frame_step_us);
+                                        timed.vid_advance_us = 0;
                                         seen_real_keyframe = true;
                                         log::info!("{stream_label}: first camera keyframe received; switching from keepalive to live");
                                     } else {
@@ -1078,10 +1208,9 @@ pub(super) async fn make_factory(
                                     && is_video(&timed.media)
                                     && !is_video_keyframe(&timed.media)
                                 {
-                                    // Keep the camera-clock advancing even for dropped frames.
-                                    if let Some(us) = video_microseconds(&timed.media) {
-                                        vid_ts = stats.video_ts_from_camera(us);
-                                    }
+                                    // Keep the video clock advancing even for dropped frames,
+                                    // using the forwarder-computed advance (continuous across drops).
+                                    vid_ts = stats.advance_video_pts(timed.vid_advance_us);
                                     stats.p_dropped_backpressure += 1;
                                     continue;
                                 }
@@ -1090,16 +1219,14 @@ pub(super) async fn make_factory(
                                     in_backpressure && matches!(timed.media, BcMedia::Pframe(_));
                                 if should_drop_p {
                                     stats.p_dropped_backpressure += 1;
-                                    if let Some(us) = video_microseconds(&timed.media) {
-                                        vid_ts = stats.video_ts_from_camera(us);
-                                    }
+                                    vid_ts = stats.advance_video_pts(timed.vid_advance_us);
                                     continue;
                                 }
 
                                 match send_to_sources(
                                     timed.media,
                                     &stream_label,
-                                    &mut pools,
+                                    &mut pool_guard.pools,
                                     &vid_src,
                                     &aud_src,
                                     &mut vid_ts,
@@ -1110,6 +1237,9 @@ pub(super) async fn make_factory(
                                     &mut aud_pacer,
                                     &mut stats,
                                     Some(timed.recv_at),
+                                    // Live frame: advance the video clock by the forwarder's
+                                    // carried camera-time delta (continuous across drops).
+                                    Some(timed.vid_advance_us),
                                 )? {
                                     PushOutcome::Gone => {
                                         log::info!("{stream_label}: Client disconnected, stopping camera relay");
@@ -1286,6 +1416,7 @@ fn push_audio_frame(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_to_sources(
     data: BcMedia,
     stream_label: &str,
@@ -1300,6 +1431,10 @@ fn send_to_sources(
     aud_pacer: &mut Option<PacerState>,
     stats: &mut StreamStats,
     recv_at: Option<std::time::Instant>,
+    // For live frames, the forwarder-computed camera-time advance for this frame
+    // (`Some`, continuous across drops). `None` for buffered frames (the slow-path
+    // learning buffer is contiguous), which fall back to `video_ts_from_camera`.
+    vid_advance_us: Option<u64>,
 ) -> AnyResult<PushOutcome> {
     // Update TS
     match data {
@@ -1383,7 +1518,10 @@ fn send_to_sources(
                 if let Some(recv_at) = recv_at {
                     stats.record_video_gap(recv_at);
                 }
-                let ts_us = stats.video_ts_from_camera(microseconds);
+                let ts_us = match vid_advance_us {
+                    Some(adv) => stats.advance_video_pts(adv),
+                    None => stats.video_ts_from_camera(microseconds),
+                };
                 let frame_dur =
                     Duration::from_micros(1_000_000u64 / stream_config.fps.max(1) as u64);
                 log::trace!("Sending I-frame: {:?}", Duration::from_micros(ts_us));
@@ -1416,7 +1554,10 @@ fn send_to_sources(
                 if let Some(recv_at) = recv_at {
                     stats.record_video_gap(recv_at);
                 }
-                let ts_us = stats.video_ts_from_camera(microseconds);
+                let ts_us = match vid_advance_us {
+                    Some(adv) => stats.advance_video_pts(adv),
+                    None => stats.video_ts_from_camera(microseconds),
+                };
                 let frame_dur =
                     Duration::from_micros(1_000_000u64 / stream_config.fps.max(1) as u64);
 
@@ -1527,7 +1668,7 @@ fn acquire_pooled_buffer(
                 map[..needed].copy_from_slice(data);
             }
             if bucket > needed {
-                let _ = buf_ref.set_size(needed);
+                buf_ref.set_size(needed);
             }
         }
         Ok(buf)
@@ -1981,7 +2122,7 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
 
     source.set_is_live(true);
-    source.set_property("format", &gstreamer::Format::Time);
+    source.set_property("format", gstreamer::Format::Time);
     source.set_do_timestamp(false); // ✅ was true
     source.set_block(false); // ok if you choose dropping
     source.set_property("emit-signals", false);
@@ -2046,7 +2187,7 @@ fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
 
     source.set_is_live(true);
-    source.set_property("format", &gstreamer::Format::Time);
+    source.set_property("format", gstreamer::Format::Time);
     source.set_do_timestamp(false); // ✅ was true
     source.set_block(false); // ok if you choose dropping
     source.set_property("emit-signals", false);
@@ -2112,7 +2253,7 @@ fn pipe_aac(bin: &Element, _stream_config: &StreamConfig) -> Result<Linked> {
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
 
     source.set_is_live(true);
-    source.set_property("format", &gstreamer::Format::Time);
+    source.set_property("format", gstreamer::Format::Time);
     source.set_do_timestamp(false); // ✅ was true
     source.set_block(false); // ok if you choose dropping
     source.set_property("emit-signals", false);
@@ -2207,7 +2348,7 @@ fn pipe_adpcm(bin: &Element, block_size: u32, _stream_config: &StreamConfig) -> 
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
 
     source.set_is_live(true);
-    source.set_property("format", &gstreamer::Format::Time);
+    source.set_property("format", gstreamer::Format::Time);
     source.set_do_timestamp(false); // ✅ was true
     source.set_block(false); // ok if you choose dropping
     source.set_property("emit-signals", false);
@@ -2467,6 +2608,17 @@ impl StreamStats {
         self.vid_pts_us
     }
 
+    /// Advance the video PTS by a camera-time delta already computed by the
+    /// forwarder (which is the clock authority for live frames, so the advance
+    /// stays continuous across queue-full drops). Used for delivered live frames
+    /// instead of `video_ts_from_camera`; the per-frame deltas were wrap-/reset-
+    /// capped at the forwarder, so this is a plain accumulation.
+    fn advance_video_pts(&mut self, advance_us: u64) -> u64 {
+        self.vid_pts_us = self.vid_pts_us.saturating_add(advance_us);
+        self.last_vid_pts_us = self.vid_pts_us;
+        self.vid_pts_us
+    }
+
     fn aud_stats_snapshot(&self) -> AudStatsSnapshot {
         if self.aud_packets == 0 {
             return AudStatsSnapshot::empty();
@@ -2557,7 +2709,7 @@ fn make_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
 fn buffer_size_bytes(stream_config: &StreamConfig) -> u32 {
     let bitrate = stream_config.bitrate.max(1) as u64;
     let fps = stream_config.fps.max(1) as u64;
-    let bytes_per_sec = (bitrate + 7) / 8;
+    let bytes_per_sec = bitrate.div_ceil(8);
     let buffer_ms = stream_config.buffer_duration_ms.max(1000);
     let base = bytes_per_sec.saturating_mul(buffer_ms) / 1000;
     let max_frame_guess = max_frame_guess_bytes(bytes_per_sec, fps);

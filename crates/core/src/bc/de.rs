@@ -9,6 +9,17 @@ use nom::{
 
 type IResult<I, O, E = nom_language::error::VerboseError<I>> = Result<(I, O), nom::Err<E>>;
 
+/// Upper bound on a single BC control message body (`body_len`), enforced before
+/// any buffering/allocation. `body_len` is a wire-supplied `u32`, so a bogus
+/// header could otherwise make the framing layer (`BcCodex`) buffer toward a
+/// multi-gigabyte declared body and exhaust memory (DoS) on both the TCP and UDP
+/// transports. 16 MiB is far above any legitimate control message — observed
+/// bodies are a few KiB (login replies ~3 KiB) up to ~30 KiB for inline binary
+/// payloads, and large transfers (snapshots, firmware) are chunked across many
+/// messages rather than sent as one giant body — while still rejecting clearly
+/// malicious lengths.
+const MAX_BODY_LEN: u32 = 16 * 1024 * 1024;
+
 impl Bc {
     /// Returns Ok(deserialized data, the amount of data consumed)
     /// Can then use this as the amount that should be remove from a buffer
@@ -83,8 +94,21 @@ fn bc_modern_msg<'a>(
     // If missing payload_offset treat all as payload
     let ext_len = header.payload_offset.unwrap_or_default();
 
+    // `body_len` and `payload_offset` (ext_len) are both wire-controlled. Compute
+    // the payload length with a checked subtraction so a `payload_offset` larger
+    // than `body_len` is rejected as a parse error instead of underflowing (which
+    // would panic in debug and wrap to a huge value in release). Doing this before
+    // the `take`s also guarantees `ext_len <= body_len`, so neither `take` can be
+    // asked to buffer past the (already capped, see `MAX_BODY_LEN`) body.
+    let payload_len = header.body_len.checked_sub(ext_len).ok_or_else(|| {
+        Err::Error(make_error(
+            buf,
+            "payload_offset exceeds body_len",
+            ErrorKind::Verify,
+        ))
+    })?;
+
     let (buf, ext_buf) = take(ext_len)(buf)?;
-    let payload_len = header.body_len - ext_len;
     let (buf, payload_buf) = take(payload_len)(buf)?;
 
     let decrypted;
@@ -174,9 +198,20 @@ fn bc_modern_msg<'a>(
                     // if if context.debug {
                     //     log::trace!("Binary: {:X?}", &processed_payload_buf[0..30]);
                     // }
-                    Some(BcPayloads::Binary(
-                        processed_payload_buf[0..(encrypted_len as usize)].to_vec(),
-                    ))
+                    // `encrypted_len` comes from the (wire-supplied) extension XML, so it
+                    // can exceed the decrypted payload buffer. Slice it with a checked
+                    // `get(..)` and surface an oversize length as a parse error rather
+                    // than panicking on an out-of-bounds index.
+                    let bin = processed_payload_buf
+                        .get(..(encrypted_len as usize))
+                        .ok_or_else(|| {
+                            Err::Error(make_error(
+                                buf,
+                                "encrypt_len exceeds payload buffer",
+                                ErrorKind::Eof,
+                            ))
+                        })?;
+                    Some(BcPayloads::Binary(bin.to_vec()))
                 }
                 _ => Some(BcPayloads::Binary(payload_buf.to_vec())),
             };
@@ -218,7 +253,14 @@ fn bc_header(buf: &[u8]) -> IResult<&[u8], BcHeader> {
     )
     .parse(buf)?;
     let (buf, msg_id) = error_context("MsgID missing", le_u32).parse(buf)?;
-    let (buf, body_len) = error_context("BodyLen missing", le_u32).parse(buf)?;
+    // `body_len` is an unbounded wire `u32`. Reject anything past `MAX_BODY_LEN`
+    // here, before the framing layer starts buffering toward the declared body,
+    // so a bogus header cannot drive a huge allocation (DoS) on either transport.
+    let (buf, body_len) = error_context(
+        "BodyLen invalid",
+        verify(le_u32, |len: &u32| *len <= MAX_BODY_LEN),
+    )
+    .parse(buf)?;
     let (buf, channel_id) = error_context("ChannelID missing", le_u8).parse(buf)?;
     let (buf, stream_type) = error_context("StreamType missing", le_u8).parse(buf)?;
     let (buf, msg_num) = error_context("MsgNum missing", le_u16).parse(buf)?;
@@ -568,5 +610,47 @@ mod tests {
                     }),
             }) if version == "1.1" && stream_type == Some("mainStream".to_string())
         );
+    }
+
+    /// Build a minimal modern BC header (class 0x6414 has a payload_offset word).
+    fn modern_header_bytes(body_len: u32, class: u16, payload_offset: Option<u32>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC_HEADER.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // msg_id
+        bytes.extend_from_slice(&body_len.to_le_bytes());
+        bytes.push(0); // channel_id
+        bytes.push(0); // stream_type
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // msg_num
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // response_code
+        bytes.extend_from_slice(&class.to_le_bytes());
+        if let Some(off) = payload_offset {
+            bytes.extend_from_slice(&off.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    // A camera-supplied `body_len` beyond the cap must be a parse error, not an
+    // unbounded buffer/allocation (DoS). See `MAX_BODY_LEN`.
+    fn rejects_oversize_body_len() {
+        init();
+        let bytes = modern_header_bytes(MAX_BODY_LEN + 1, 0x6614, None);
+        assert!(bc_header(&bytes).is_err());
+        // A `body_len` exactly at the cap parses (boundary is inclusive).
+        let bytes_ok = modern_header_bytes(MAX_BODY_LEN, 0x6614, None);
+        assert!(bc_header(&bytes_ok).is_ok());
+    }
+
+    #[test]
+    // A `payload_offset` larger than `body_len` would underflow `body_len - ext_len`;
+    // it must surface as a parse error instead of panicking/wrapping.
+    fn rejects_payload_offset_past_body_len() {
+        init();
+        let context = BcContext::new_with_encryption(EncryptionProtocol::BCEncrypt);
+        let bytes = modern_header_bytes(4, 0x6414, Some(100));
+        let (rest, header) = bc_header(&bytes).unwrap();
+        assert_eq!(header.body_len, 4);
+        assert_eq!(header.payload_offset, Some(100));
+        assert!(bc_body(&context, &header, rest).is_err());
     }
 }

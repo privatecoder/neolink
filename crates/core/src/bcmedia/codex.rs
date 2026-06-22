@@ -1,4 +1,4 @@
-//! Handles sending and recieving messages as packets
+//! Handles sending and receiving messages as packets
 //!
 //! BcMediaCodex is used with a `[tokio_util::codec::Framed]` to form complete packets
 //!

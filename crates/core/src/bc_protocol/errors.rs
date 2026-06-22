@@ -45,7 +45,7 @@ pub enum Error {
     },
 
     /// Raised when the camera responds with a status code over than OK
-    #[error("Camera responded with Service Unavaliable: Msg of type {id} returned code {code}")]
+    #[error("Camera responded with Service Unavailable: Msg of type {id} returned code {code}")]
     CameraServiceUnavailable {
         /// The message ID
         id: u32,

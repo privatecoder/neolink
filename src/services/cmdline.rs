@@ -2,9 +2,9 @@ use anyhow::{anyhow, Result};
 use clap::{Parser, ValueEnum};
 
 fn onoff_parse(src: &str) -> Result<bool> {
-    match src {
-        "true" | "on" | "yes" => Ok(true),
-        "false" | "off" | "no" => Ok(false),
+    match src.trim().to_lowercase().as_str() {
+        "true" | "on" | "yes" | "1" => Ok(true),
+        "false" | "off" | "no" | "0" => Ok(false),
         _ => Err(anyhow!(
             "Could not understand {}, check your input, should be true/false, on/off or yes/no",
             src
@@ -45,7 +45,7 @@ pub enum PortAction {
     /// Set both port and on/off
     Set {
         /// The new port
-        port: u32,
+        port: u16,
         /// On/off
         #[arg(value_parser = onoff_parse, action = clap::ArgAction::Set, name = "on|off")]
         enabled: bool,
@@ -53,6 +53,6 @@ pub enum PortAction {
     /// Set the port
     Port {
         /// The new port
-        port: u32,
+        port: u16,
     },
 }

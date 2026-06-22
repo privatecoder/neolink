@@ -5,6 +5,9 @@ use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use neolink_core::{bc_protocol::StreamKind, bcmedia::model::BcMedia};
 use tokio::sync::mpsc::Receiver as MpscReceiver;
 
+/// Buffer capacity for the media-frame mpsc channel feeding a consumer.
+const MEDIA_CHANNEL_CAP: usize = 500;
+
 impl NeoInstance {
     /// Streams a camera source while not paused
     pub(crate) async fn stream_while_live(
@@ -15,7 +18,7 @@ impl NeoInstance {
         let name = config.name.clone();
 
         let media_rx = if config.pause.on_motion {
-            let (media_tx, media_rx) = tokio::sync::mpsc::channel(500);
+            let (media_tx, media_rx) = tokio::sync::mpsc::channel(MEDIA_CHANNEL_CAP);
             let counter = UseCounter::new().await;
 
             let mut md = self.motion().await?;
@@ -139,7 +142,7 @@ impl NeoInstance {
 
     /// Streams a camera source
     pub(crate) async fn stream(&self, stream: StreamKind) -> AnyResult<MpscReceiver<BcMedia>> {
-        let (media_tx, media_rx) = tokio::sync::mpsc::channel(500);
+        let (media_tx, media_rx) = tokio::sync::mpsc::channel(MEDIA_CHANNEL_CAP);
         let config = self.config().await?.borrow().clone();
         let strict = config.strict;
         let thread_camera = self.clone();

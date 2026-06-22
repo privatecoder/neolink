@@ -51,7 +51,7 @@ impl BcCamera {
         } else {
             Err(Error::UnintelligibleReply {
                 reply: std::sync::Arc::new(Box::new(msg)),
-                why: "Expected ModernMsg payload with a user_list but it was not recieved",
+                why: "Expected ModernMsg payload with a user_list but it was not received",
             })
         }
     }

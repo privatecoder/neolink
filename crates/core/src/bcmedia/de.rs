@@ -8,6 +8,15 @@ type IResult<I, O, E = nom_language::error::VerboseError<I>> = Result<(I, O), no
 // PAD_SIZE: Media packets use 8 byte padding
 const PAD_SIZE: u32 = 8;
 
+/// Upper bound on a single media frame's `payload_size` / `additional_header_size`,
+/// enforced before the `take` that would buffer them. Both are wire-supplied `u32`s,
+/// so a bogus media header could otherwise drive the framing layer to buffer toward a
+/// multi-gigabyte declared size and exhaust memory (DoS), on both the TCP and UDP
+/// transports. 16 MiB is far above any real frame — a 4K key-frame is a few MiB at
+/// most, and the `additional_header` is only a handful of bytes — while still
+/// rejecting clearly malicious lengths.
+const MAX_MEDIA_PAYLOAD: u32 = 16 * 1024 * 1024;
+
 impl BcMedia {
     pub(crate) fn deserialize(buf: &mut BytesMut) -> Result<BcMedia, Error> {
         let (result, len) = match consumed(bcmedia).parse(buf) {
@@ -172,8 +181,17 @@ fn bcmedia_iframe(buf: &[u8]) -> IResult<&[u8], BcMediaIframe> {
         verify(take4, |x| matches!(x, "H264" | "H265")),
     )
     .parse(buf)?;
-    let (buf, payload_size) = le_u32(buf)?;
-    let (buf, additional_header_size) = le_u32(buf)?;
+    // Reject oversized wire lengths before the `take`s below buffer toward them (DoS).
+    let (buf, payload_size) = context(
+        "IFrame payload_size exceeds maximum",
+        verify(le_u32, |x: &u32| *x <= MAX_MEDIA_PAYLOAD),
+    )
+    .parse(buf)?;
+    let (buf, additional_header_size) = context(
+        "IFrame additional_header_size exceeds maximum",
+        verify(le_u32, |x: &u32| *x <= MAX_MEDIA_PAYLOAD),
+    )
+    .parse(buf)?;
     let (buf, microseconds) = le_u32(buf)?;
     let (buf, _unknown_b) = le_u32(buf)?;
     let (buf, time) = if additional_header_size >= 4 {
@@ -222,8 +240,17 @@ fn bcmedia_pframe(buf: &[u8]) -> IResult<&[u8], BcMediaPframe> {
         verify(take4, |x| matches!(x, "H264" | "H265")),
     )
     .parse(buf)?;
-    let (buf, payload_size) = le_u32(buf)?;
-    let (buf, additional_header_size) = le_u32(buf)?;
+    // Reject oversized wire lengths before the `take`s below buffer toward them (DoS).
+    let (buf, payload_size) = context(
+        "PFrame payload_size exceeds maximum",
+        verify(le_u32, |x: &u32| *x <= MAX_MEDIA_PAYLOAD),
+    )
+    .parse(buf)?;
+    let (buf, additional_header_size) = context(
+        "PFrame additional_header_size exceeds maximum",
+        verify(le_u32, |x: &u32| *x <= MAX_MEDIA_PAYLOAD),
+    )
+    .parse(buf)?;
     let (buf, microseconds) = le_u32(buf)?;
     let (buf, _unknown_b) = le_u32(buf)?;
     let (buf, _additional_header) = take(additional_header_size)(buf)?;
@@ -274,7 +301,14 @@ fn bcmedia_aac(buf: &[u8]) -> IResult<&[u8], BcMediaAac> {
 fn bcmedia_adpcm(buf: &[u8]) -> IResult<&[u8], BcMediaAdpcm> {
     const SUB_HEADER_SIZE: u16 = 4;
 
-    let (buf, payload_size) = le_u16(buf)?;
+    // `block_size` below is `payload_size - SUB_HEADER_SIZE`; reject a wire-supplied
+    // `payload_size` smaller than the sub-header so the subtraction cannot underflow
+    // (panic in debug / huge wrap + over-long `take` in release).
+    let (buf, payload_size) = context(
+        "ADPCM payload_size smaller than sub-header",
+        verify(le_u16, |x: &u16| *x >= SUB_HEADER_SIZE),
+    )
+    .parse(buf)?;
     let (buf, _payload_size_b) = le_u16(buf)?;
     let (buf, _magic) = context(
         "ADPCM data magic value is invalid",
@@ -549,6 +583,39 @@ mod tests {
             assert_eq!(d.len(), 244);
         } else {
             panic!();
+        }
+    }
+
+    #[test]
+    // A wire-supplied ADPCM payload_size below the sub-header size must be a parse
+    // error (not an underflow panic / over-long take). See `bcmedia_adpcm`.
+    fn rejects_adpcm_payload_smaller_than_subheader() {
+        init();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC_HEADER_BCMEDIA_ADPCM.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes()); // payload_size < SUB_HEADER_SIZE (4)
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // payload_size_b
+        match BcMedia::deserialize(&mut BytesMut::from(&bytes[..])) {
+            Ok(_) => panic!("expected a parse error"),
+            Err(Error::NomIncomplete(_)) => panic!("expected a hard error, got incomplete"),
+            Err(_) => {}
+        }
+    }
+
+    #[test]
+    // An oversized wire payload_size must be rejected before the take buffers
+    // toward it (DoS). See `MAX_MEDIA_PAYLOAD`.
+    fn rejects_oversize_iframe_payload() {
+        init();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC_HEADER_BCMEDIA_IFRAME.to_le_bytes());
+        bytes.extend_from_slice(b"H264");
+        bytes.extend_from_slice(&(super::MAX_MEDIA_PAYLOAD + 1).to_le_bytes()); // payload_size
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // additional_header_size
+        match BcMedia::deserialize(&mut BytesMut::from(&bytes[..])) {
+            Ok(_) => panic!("expected a parse error"),
+            Err(Error::NomIncomplete(_)) => panic!("expected a hard error, got incomplete"),
+            Err(_) => {}
         }
     }
 }
