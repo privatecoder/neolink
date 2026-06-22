@@ -64,7 +64,6 @@ impl UseCounter {
     }
 
     #[cfg(feature = "gstreamer")]
-    #[allow(dead_code)]
     pub(crate) async fn create_deactivated(&self) -> Result<Permit> {
         Ok(Permit::new(self))
     }

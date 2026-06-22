@@ -5,7 +5,7 @@ use log::*;
 use super::config::CameraConfig;
 use anyhow::{anyhow, Context, Error, Result};
 use neolink_core::bc_protocol::{
-    BcCamera, BcCameraOpt, ConnectionProtocol, Credentials, DiscoveryMethods, MaxEncryption,
+    BcCamera, BcCameraOpt, ConnectionProtocol, Credentials, MaxEncryption,
 };
 use std::{
     fmt::{Display, Error as FmtError, Formatter},
@@ -22,40 +22,30 @@ where
 
 pub(crate) enum AddressOrUid {
     Address(String),
-    #[allow(dead_code)]
-    Uid(String, DiscoveryMethods),
-    #[allow(dead_code)]
-    AddressWithUid(String, String, DiscoveryMethods),
+    Uid(String),
+    AddressWithUid(String, String),
 }
 
 impl Display for AddressOrUid {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FmtError> {
         match self {
-            AddressOrUid::AddressWithUid(addr, uid, _) => {
+            AddressOrUid::AddressWithUid(addr, uid) => {
                 write!(f, "Address: {}, UID: {}", addr, uid)
             }
             AddressOrUid::Address(host) => write!(f, "Address: {}", host),
-            AddressOrUid::Uid(host, _) => write!(f, "UID: {}", host),
+            AddressOrUid::Uid(host) => write!(f, "UID: {}", host),
         }
     }
 }
 
 impl AddressOrUid {
     // Created by translating the config fields directly
-    pub(crate) fn new(
-        address: &Option<String>,
-        uid: &Option<String>,
-        method: &DiscoveryMethods,
-    ) -> Result<Self, Error> {
+    pub(crate) fn new(address: &Option<String>, uid: &Option<String>) -> Result<Self, Error> {
         match (address, uid) {
             (None, None) => Err(anyhow!("Neither address or uid given")),
-            (Some(host), Some(uid)) => Ok(AddressOrUid::AddressWithUid(
-                host.clone(),
-                uid.clone(),
-                *method,
-            )),
+            (Some(host), Some(uid)) => Ok(AddressOrUid::AddressWithUid(host.clone(), uid.clone())),
             (Some(host), None) => Ok(AddressOrUid::Address(host.clone())),
-            (None, Some(host)) => Ok(AddressOrUid::Uid(host.clone(), *method)),
+            (None, Some(host)) => Ok(AddressOrUid::Uid(host.clone())),
         }
     }
 
@@ -112,12 +102,8 @@ impl AddressOrUid {
 }
 
 pub(crate) async fn connect_and_login(camera_config: &CameraConfig) -> Result<BcCamera> {
-    let camera_addr = AddressOrUid::new(
-        &camera_config.camera_addr,
-        &camera_config.camera_uid,
-        &camera_config.discovery,
-    )
-    .unwrap();
+    let camera_addr =
+        AddressOrUid::new(&camera_config.camera_addr, &camera_config.camera_uid).unwrap();
     info!(
         "{}: Connecting to camera at {}",
         camera_config.name, camera_addr

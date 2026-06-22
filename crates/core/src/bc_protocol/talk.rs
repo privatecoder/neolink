@@ -231,7 +231,7 @@ impl BcCamera {
 
             // Time to play the sample in seconds
             let play_length = samples_sent as f32 / sample_rate as f32;
-            std::thread::sleep(std::time::Duration::from_secs_f32(play_length));
+            tokio::time::sleep(std::time::Duration::from_secs_f32(play_length)).await;
         }
 
         self.talk_stop().await?;

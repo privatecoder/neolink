@@ -53,7 +53,8 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
                             "{:<12} {:>4} {:>16}",
                             user.user_name,
                             user.user_id
-                                .expect("user_id should exist when reading users"),
+                                .map(|id| id.to_string())
+                                .unwrap_or_else(|| "-".to_owned()),
                             match user.user_level {
                                 0 => "User".to_owned(),
                                 1 => "Administrator".to_owned(),

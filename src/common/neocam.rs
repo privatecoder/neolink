@@ -30,7 +30,6 @@ use crate::{
 };
 use neolink_core::bc_protocol::BcCamera;
 
-#[allow(dead_code)]
 pub(crate) enum NeoCamCommand {
     HangUp,
     Instance(OneshotSender<Result<NeoInstance>>),

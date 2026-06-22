@@ -137,7 +137,9 @@ fn bc_legacy<W: Write>(legacy: &'_ LegacyMsg) -> impl SerializeFn<W> + '_ {
                 slice(&[])(out)
             }
             UnknownMsg => {
-                panic!("Cannot serialize an unknown message!");
+                // Cannot serialize an unknown message; signal an error like the
+                // LoginMsg arm above instead of panicking.
+                Err(GenError::CustomError(0))
             }
         }
     }
@@ -193,6 +195,26 @@ fn test_legacy_login_roundtrip() {
     let msg2 = Bc::deserialize(&context, &mut bytes::BytesMut::from(ser_buf.as_slice())).unwrap();
     assert_eq!(msg, msg2);
     assert_eq!(&sample[..], ser_buf.as_slice());
+}
+
+#[test]
+fn test_legacy_unknown_msg_errors_not_panics() {
+    // Serializing a LegacyMsg::UnknownMsg is unsupported. It must return an
+    // error rather than panicking (it used to `panic!`).
+    let msg = Bc {
+        meta: BcMeta {
+            msg_id: 0,
+            channel_id: 0,
+            stream_type: 0,
+            response_code: 0,
+            msg_num: 0,
+            class: 0x6514,
+        },
+        body: BcBody::LegacyMsg(LegacyMsg::UnknownMsg),
+    };
+
+    let result = msg.serialize(vec![], &EncryptionProtocol::Unencrypted);
+    assert!(result.is_err());
 }
 
 #[test]

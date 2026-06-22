@@ -103,7 +103,7 @@ impl BcCamera {
 
         sub_set.send(get).await?;
         if let Ok(reply) =
-            tokio::time::timeout(tokio::time::Duration::from_millis(500), sub_set.recv()).await
+            tokio::time::timeout(crate::bc_protocol::CMD_REPLY_TIMEOUT, sub_set.recv()).await
         {
             let msg = reply?;
             if msg.meta.response_code != 200 {
