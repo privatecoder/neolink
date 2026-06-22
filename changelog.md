@@ -10,6 +10,46 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## 0.7.13
+
+Robustness fixes and a code-quality pass.
+
+### Fixes
+
+- **Discovery no longer aborts on a stray datagram.** During relay-assisted P2P
+  hole-punching the discovery UDP socket is exposed to the network and can
+  receive foreign, non-Baichuan datagrams (other protocols, NAT keepalives,
+  scanners). A single such packet previously logged an error and tore down the
+  discovery attempt; it is now skipped (logged at `debug`) and discovery keeps
+  reading. Relay/camera terminate signals and genuine socket errors remain fatal.
+- **`talk` no longer blocks the async runtime.** Playback pacing used a blocking
+  `std::thread::sleep` inside the async `talk` path, stalling other tasks on that
+  worker thread; it now uses `tokio::time::sleep`.
+- **Several panics replaced with clean errors.** `neolink talk <camera>` with no
+  audio source, a non-UTF-8 `--file-path`, a camera that omits `user_id` in the
+  `users` listing, and re-serializing an unknown legacy message now return errors
+  instead of panicking.
+
+### Notes
+
+- Internal cleanup (no behavioural change): removed dead code — an unused
+  `BcCamera` field, an unused enum variant, and an unused field/parameter — and
+  promoted duplicated timeout/capacity literals to named constants.
+- No configuration changes are required.
+- Verified: `cargo build`, `cargo test`, `cargo clippy`, `cargo fmt` all clean.
+
+### References
+
+- Full history: [`changelog.md`](changelog.md).
+
+### Docker image
+
+```bash
+docker pull ghcr.io/privatecoder/neolink:0.7.13
+```
+
+---
+
 ## 0.7.12
 
 Hardens camera snapshot reliability.
