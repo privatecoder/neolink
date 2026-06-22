@@ -9,7 +9,6 @@ use std::{
     time::Duration,
 };
 use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
 
 use Md5Trunc::*;
 
@@ -58,6 +57,13 @@ pub use stream::{StreamData, StreamKind};
 
 pub(crate) type Result<T> = std::result::Result<T, Error>;
 
+/// How long a one-shot command waits for the camera's reply message before
+/// giving up. Shared by the floodlight/led/users/services/pir command helpers.
+pub(crate) const CMD_REPLY_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Ceiling for the exponential reconnect/registration backoff (seconds).
+const MAX_BACKOFF_SECS: u64 = 60;
+
 #[derive(Clone, Copy)]
 enum ReadKind {
     ReadOnly,
@@ -79,8 +85,6 @@ pub struct BcCamera {
     /// Features (e.g. "battery", "floodlight_tasks") the camera has rejected as
     /// unsupported, so the doomed request is not re-sent on this connection.
     unsupported: RwLock<HashSet<String>>,
-    #[allow(dead_code)]
-    cancel: CancellationToken,
 }
 
 /// Options used to construct a camera
@@ -247,8 +251,8 @@ impl BcCamera {
                         if retry >= max_retry && max_retry > 0 {
                             return Err(Error::DiscoveryTimeout);
                         }
-                        // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, then cap at 60s
-                        let backoff_secs = std::cmp::min(1u64 << retry, 60);
+                        // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, then cap at MAX_BACKOFF_SECS
+                        let backoff_secs = std::cmp::min(1u64 << retry, MAX_BACKOFF_SECS);
                         log::info!("{}: Registration with reolink servers failed. Retrying in {}s: {}/{}",
                             options.name,
                             backoff_secs,
@@ -266,7 +270,7 @@ impl BcCamera {
                             let uid_remote = uid.clone();
                             info!("{}: Trying remote discovery", options.name);
                             let result = discovery
-                                .remote(&uid_remote, &reg_result)
+                                .remote(&reg_result)
                                 .await;
                             match result {
                                 Ok(disc) => {
@@ -385,7 +389,6 @@ impl BcCamera {
             credentials: Credentials::new(username, passwd),
             abilities: Default::default(),
             unsupported: Default::default(),
-            cancel: CancellationToken::new(),
         };
         me.keepalive().await?;
         Ok(me)

@@ -15,6 +15,9 @@ use tokio::{sync::RwLock, task::JoinSet};
 
 type MsgHandler = dyn 'static + Send + Sync + for<'a> Fn(&'a Bc) -> BoxFuture<'a, Option<Bc>>;
 
+/// Buffer capacity for a subscriber's incoming-message channel.
+const SUB_CHANNEL_CAP: usize = 500;
+
 #[derive(Default)]
 struct Subscriber {
     /// Subscribers based on their ID and their num
@@ -125,7 +128,7 @@ impl BcConnection {
     }
 
     pub async fn subscribe(&self, msg_id: u32, msg_num: u16) -> Result<BcSubscription<'_>> {
-        let (tx, rx) = channel(500);
+        let (tx, rx) = channel(SUB_CHANNEL_CAP);
         self.poll_commander
             .send(PollCommand::AddSubscriber(msg_id, Some(msg_num), tx))
             .await?;
@@ -153,7 +156,7 @@ impl BcConnection {
     ///
     /// This function creates a temporary handle to grab this single message
     pub async fn subscribe_to_id(&self, msg_id: u32) -> Result<BcSubscription<'_>> {
-        let (tx, rx) = channel(500);
+        let (tx, rx) = channel(SUB_CHANNEL_CAP);
         self.poll_commander
             .send(PollCommand::AddSubscriber(msg_id, None, tx))
             .await?;

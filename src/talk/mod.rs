@@ -73,20 +73,22 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
     }
 
     let (mut set, rx) = match (&opt.file_path, &opt.microphone) {
-        (Some(path), false) => gst::from_input(
-            &format!(
-                "filesrc location={}",
-                path.to_str().expect("File path not UTF8 complient")
-            ),
-            opt.volume,
-            opt.noise_suppression,
-            opt.echo_cancel,
-            opt.echo_suppression_level,
-            opt.noise_suppression_level,
-            block_size,
-            sample_rate,
-        )
-        .with_context(|| format!("Failed to setup gst with the file: {:?}", path))?,
+        (Some(path), false) => {
+            let path_str = path
+                .to_str()
+                .ok_or_else(|| anyhow!("--file-path is not valid UTF-8: {:?}", path))?;
+            gst::from_input(
+                &format!("filesrc location={}", path_str),
+                opt.volume,
+                opt.noise_suppression,
+                opt.echo_cancel,
+                opt.echo_suppression_level,
+                opt.noise_suppression_level,
+                block_size,
+                sample_rate,
+            )
+            .with_context(|| format!("Failed to setup gst with the file: {:?}", path))?
+        }
         (None, true) => gst::from_input(
             &opt.input_src,
             opt.volume,
@@ -98,7 +100,11 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
             sample_rate,
         )
         .context("Failed to setup gst using the microphone")?,
-        _ => unreachable!(),
+        _ => {
+            return Err(anyhow!(
+                "Provide an audio source: --file-path <path> or --microphone"
+            ))
+        }
     };
 
     camera

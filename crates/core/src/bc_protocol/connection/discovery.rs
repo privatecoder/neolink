@@ -1346,12 +1346,7 @@ impl Discovery {
     //
     // This method is best when broadcasts are not possible but we can contact the camera
     // directly
-    #[allow(unused)]
-    pub(crate) async fn remote(
-        &self,
-        uid: &str,
-        reg_result: &RegisterResult,
-    ) -> Result<DiscoveryResult> {
+    pub(crate) async fn remote(&self, reg_result: &RegisterResult) -> Result<DiscoveryResult> {
         trace!("Start remote");
         let connect_result = tokio::select! {
             v = self.discoverer.client_initiated_dev(reg_result) => {v},

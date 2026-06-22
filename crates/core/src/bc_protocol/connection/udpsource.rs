@@ -50,6 +50,10 @@ const SOCKET_OUT_CAPACITY: usize = 32768;
 /// was too tight on remote/relay paths (one RTT); 500 ms covers several.
 pub const DEFAULT_GAP_SKIP_WAIT_MS: u64 = 500;
 
+/// Per-step timeout used while reconnecting the UDP socket (send/connect/handshake)
+/// after a send failure, e.g. on a lossy cellular network.
+const UDP_RECONNECT_STEP: Duration = Duration::from_millis(250);
+
 pub(crate) type InnerFramed = Framed<Compat<IntoAsyncRead<UdpPayloadSource>>, BcCodex>;
 pub(crate) struct UdpSource {
     inner: Pin<Box<InnerFramed>>,
@@ -387,7 +391,7 @@ impl UdpPayloadInner {
                             },
                             packet = socket_in_rx.next() => {
                                 let packet = packet.ok_or(Error::BcUdpDropSender)?;
-                                match tokio::time::timeout(tokio::time::Duration::from_millis(250), inner.send((packet, thread_camera_addr))).await {
+                                match tokio::time::timeout(UDP_RECONNECT_STEP, inner.send((packet, thread_camera_addr))).await {
                                     Ok(written) => {
                                         written?;
                                     }
@@ -396,8 +400,8 @@ impl UdpPayloadInner {
                                         // Socket is (maybe) broken
                                         // Seems to happen with network reconnects like over
                                         // a lossy cellular network
-                                        let stream = Arc::new(tokio::time::timeout(tokio::time::Duration::from_millis(250), connect_try_port(inner.inner.get_ref().local_addr()?.port())).await.map_err(|_| Error::BcUdpReconnectTimeout)??);
-                                        inner = tokio::time::timeout(tokio::time::Duration::from_millis(250), BcUdpSource::new_from_socket(stream, inner.addr)).await.map_err(|_| Error::BcUdpReconnectTimeout)??;
+                                        let stream = Arc::new(tokio::time::timeout(UDP_RECONNECT_STEP, connect_try_port(inner.inner.get_ref().local_addr()?.port())).await.map_err(|_| Error::BcUdpReconnectTimeout)??);
+                                        inner = tokio::time::timeout(UDP_RECONNECT_STEP, BcUdpSource::new_from_socket(stream, inner.addr)).await.map_err(|_| Error::BcUdpReconnectTimeout)??;
 
                                         // Inform the camera that we are the same client
                                         //
@@ -413,7 +417,7 @@ impl UdpPayloadInner {
                                                     did: thread_camera_id,
                                                 }),
                                         });
-                                        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(250), inner.send((msg, thread_camera_addr))).await;
+                                        let _ = tokio::time::timeout(UDP_RECONNECT_STEP, inner.send((msg, thread_camera_addr))).await;
                                     }
                                 }
 

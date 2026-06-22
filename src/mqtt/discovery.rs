@@ -91,17 +91,9 @@ struct DiscoveryLight {
 }
 
 #[derive(Serialize, Debug)]
-#[allow(dead_code)]
 enum Encoding {
-    None,
     #[serde(rename = "b64")]
     Base64,
-}
-
-impl Encoding {
-    fn is_none(&self) -> bool {
-        matches!(self, Self::None)
-    }
 }
 
 #[derive(Serialize, Debug)]
@@ -114,7 +106,6 @@ struct DiscoveryCamera {
     availability: DiscoveryAvaliablity,
     // Camera specific
     topic: String,
-    #[serde(skip_serializing_if = "Encoding::is_none")]
     image_encoding: Encoding,
 }
 
