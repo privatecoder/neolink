@@ -88,7 +88,7 @@ use log::*;
 use mqttc::{Mqtt, MqttReplyRef};
 
 use self::{
-    discovery::enable_discovery,
+    discovery::{disable_discovery, enable_discovery},
     mqttc::{MqttInstance, MqttReply},
 };
 
@@ -136,11 +136,28 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
                                 loop {
                                     let camera = thread_reactor2.get(&name).await?;
                                     let mqtt_instance = mqtt_instance.resubscribe().await?;
+                                    // Capture handles for discovery cleanup before the originals
+                                    // are moved into listen_on_camera. Used only on local_cancel
+                                    // (camera removed from config) to clear retained HA discovery.
+                                    let cleanup_camera = camera.clone();
+                                    let cleanup_mqtt = mqtt_instance.resubscribe().await?;
                                     let r = tokio::select!{
                                         _ = thread_global_cancel.cancelled() => {
                                             AnyResult::Ok(())
                                         },
                                         _ = local_cancel.cancelled() => {
+                                            // Camera removed from config: clear its retained Home
+                                            // Assistant discovery configs so no ghost entities are
+                                            // left on the broker. Best-effort; a failure here must
+                                            // not block shutdown of this handler.
+                                            if let Ok(conf_watch) = cleanup_camera.config().await {
+                                                let mqtt_conf = conf_watch.borrow().mqtt.clone();
+                                                if let Some(dc) = mqtt_conf.discovery.as_ref() {
+                                                    if let Err(e) = disable_discovery(dc, &cleanup_mqtt, &name).await {
+                                                        log::warn!("{name}: failed to clear MQTT discovery on removal: {e:?}");
+                                                    }
+                                                }
+                                            }
                                             AnyResult::Ok(())
                                         },
                                         v = listen_on_camera(camera, mqtt_instance) => {
@@ -173,8 +190,18 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
                         }
                     }
 
-                    for (running_name, token) in cameras.iter() {
-                        if ! config_names.contains(running_name) {
+                    // Cancel AND remove cameras no longer in the config. Removing
+                    // the entry matters: re-adding a camera is gated on
+                    // `!cameras.contains_key(name)`, so a stale (cancelled) entry
+                    // left behind would permanently block that camera from being
+                    // restarted on a later config reload.
+                    let to_remove: Vec<String> = cameras
+                        .iter()
+                        .filter(|(running_name, _)| !config_names.contains(*running_name))
+                        .map(|(running_name, _)| running_name.clone())
+                        .collect();
+                    for running_name in to_remove {
+                        if let Some(token) = cameras.remove(&running_name) {
                             token.cancel();
                         }
                     }
@@ -871,7 +898,7 @@ async fn handle_mqtt_message(
                 "OK"
             }
             .to_string();
-            mqtt.send_message("control/ir", &reply, false)
+            mqtt.send_message("control/reboot", &reply, false)
                 .await
                 .with_context(|| "Failed to publish reboot on the camera")?;
         }
@@ -1007,7 +1034,7 @@ async fn handle_mqtt_message(
                 "FAIL"
             }
             .to_string();
-            mqtt.send_message("control/ir", &reply, false)
+            mqtt.send_message("control/ptz/preset", &reply, false)
                 .await
                 .with_context(|| "Failed to publish ptz move")?;
         }
@@ -1046,7 +1073,7 @@ async fn handle_mqtt_message(
                 "FAIL"
             }
             .to_string();
-            mqtt.send_message("control/ir", &reply, false)
+            mqtt.send_message("control/ptz/assign", &reply, false)
                 .await
                 .with_context(|| "Failed to publish ptz move")?;
         }
@@ -1100,12 +1127,21 @@ async fn handle_mqtt_message(
             topic: "control/wakeup",
             message,
         } => {
+            // `message` is an attacker-supplied MQTT payload (minutes to stay
+            // awake). Cap it so `mins * 60` cannot overflow and a bogus value
+            // cannot pin the camera connected for an absurd duration.
+            const MAX_WAKEUP_MINS: u64 = 24 * 60; // 24 hours
             let reply = match message.parse::<u64>() {
-                Ok(secs) => {
+                Ok(mins) if mins > MAX_WAKEUP_MINS => {
+                    error!("Wakeup minutes {mins} exceeds max {MAX_WAKEUP_MINS}");
+                    format!("FAIL: wakeup minutes {mins} exceeds max {MAX_WAKEUP_MINS}")
+                }
+                Ok(mins) => {
                     if let Ok(permit) = camera.permit().await {
                         // This task waits for the `run_task` to send the OK then starts the countdown
                         // to drop the permit
                         let camera = camera.clone();
+                        let secs = mins * 60; // bounded by MAX_WAKEUP_MINS above
                         tokio::task::spawn(async move {
                             // Wait for connection then start the countdown
                             // By using a run_task we can delay the countdown until AFTER we are connected
@@ -1113,15 +1149,14 @@ async fn handle_mqtt_message(
                                 .run_task(|_cam| Box::pin(async move { AnyResult::Ok(()) }))
                                 .await;
 
-                            sleep(Duration::from_secs(secs * 60)).await;
+                            sleep(Duration::from_secs(secs)).await;
 
                             drop(permit);
                         });
-                        "OK"
+                        "OK".to_string()
                     } else {
-                        "FAIL: Camera shutting down"
+                        "FAIL: Camera shutting down".to_string()
                     }
-                    .to_string()
                 }
                 Err(e) => {
                     error!("Failed to parse minutes: {:?}", e);
@@ -1310,7 +1345,7 @@ async fn handle_mqtt_message(
                     match ser_xml {
                         Ok(bytes) => match String::from_utf8(bytes) {
                             Ok(str) => {
-                                mqtt.send_message("status/ptz", &str, false)
+                                mqtt.send_message("status/ptz/preset", &str, false)
                                     .await
                                     .with_context(|| "Failed to publish ptz info")?;
                                 "OK"
@@ -1328,7 +1363,7 @@ async fn handle_mqtt_message(
                 }
             }
             .to_string();
-            mqtt.send_message("query/ptz", &reply, false)
+            mqtt.send_message("query/ptz/preset", &reply, false)
                 .await
                 .with_context(|| "Failed to publish ptz query")?;
         }

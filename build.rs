@@ -8,7 +8,7 @@ fn main() {
 
 fn build_ver() {
     let cargo_ver = env::var("CARGO_PKG_VERSION").unwrap();
-    let version = git_ver().unwrap_or(format!("{}", cargo_ver));
+    let version = git_ver().unwrap_or(cargo_ver.to_string());
 
     println!("cargo:rustc-env=NEOLINK_VERSION={}", version);
     println!(

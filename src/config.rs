@@ -10,8 +10,12 @@ use std::collections::HashSet;
 use validator::Validate;
 use validator::ValidationError;
 
+// Accept both the bare (`request`/`require`) and the GStreamer-style trailing-d
+// spellings (`requested`/`required`) — the latter is what sample_config.toml has
+// long documented and what users naturally copy. The consumer (`set_up_tls`)
+// maps both spellings, so the regex and the match stay in agreement.
 static RE_TLS_CLIENT_AUTH: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^(none|request|require)$").unwrap());
+    Lazy::new(|| Regex::new(r"^(none|request|requested|require|required)$").unwrap());
 static RE_PAUSE_MODE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(black|still|test|none)$").unwrap());
 static RE_MAXENC_SRC: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^([nN]one|[Aa][Ee][Ss]|[Bb][Cc][Ee][Nn][Cc][Rr][Yy][Pp][Tt])$").unwrap()
@@ -66,6 +70,36 @@ pub(crate) struct Config {
     /// `NEOLINK_STREAM_CACHE_PATH` environment variable.
     #[serde(default)]
     pub(crate) stream_cache_path: Option<String>,
+}
+
+impl Config {
+    /// Resolve each camera's effective `offline_timeout_secs` from the
+    /// per-camera ?? global ?? 0 precedence, and enforce the >=60s safety floor
+    /// (a value below it would tear a viewer down mid camera-reboot, the exact
+    /// failure the keepalive avoids). After this every camera holds a concrete
+    /// resolved value, so consumers read a single effective number.
+    ///
+    /// This MUST be applied identically at startup (`main.rs`) and on every
+    /// runtime config reload (the reactor's `update_config`); otherwise a
+    /// reloaded sub-60 value would violate the floor and an unset value would
+    /// flip from inherit-global to 0.
+    pub(crate) fn resolve_offline_timeouts(&mut self) {
+        let global_offline_timeout = self.offline_timeout_secs;
+        for cam in self.cameras.iter_mut() {
+            let mut secs = cam
+                .offline_timeout_secs
+                .or(global_offline_timeout)
+                .unwrap_or(0);
+            if secs > 0 && secs < 60 {
+                log::warn!(
+                    "{}: offline_timeout_secs={secs} is below the 60s floor; clamping to 60 (must exceed your camera's reboot time)",
+                    cam.name
+                );
+                secs = 60;
+            }
+            cam.offline_timeout_secs = Some(secs.min(86400));
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Validate, PartialEq, Eq)]

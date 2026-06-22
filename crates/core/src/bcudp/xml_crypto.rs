@@ -5,7 +5,10 @@ const XML_KEY: [u32; 8] = [
 pub(crate) fn decrypt(offset: u32, buf: &[u8]) -> Vec<u8> {
     let key = XML_KEY
         .iter()
-        .flat_map(|i| (i + offset).to_le_bytes())
+        // `offset` is the wire-supplied transaction id, so `i + offset` can overflow.
+        // Use `wrapping_add`: release already wraps, and wrapping matches the crypto's
+        // intent, so this only removes the debug-build overflow panic.
+        .flat_map(|i| i.wrapping_add(offset).to_le_bytes())
         .cycle();
     buf.iter().zip(key).map(|(byte, key)| key ^ byte).collect()
 }
@@ -21,6 +24,14 @@ fn test_udp_xml_crypto() {
 
     let decrypted = decrypt(87, &sample[..]);
     assert_eq!(decrypted, &should_be[..]);
+}
+
+#[test]
+fn decrypt_large_offset_does_not_panic() {
+    // `offset` is a wire-supplied tid; near u32::MAX, `i + offset` would overflow and
+    // panic in debug builds. `wrapping_add` must make this a no-panic.
+    let data = [0u8; 64];
+    let _ = decrypt(u32::MAX, &data);
 }
 
 #[test]

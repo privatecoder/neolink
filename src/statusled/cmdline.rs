@@ -2,9 +2,9 @@ use anyhow::{anyhow, Result};
 use clap::Parser;
 
 fn onoff_parse(src: &str) -> Result<bool> {
-    match src {
-        "true" | "on" | "yes" => Ok(true),
-        "false" | "off" | "no" => Ok(false),
+    match src.trim().to_lowercase().as_str() {
+        "true" | "on" | "yes" | "1" => Ok(true),
+        "false" | "off" | "no" | "0" => Ok(false),
         _ => Err(anyhow!(
             "Could not understand {}, check your input, should be true/false, on/off or yes/no",
             src

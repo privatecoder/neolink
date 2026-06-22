@@ -2,7 +2,7 @@ use super::{BcCamera, Result};
 use crate::bc::model::*;
 
 impl BcCamera {
-    /// Ping the camera will either return Ok(()) which means a sucess reply
+    /// Ping the camera will either return Ok(()) which means a success reply
     /// or error
     pub async fn ping(&self) -> Result<()> {
         let connection = self.get_connection();

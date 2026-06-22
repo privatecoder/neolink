@@ -66,7 +66,24 @@ impl NeoReactor {
                             }
                             NeoReactorCommand::Get(name, sender) => {
                                 let new = match instances.entry(name.clone()) {
-                                    Entry::Occupied(occ) => Result::Ok(Some(occ.get().subscribe().await?)),
+                                    Entry::Occupied(occ) if occ.get().is_alive() => Result::Ok(Some(occ.get().subscribe().await?)),
+                                    Entry::Occupied(mut occ) => {
+                                        // Entry exists but its NeoCam was torn down (e.g. a
+                                        // CameraLoginFail cancelled it). Rebuild from the current
+                                        // config so a corrected credential / config takes effect
+                                        // without a process restart, rather than handing back a
+                                        // dead instance.
+                                        let current_config: Config = (*thread_config_tx.borrow()).clone();
+                                        if let Some(config) = current_config.cameras.iter().find(|cam| cam.name == name).cloned() {
+                                            log::info!("{name}: previous camera instance had stopped; recreating");
+                                            let cam = NeoCam::new(config).await?;
+                                            Result::Ok(Some(occ.insert(cam).subscribe().await?))
+                                        } else {
+                                            // No longer in config; forget it.
+                                            occ.remove();
+                                            Result::Ok(None)
+                                        }
+                                    }
                                     Entry::Vacant(vac) => {
                                         let current_config: Config = (*thread_config_tx.borrow()).clone();
                                         if let Some(config) = current_config.cameras.iter().find(|cam| cam.name == name).cloned() {
@@ -85,14 +102,32 @@ impl NeoReactor {
                                 };
                                 let _ = sender.send(new);
                             },
-                            NeoReactorCommand::UpdateConfig(new_conf, reply) => {
+                            NeoReactorCommand::UpdateConfig(mut new_conf, reply) => {
+                                // Resolve offline-timeout precedence + 60s floor identically
+                                // to startup (main.rs) so a runtime reload doesn't regress to
+                                // raw values (sub-60 violating the floor, unset flipping to 0).
+                                new_conf.resolve_offline_timeouts();
+
                                 // Shutdown or Notify instances of a change
                                 let mut names = new_conf.cameras.iter().filter(|cam_conf| cam_conf.enabled).map(|cam_conf| (cam_conf.name.clone(), cam_conf.clone())).collect::<HashMap<_,_>>();
                                 // Remove those no longer in the config
                                 instances.retain(|name, _| names.contains_key(name));
-                                for (name, instance) in instances.iter() {
+                                for (name, instance) in instances.iter_mut() {
                                     if let Some(conf) = names.remove(name) {
-                                        let _ = instance.update_config(conf).await;
+                                        if instance.is_alive() {
+                                            let _ = instance.update_config(conf).await;
+                                        } else {
+                                            // The NeoCam's tasks were cancelled (e.g. a prior
+                                            // CameraLoginFail tore it down). Pushing config into a
+                                            // dead instance does nothing, so recreate it: a corrected
+                                            // credential / config now revives the camera on reload
+                                            // instead of leaving a zombie that never reconnects.
+                                            log::info!("{name}: camera tasks had stopped; recreating on config reload");
+                                            match NeoCam::new(conf).await {
+                                                Ok(cam) => { *instance = cam; }
+                                                Err(e) => log::warn!("{name}: failed to recreate camera on config reload: {e:?}"),
+                                            }
+                                        }
                                     }
                                 }
 

@@ -92,9 +92,17 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
                 CmdDirection::Down => Direction::Down,
                 CmdDirection::Stop => Direction::Stop,
             };
-            let speed = speed.unwrap_or(32) as f32;
+            let speed = speed.unwrap_or(32);
+            // `speed` is the divisor for the move duration; an explicit 0 would
+            // make `amount / speed` non-finite (inf/NaN) and panic
+            // `Duration::from_secs_f32`. Reject it with a clear error.
+            if speed == 0 {
+                return Err(anyhow::anyhow!("PTZ speed must be greater than 0 (got 0)"));
+            }
+            let speed = speed as f32;
             let seconds = amount as f32 / speed;
-            let duration = Duration::from_secs_f32(seconds);
+            let duration = Duration::try_from_secs_f32(seconds)
+                .context("PTZ move duration is out of range")?;
             camera
                 .run_task(|cam| {
                     Box::pin(async move {

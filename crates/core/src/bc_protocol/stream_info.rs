@@ -46,7 +46,7 @@ impl BcCamera {
         } else {
             Err(Error::UnintelligibleReply {
                 reply: std::sync::Arc::new(Box::new(msg)),
-                why: "Expected StreamInfoList xml but it was not recieved",
+                why: "Expected StreamInfoList xml but it was not received",
             })
         }
     }

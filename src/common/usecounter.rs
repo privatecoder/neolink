@@ -116,7 +116,7 @@ impl Permit {
         self.value
             .clone()
             .wait_for(|curr| {
-                log::trace!("aquired_users: {}", *curr);
+                log::trace!("acquired_users: {}", *curr);
                 *curr > 0
             })
             .await?;

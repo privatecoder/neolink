@@ -64,7 +64,7 @@ impl BcCamera {
                 } else {
                     return Err(Error::UnintelligibleReply {
                         reply: std::sync::Arc::new(Box::new(msg)),
-                        why: "Expected PirSate xml but it was not recieved",
+                        why: "Expected PirState xml but it was not received",
                     });
                 }
             }

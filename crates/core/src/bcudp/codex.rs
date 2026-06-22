@@ -1,4 +1,4 @@
-//! Handles sending and recieving messages as complete packets
+//! Handles sending and receiving messages as complete packets
 //!
 //! BcUdpCodex is used with a `[tokio_util::codec::Framed]` to form complete packets
 //!
