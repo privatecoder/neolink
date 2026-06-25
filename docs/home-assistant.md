@@ -91,11 +91,19 @@ If a stream's codec has already been seen once (it's cached), Neolink serves the
 pipeline **immediately** from cache and connects to the camera in the background — so
 a card opened while the camera is offline, or a camera that reboots while a card is
 open, no longer fails or times out. During the gap Neolink streams a low-rate
-placeholder (a black video frame plus matching silent audio, encoded once at the
-camera's resolution / AAC rate) so the viewer keeps both negotiated tracks alive; when
-the camera comes back the session **hands off to live video on its own, with no
-reconnect**. In the add-on log you'll see `…: keepalive: encoded …` when it starts and
-`…: first camera keyframe received; switching from keepalive to live` on recovery.
+placeholder plus matching silent audio so the viewer keeps both negotiated tracks
+alive. Once the camera has produced a real keyframe for that stream, Neolink caches
+that camera keyframe and replays it as the video placeholder. That replayed frame
+carries the camera's own H264/H265 parameter sets (SPS/PPS/VPS), so the SDP/caps the
+client negotiated match the live stream exactly and go2rtc / Home Assistant do not
+drop into a reconnect loop at the placeholder-to-live handoff. A locally encoded black
+frame is only used as the cold-start fallback before any real keyframe has been seen
+for that stream (for example right after the add-on starts and the camera has never
+connected). When the camera comes back the session **hands off to live video on its
+own, with no reconnect**. In debug logs you'll see `keepalive: replaying cached camera
+… IDR` when the cached camera frame is used, `…: keepalive: encoded …` only for the
+cold-start fallback, and `…: first camera keyframe received; switching from keepalive
+to live` on recovery.
 
 The placeholder is held **indefinitely by design** — there is no internal time limit,
 so an always-on wall-dashboard card stays connected through an arbitrarily long outage

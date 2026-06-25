@@ -1,7 +1,7 @@
 [package]
 name = "neolink"
 description = "A standards-compliant bridge to Reolink IP cameras"
-version = "0.7.14"
+version = "0.7.15"
 authors = ["privatecoder"]
 edition = "2021"
 license = "AGPL-3.0-or-later"

@@ -10,6 +10,39 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## 0.7.15
+
+Live-view reliability fix for Home Assistant / go2rtc: the RTSP keepalive
+placeholder now preserves the camera's own codec parameter sets, and the
+forwarder's backpressure queue self-corrects latency instead of pinning it.
+Together these fix a reconnect loop where a stream would connect and then
+immediately drop.
+
+### Fixes — RTSP / live view
+
+- **Keepalive no longer breaks the placeholder→live handoff.** When a client
+  connected before the camera produced its first frame, Neolink served a
+  locally-encoded black keyframe whose H264/H265 parameter sets (SPS/PPS, plus
+  VPS for H265) differed from the camera's. The RTSP/SDP parameters the client
+  negotiated were inferred from that synthetic frame, so when the real camera
+  bitstream arrived a strict client (go2rtc / Home Assistant) rejected it and
+  reconnected — a tight reconnect loop where the stream never held, made worse
+  once a camera fell behind and clients lingered on the placeholder. Neolink now
+  caches each stream's first valid real camera keyframe (one carrying complete
+  parameter sets) and replays *that* as the keepalive placeholder, so the
+  negotiated parameters match the live stream exactly. The synthetic black frame
+  remains only as a cold-start fallback, before any real keyframe has been seen
+  for that stream.
+- **Backpressure now drops the oldest queued frame, not the newest.** The
+  forwarder→sender bridge queue previously discarded the incoming frame when full
+  and kept the stale backlog, so a brief camera lag pinned latency at the backlog
+  depth (the `CATCHUP enter (lag=…)` path) and starved recovery. It now evicts the
+  oldest queued frame and enqueues the newest, so latency self-corrects; an
+  evicted video frame's clock advance is carried forward to the next delivered
+  video frame, keeping the media clock continuous (no PTS jump / A-V drift).
+
+No configuration changes are required.
+
 ## 0.7.14
 
 Security and robustness release: hardens the protocol parsers against malformed

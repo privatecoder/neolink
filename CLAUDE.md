@@ -193,7 +193,9 @@ content-clock anchored once to the video clock (`aud_anchored`). Do NOT switch
 audio to arrival-based timestamps — audio is constant-rate but arrives bursty, so
 arrival-timed PTS destabilizes the pipeline and causes periodic stalls (tried, fails).
 The catch-up/backpressure drop paths must keep advancing the video clock
-(`video_microseconds` helper) so it stays continuous across dropped frames.
+(`video_microseconds` helper) so it stays continuous across dropped frames. The
+forwarder bridge queue is drop-oldest; when it evicts video, carry that clock advance
+into the next delivered video frame.
 
 ## Config
 
