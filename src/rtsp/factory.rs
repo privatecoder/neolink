@@ -473,20 +473,109 @@ pub(super) async fn make_factory(
                         let (stream_config, mut buffer, permit, mut media_rx, vid_src, aud_src, use_keepalive, reconcile_baseline) =
                             if let Some(cached) = cached.filter(|c| c.vid_type.is_some()) {
                                 // ===== Fast path: stream type is cached =====
-                                // Build the pipeline from cached caps and return it to
-                                // gstreamer immediately, so the RTSP callback unblocks and
-                                // the client can reach PLAY without the camera being online.
-                                // Then connect in the background and feed the appsrc. The
-                                // stream layer (run_passive_task) keeps media_rx open across
-                                // camera drops, so once an offline camera (re)connects the
-                                // frames flow into the existing session with no client
-                                // reconnect.
+                                // Usually build the pipeline from cached caps and return it to
+                                // gstreamer immediately. On process-cold startup (no real IDR
+                                // captured in memory yet), optionally wait briefly for the first
+                                // camera keyframe before replying so go2rtc does not see a
+                                // keepalive-only stream during P2P startup.
                                 log::info!(
-                                    "{name}::{stream}: Using cached stream types (serving immediately): video={:?}, audio={:?}",
+                                    "{name}::{stream}: Using cached stream types: video={:?}, audio={:?}",
                                     cached.vid_type, cached.aud_type
                                 );
                                 let stream_config =
                                     StreamConfig::from_cache(&cached, config.buffer_duration);
+                                let startup_wait_secs =
+                                    config.startup_keyframe_wait_secs.unwrap_or(5);
+                                let warm_real_idr = stream_config
+                                    .vid_type
+                                    .and_then(|vt| cached_real_idr(&cache_key, vt))
+                                    .is_some();
+                                let startup_mode = cached_fast_path_startup_mode(
+                                    startup_wait_secs,
+                                    warm_real_idr,
+                                );
+
+                                // permit() + stream_while_live() return promptly even while
+                                // the camera is mid-outage; media_rx stays empty until the
+                                // camera is reachable.
+                                let connect = async {
+                                    let permit = camera.permit().await?;
+                                    let media_rx = camera.stream_while_live(stream).await?;
+                                    log::info!("{name}::{stream}: Camera relay established");
+                                    AnyResult::Ok((permit, media_rx))
+                                };
+                                let (permit, media_rx) = tokio::select! {
+                                    _ = cancel_child.cancelled() => {
+                                        log::debug!("{name}::{stream}: client setup cancelled before the camera connected");
+                                        let _ = reply.send(SetupOutcome::Unavailable);
+                                        return Ok(());
+                                    }
+                                    r = tokio::time::timeout(Duration::from_secs(20), connect) => match r {
+                                        Ok(Ok(v)) => v,
+                                        Ok(Err(e)) => {
+                                            log::warn!("{name}::{stream}: camera setup failed: {e:?}");
+                                            let _ = reply.send(SetupOutcome::Unavailable);
+                                            return Ok(());
+                                        }
+                                        Err(_) => {
+                                            log::warn!("{name}::{stream}: camera setup did not complete within 20s (camera likely unavailable)");
+                                            let _ = reply.send(SetupOutcome::Unavailable);
+                                            return Ok(());
+                                        }
+                                    }
+                                };
+
+                                let mut media_rx = media_rx;
+                                let mut startup_buffer = Vec::new();
+                                let mut use_keepalive = true;
+                                if let CachedStartupMode::WaitForKeyframe(wait) = startup_mode {
+                                    log::info!(
+                                        "{name}::{stream}: waiting up to {:?} for first camera keyframe before serving cached RTSP stream",
+                                        wait
+                                    );
+                                    let deadline = tokio::time::sleep(wait);
+                                    tokio::pin!(deadline);
+                                    loop {
+                                        tokio::select! {
+                                            _ = cancel_child.cancelled() => {
+                                                let _ = reply.send(SetupOutcome::Unavailable);
+                                                return Ok(());
+                                            }
+                                            _ = &mut deadline => {
+                                                log::info!(
+                                                    "{name}::{stream}: startup keyframe wait timed out after {:?}; serving cached keepalive",
+                                                    wait
+                                                );
+                                                startup_buffer.clear();
+                                                break;
+                                            }
+                                            media = media_rx.recv() => {
+                                                let Some(media) = media else {
+                                                    log::info!(
+                                                        "{name}::{stream}: camera stream ended during startup keyframe wait; serving cached keepalive"
+                                                    );
+                                                    startup_buffer.clear();
+                                                    break;
+                                                };
+                                                let keyframe = is_video_keyframe(&media);
+                                                if keyframe {
+                                                    cache_real_idr(&cache_key, &media);
+                                                }
+                                                startup_buffer.push(media);
+                                                if keyframe {
+                                                    log::info!(
+                                                        "{name}::{stream}: startup keyframe received before RTSP reply; serving live stream immediately"
+                                                    );
+                                                    use_keepalive = false;
+                                                    startup_buffer = drain_from_first_keyframe(startup_buffer)
+                                                        .unwrap_or_default();
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
                                 let (vid_src, aud_src) = match build_sources(
                                     &element,
                                     &stream_config,
@@ -501,23 +590,9 @@ pub(super) async fn make_factory(
                                     }
                                 };
                                 let _ = reply.send(SetupOutcome::Pipeline(element));
-
-                                // permit() + stream_while_live() return promptly even while
-                                // the camera is mid-outage; media_rx stays empty until the
-                                // camera is reachable.
-                                let connect = async {
-                                    let permit = camera.permit().await?;
-                                    let media_rx = camera.stream_while_live(stream).await?;
-                                    log::info!("{name}::{stream}: Camera relay established");
-                                    AnyResult::Ok((permit, media_rx))
-                                };
-                                let (permit, media_rx) = tokio::select! {
-                                    _ = cancel_child.cancelled() => return Ok(()),
-                                    r = connect => r?,
-                                };
                                 // The cached value is the reconcile baseline: confirm the live
                                 // stream still matches it once frames flow (see the live loop).
-                                (stream_config, Vec::new(), permit, media_rx, vid_src, aud_src, true, Some(cached))
+                                (stream_config, startup_buffer, permit, media_rx, vid_src, aud_src, use_keepalive, Some(cached))
                             } else {
                                 // ===== Slow path: stream type not cached =====
                                 // We must reach the camera to learn the codec before the
@@ -2904,6 +2979,25 @@ fn media_queue_capacity(stream_config: &StreamConfig) -> usize {
     target.max(min_capacity).min(5000)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CachedStartupMode {
+    Immediate,
+    WaitForKeyframe(Duration),
+}
+
+fn cached_fast_path_startup_mode(wait_secs: u32, warm_real_idr: bool) -> CachedStartupMode {
+    if wait_secs == 0 || warm_real_idr {
+        CachedStartupMode::Immediate
+    } else {
+        CachedStartupMode::WaitForKeyframe(Duration::from_secs(wait_secs as u64))
+    }
+}
+
+fn drain_from_first_keyframe(mut frames: Vec<BcMedia>) -> Option<Vec<BcMedia>> {
+    let first_keyframe = frames.iter().position(is_video_keyframe)?;
+    Some(frames.split_off(first_keyframe))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3037,5 +3131,39 @@ mod tests {
             .recv_timeout(Duration::ZERO)
             .expect("second queued item");
         assert_eq!(second.vid_advance_us, 1_000);
+    }
+
+    #[test]
+    fn cached_fast_path_gate_waits_only_when_cold_and_enabled() {
+        assert_eq!(
+            cached_fast_path_startup_mode(5, false),
+            CachedStartupMode::WaitForKeyframe(Duration::from_secs(5))
+        );
+        assert_eq!(
+            cached_fast_path_startup_mode(0, false),
+            CachedStartupMode::Immediate
+        );
+        assert_eq!(
+            cached_fast_path_startup_mode(5, true),
+            CachedStartupMode::Immediate
+        );
+    }
+
+    #[test]
+    fn startup_gate_drain_starts_at_first_real_keyframe() {
+        let frames = vec![pframe(1000), iframe(h264_idr(0x33), 2000), pframe(3000)];
+
+        let drained = drain_from_first_keyframe(frames).expect("keyframe split");
+
+        assert_eq!(drained.len(), 2);
+        assert!(is_video_keyframe(&drained[0]));
+        assert!(matches!(drained[1], BcMedia::Pframe(_)));
+    }
+
+    #[test]
+    fn startup_gate_times_out_when_no_keyframe_was_buffered() {
+        let frames = vec![pframe(1000), pframe(2000)];
+
+        assert!(drain_from_first_keyframe(frames).is_none());
     }
 }
