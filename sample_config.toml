@@ -6,6 +6,10 @@ bind = "0.0.0.0"
 # Default port is 8554 but you can change it by uncommenting the following
 # bind_port = 8554
 
+# On a cached RTSP cold start, wait briefly for the first real camera keyframe
+# before serving the keepalive placeholder. 0 disables this wait.
+# startup_keyframe_wait_secs = 5
+
 # Uncomment the following and supply a path to a valid PEM
 # to activate TLS encryption.
 # The PEM should contain the certificate and the private key

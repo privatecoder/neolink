@@ -87,23 +87,27 @@ setup/teardown, adding to the churn.
 
 ## Opening an offline camera / surviving a reboot
 
-If a stream's codec has already been seen once (it's cached), Neolink serves the
-pipeline **immediately** from cache and connects to the camera in the background — so
-a card opened while the camera is offline, or a camera that reboots while a card is
-open, no longer fails or times out. During the gap Neolink streams a low-rate
-placeholder plus matching silent audio so the viewer keeps both negotiated tracks
-alive. Once the camera has produced a real keyframe for that stream, Neolink caches
-that camera keyframe and replays it as the video placeholder. That replayed frame
-carries the camera's own H264/H265 parameter sets (SPS/PPS/VPS), so the SDP/caps the
-client negotiated match the live stream exactly and go2rtc / Home Assistant do not
-drop into a reconnect loop at the placeholder-to-live handoff. A locally encoded black
-frame is only used as the cold-start fallback before any real keyframe has been seen
-for that stream (for example right after the add-on starts and the camera has never
-connected). When the camera comes back the session **hands off to live video on its
-own, with no reconnect**. In debug logs you'll see `keepalive: replaying cached camera
-… IDR` when the cached camera frame is used, `…: keepalive: encoded …` only for the
-cold-start fallback, and `…: first camera keyframe received; switching from keepalive
-to live` on recovery.
+If a stream's codec has already been seen once (it's cached), Neolink can serve the
+pipeline from cache and connect to the camera in the background — so a card opened
+while the camera is offline, or a camera that reboots while a card is open, no longer
+fails or times out. On a fresh Neolink process, before that stream has produced its
+first real keyframe, Neolink waits briefly (`startup_keyframe_wait_secs`, default 5s)
+before serving the cached RTSP pipeline; if the keyframe arrives in that window, the
+session starts straight on live video instead of exposing a keepalive-only stream to
+go2rtc. If the wait expires, or after a real keyframe has already been cached in
+memory, Neolink serves the cached pipeline immediately and streams a low-rate
+placeholder plus matching silent audio during any gap.
+
+Once the camera has produced a real keyframe for that stream, Neolink caches that
+camera keyframe and replays it as the video placeholder. That replayed frame carries
+the camera's own H264/H265 parameter sets (SPS/PPS/VPS), so the SDP/caps the client
+negotiated match the live stream exactly. A locally encoded black frame is only used
+as the cold-start fallback before any real keyframe has been seen for that stream.
+When the camera comes back the session **hands off to live video on its own, with no
+reconnect**. In debug logs you'll see `keepalive: replaying cached camera … IDR` when
+the cached camera frame is used, `…: keepalive: encoded …` only for the cold-start
+fallback, and `…: first camera keyframe received; switching from keepalive to live` on
+recovery.
 
 The placeholder is held **indefinitely by design** — there is no internal time limit,
 so an always-on wall-dashboard card stays connected through an arbitrarily long outage
@@ -116,6 +120,59 @@ One prerequisite: the codec/rate are only cached after a *successful* view, so t
 online. After that, offline opens and reboots recover automatically. The silent-audio
 part needs an AAC stream; if it can't be built, the stream falls back to the previous
 behaviour (video keepalive only, which some players still drop during a long outage).
+
+## Live view connects then drops in a reconnect loop
+
+**Symptom.** After Neolink (re)starts — or intermittently — a camera's live view never
+holds: it connects and drops within a second, retries every few seconds, and the card
+shows nothing. Neolink's log shows the session counter climbing fast, many
+`Client disconnected during keepalive (3 vid / 3 aud pushed …)` lines, and sessions that
+reach `switching from keepalive to live` then `Client disconnected` almost immediately.
+
+**Why it happens.** Two things combine:
+
+1. **A cold-start race.** A Reolink camera takes ~2–3 s to connect over P2P after Neolink
+   starts. The cached RTSP fast path, by design, can answer a client *immediately* from
+   the cached codec info and serve a low-rate keepalive placeholder while the camera
+   connects in the background. But go2rtc (Home Assistant's RTSP/WebRTC bridge) waits only
+   a few hundred milliseconds for a real keyframe — it receives ~3 keepalive frames, sees
+   no real video, and **disconnects**.
+2. **go2rtc reconnect hysteresis.** That first bail tips go2rtc into an aggressive ~5 s
+   reconnect storm. Once storming, it reconnects *faster than a stable stream can
+   establish* and drops even healthy sessions, so it doesn't self-heal — only a calm
+   restart (or the fixes below) clears it. Neolink isn't closing those sessions; the
+   teardown is client-driven (you'll see the gstreamer `push_buffer => FLUSHING` in a
+   debug log). Each retry also makes Neolink spin up a fresh per-client camera video
+   stream, adding churn.
+
+When Neolink happens to win the race (the camera produces a keyframe before go2rtc gives
+up), the same stream plays perfectly for minutes — which is why the failure looks
+intermittent and "a restart sometimes fixes it."
+
+**The fixes (use both):**
+
+- **Neolink side — remove the trigger.** `startup_keyframe_wait_secs` (default **5 s**, on
+  by default) makes the cached fast path, on the first open of a stream since Neolink
+  started, **wait for the camera's first real keyframe before answering** — so go2rtc's
+  first PLAY gets real video and never bails on keepalive-only media. The cost is that the
+  first open per camera after a restart shows a brief "connecting" (up to ~5 s, usually
+  the ~2–3 s P2P connect) instead of an instant placeholder; warm opens are unaffected.
+  Set it to `0` to restore the old immediate-serve behaviour.
+- **Home Assistant side — remove the amplifier.** Don't give each card a raw
+  `rtsp://…:8558/…` URL (every card then makes its own impatient, no-backoff connection).
+  Register the cameras **once** as named go2rtc streams so a single go2rtc owns one
+  producer per camera and reconnects with sane backoff, then reference them by **name**:
+
+  ```yaml
+  # go2rtc config
+  streams:
+    front-door:  rtsp://homeassistant.local:8558/front-door/sub
+    driveway:    rtsp://homeassistant.local:8558/driveway/sub
+  ```
+
+  then in the card use `url: front-door` (the stream name, not an `rtsp://` URL). See
+  ["Define the stream once in go2rtc"](#define-the-stream-once-in-go2rtc) for the exact
+  card wiring and the built-in-go2rtc caveat.
 
 ## Recommended configurations
 

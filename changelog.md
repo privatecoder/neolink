@@ -10,6 +10,37 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## 0.7.16
+
+Fixes the Home Assistant / go2rtc live-view **reconnect loop after a restart**: on a
+cold start the cached RTSP fast path now briefly waits for the camera's first real
+keyframe before serving, instead of exposing a keepalive-only stream that go2rtc
+rejects during the camera's P2P connect.
+
+### Fixes — RTSP / live view
+
+- **Cold-start keyframe gate stops the post-restart reconnect storm.** After Neolink
+  (re)starts, a camera needs ~2–3 s to connect over P2P. The cached fast path used to
+  answer the RTSP client and serve the keepalive placeholder **immediately**, before any
+  real frame existed — and go2rtc bails after ~300 ms of keepalive, which tips it into a
+  rapid reconnect storm that doesn't self-heal even once the camera is up. Neolink now,
+  on the first open of a stream since process start (no real keyframe cached yet), waits
+  up to `startup_keyframe_wait_secs` (default **5 s**) for the first real camera keyframe
+  and then serves the session straight on live video. If the wait expires (camera truly
+  offline) it falls back to the previous keepalive placeholder, so offline-open still
+  works. Warm opens (a real keyframe already cached) and `startup_keyframe_wait_secs = 0`
+  are unchanged — immediate as before.
+  - New option `startup_keyframe_wait_secs` (global default + per-camera override,
+    range 0–60; `0` disables the wait). The first open of each camera after a restart
+    now shows a brief "connecting" rather than an instant placeholder, in exchange for
+    the stream holding reliably.
+  - This complements the parameter-set + backpressure fixes in 0.7.15. The remaining
+    amplifier — go2rtc reconnecting aggressively once tripped — is best addressed
+    HA-side by giving go2rtc a single named stream to own (see
+    [`docs/home-assistant.md`](docs/home-assistant.md)).
+
+No configuration changes are required; the gate is on by default.
+
 ## 0.7.15
 
 Live-view reliability fix for Home Assistant / go2rtc: the RTSP keepalive

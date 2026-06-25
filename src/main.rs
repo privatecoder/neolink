@@ -84,10 +84,10 @@ async fn main() -> Result<()> {
         .validate()
         .with_context(|| format!("Failed to validate the {:?} config file", conf_path))?;
 
-    // Resolve the offline-timeout precedence (per-camera ?? global ?? 0) and the
-    // >=60s safety floor. The same resolution runs on every runtime config reload
-    // (reactor `update_config`), so startup and reload resolve identically.
+    // Resolve config precedence so startup and runtime reloads see identical
+    // per-camera concrete values.
     config.resolve_offline_timeouts();
+    config.resolve_startup_keyframe_waits();
 
     let neo_reactor = NeoReactor::new(config.clone()).await;
 

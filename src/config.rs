@@ -70,6 +70,18 @@ pub(crate) struct Config {
     /// `NEOLINK_STREAM_CACHE_PATH` environment variable.
     #[serde(default)]
     pub(crate) stream_cache_path: Option<String>,
+
+    #[validate(range(
+        min = 0,
+        max = 60,
+        message = "Invalid startup keyframe wait seconds",
+        code = "startup_keyframe_wait_secs"
+    ))]
+    /// Global default for how many seconds the cached RTSP fast path waits at process
+    /// startup for the first real keyframe before serving keepalive. `0` disables the
+    /// wait. A per-camera `startup_keyframe_wait_secs` overrides this.
+    #[serde(default)]
+    pub(crate) startup_keyframe_wait_secs: Option<u32>,
 }
 
 impl Config {
@@ -98,6 +110,17 @@ impl Config {
                 secs = 60;
             }
             cam.offline_timeout_secs = Some(secs.min(86400));
+        }
+    }
+
+    /// Resolve each camera's effective `startup_keyframe_wait_secs` from the
+    /// per-camera ?? global ?? 5 precedence. Unlike `offline_timeout_secs`, `0` is a
+    /// deliberate opt-out, so there is no floor.
+    pub(crate) fn resolve_startup_keyframe_waits(&mut self) {
+        let global_wait = self.startup_keyframe_wait_secs;
+        for cam in self.cameras.iter_mut() {
+            let secs = cam.startup_keyframe_wait_secs.or(global_wait).unwrap_or(5);
+            cam.startup_keyframe_wait_secs = Some(secs.min(60));
         }
     }
 }
@@ -286,6 +309,18 @@ pub(crate) struct CameraConfig {
     /// `offline_timeout_secs`. `0` = never; values 1-59 are clamped up to the 60s floor.
     #[serde(default, alias = "offline_timeout")]
     pub(crate) offline_timeout_secs: Option<u32>,
+
+    #[validate(range(
+        min = 0,
+        max = 60,
+        message = "Invalid startup keyframe wait seconds",
+        code = "startup_keyframe_wait_secs"
+    ))]
+    /// Seconds the cached RTSP fast path waits at process startup for a first real
+    /// keyframe before serving keepalive. Unset = inherit the global
+    /// `startup_keyframe_wait_secs`; `0` disables the wait.
+    #[serde(default)]
+    pub(crate) startup_keyframe_wait_secs: Option<u32>,
 
     #[serde(default = "default_maxenc")]
     #[validate(regex(
@@ -676,5 +711,58 @@ mod tests {
         // Guard the existing default while adding the new opt-in flag next to it.
         let config: MqttConfig = toml::from_str("").unwrap();
         assert!(config.enable_motion);
+    }
+
+    fn minimal_config(toml_prefix: &str, camera_extra: &str) -> Config {
+        let raw = format!(
+            r#"
+{toml_prefix}
+
+[[cameras]]
+name = "cam"
+uid = "uid"
+username = "user"
+password = "pass"
+{camera_extra}
+"#
+        );
+        toml::from_str(&raw).unwrap()
+    }
+
+    #[test]
+    fn startup_keyframe_wait_defaults_to_five_seconds() {
+        let mut config = minimal_config("", "");
+
+        config.resolve_startup_keyframe_waits();
+
+        assert_eq!(config.cameras[0].startup_keyframe_wait_secs, Some(5));
+    }
+
+    #[test]
+    fn startup_keyframe_wait_inherits_global_default() {
+        let mut config = minimal_config("startup_keyframe_wait_secs = 7", "");
+
+        config.resolve_startup_keyframe_waits();
+
+        assert_eq!(config.cameras[0].startup_keyframe_wait_secs, Some(7));
+    }
+
+    #[test]
+    fn startup_keyframe_wait_camera_override_can_disable_gate() {
+        let mut config = minimal_config(
+            "startup_keyframe_wait_secs = 7",
+            "startup_keyframe_wait_secs = 0",
+        );
+
+        config.resolve_startup_keyframe_waits();
+
+        assert_eq!(config.cameras[0].startup_keyframe_wait_secs, Some(0));
+    }
+
+    #[test]
+    fn startup_keyframe_wait_rejects_values_above_sixty() {
+        let config = minimal_config("startup_keyframe_wait_secs = 61", "");
+
+        assert!(config.validate().is_err());
     }
 }

@@ -103,10 +103,10 @@ impl NeoReactor {
                                 let _ = sender.send(new);
                             },
                             NeoReactorCommand::UpdateConfig(mut new_conf, reply) => {
-                                // Resolve offline-timeout precedence + 60s floor identically
-                                // to startup (main.rs) so a runtime reload doesn't regress to
-                                // raw values (sub-60 violating the floor, unset flipping to 0).
+                                // Resolve config precedence identically to startup (main.rs) so a
+                                // runtime reload doesn't regress to raw unset / inherited values.
                                 new_conf.resolve_offline_timeouts();
+                                new_conf.resolve_startup_keyframe_waits();
 
                                 // Shutdown or Notify instances of a change
                                 let mut names = new_conf.cameras.iter().filter(|cam_conf| cam_conf.enabled).map(|cam_conf| (cam_conf.name.clone(), cam_conf.clone())).collect::<HashMap<_,_>>();

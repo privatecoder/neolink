@@ -89,6 +89,10 @@ offline_timeout_secs = 0  # global default: seconds an RTSP viewer is served the
                           # session is torn down. 0 = never (default; held
                           # indefinitely). Per-camera offline_timeout_secs overrides
                           # this. Values 1-59 are raised to a 60s floor.
+startup_keyframe_wait_secs = 5  # global default: on a cached cold-start open,
+                                # wait this many seconds for the first real
+                                # keyframe before serving keepalive. 0 disables
+                                # the wait. Per-camera value overrides this.
 
 # Persist learned camera stream types to disk so that, after a restart, a known
 # camera's "stream not ready" placeholder can still be built before the camera is
@@ -444,6 +448,7 @@ All per-camera options (under `[[cameras]]`), with defaults. Sub-tables
 | `connect_mode` (aliases `connect`, `connection_mode`) | `always` | `always` (aliases `connected`, `on`) or `on_demand` (aliases `ondemand`, `demand`, `lazy`) — see [Connection Modes](#connection-modes). |
 | `idle_timeout_secs` (aliases `idle_timeout`, `idle_secs`) | `0` | In `always` mode: disconnect after N s idle (range 0–86400; `0` = never). Ignored in `on_demand`. |
 | `offline_timeout_secs` (alias `offline_timeout`) | *(inherits global)* | Seconds an RTSP viewer is served the offline placeholder (no real camera frames) before that session is torn down (range 0–86400); `0` = never (default; placeholder held indefinitely so it recovers on its own). Unset inherits the top-level global `offline_timeout_secs`; values 1-59 are raised to a 60 s floor. Per-session — the shared camera connection keeps reconnecting for any other viewers. |
+| `startup_keyframe_wait_secs` | *(inherits global; default 5)* | On a cached RTSP cold start, seconds to wait for the first real keyframe before serving the keepalive placeholder (range 0–60); `0` disables the wait and restores immediate keepalive serving. Once a real keyframe has been cached in memory, warm opens are immediate. |
 | `relay_warm_seconds` (aliases `relay_warm`, `relay_warm_secs`) | `60` | In `on_demand` mode: keep the connection warm N s after the last client (range 0–3600; `0` = disconnect immediately). Ignored in `always`. |
 | `udp_gap_skip_ms` | `500` | Reliable-UDP: how long to wait (ms, range 0–5000) for a missing packet before skipping it. Raise on lossy links (favours completeness over latency); on a clean link it rarely triggers. |
 | `buffer_duration` (aliases `buffer`, `duration`) | `3000` | Size of Neolink's internal video buffer, expressed as ms of stream (range 1–15000). Larger absorbs network jitter/bursts (smoother, more latency); smaller = lower latency, less burst tolerance. |
