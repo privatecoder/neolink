@@ -1,5 +1,8 @@
 use gstreamer::ClockTime;
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    time::Duration,
+};
 
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory};
@@ -13,8 +16,7 @@ use neolink_core::{
 };
 use once_cell::sync::Lazy;
 use std::future::Future;
-use std::sync::mpsc as std_mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -46,7 +48,7 @@ where
 }
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{RecvTimeoutError, TrySendError};
+use std::sync::mpsc::RecvTimeoutError;
 
 // Stream-type cache types and persistence live in `stream_cache`; factory only
 // constructs keys/values and calls `stream_cache::get`/`store`.
@@ -252,6 +254,116 @@ struct TimedMedia {
     /// continuous across forwarder drops instead of jumping/resetting. 0 for audio /
     /// non-video frames (they don't drive the video clock).
     vid_advance_us: u64,
+}
+
+#[derive(Clone)]
+struct BoundedMediaQueue {
+    inner: Arc<BoundedMediaQueueInner>,
+}
+
+struct BoundedMediaQueueInner {
+    capacity: usize,
+    state: Mutex<BoundedMediaQueueState>,
+    available: Condvar,
+}
+
+struct BoundedMediaQueueState {
+    items: VecDeque<TimedMedia>,
+    closed: bool,
+    pending_vid_advance_us: u64,
+}
+
+enum QueuePushOutcome {
+    Pushed,
+    Evicted { kind: u8 },
+}
+
+#[derive(Debug)]
+struct QueueDisconnected;
+
+impl BoundedMediaQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            inner: Arc::new(BoundedMediaQueueInner {
+                capacity: capacity.max(1),
+                state: Mutex::new(BoundedMediaQueueState {
+                    items: VecDeque::new(),
+                    closed: false,
+                    pending_vid_advance_us: 0,
+                }),
+                available: Condvar::new(),
+            }),
+        }
+    }
+
+    fn push_latest(&self, mut timed: TimedMedia) -> Result<QueuePushOutcome, QueueDisconnected> {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed {
+            return Err(QueueDisconnected);
+        }
+
+        let mut outcome = QueuePushOutcome::Pushed;
+        if state.items.len() >= self.inner.capacity {
+            if let Some(evicted) = state.items.pop_front() {
+                let kind = media_kind(&evicted.media);
+                if kind == 1 {
+                    Self::carry_video_advance(&mut state, evicted.vid_advance_us);
+                }
+                outcome = QueuePushOutcome::Evicted { kind };
+            }
+        }
+
+        if is_video(&timed.media) && state.pending_vid_advance_us > 0 {
+            timed.vid_advance_us = timed
+                .vid_advance_us
+                .saturating_add(state.pending_vid_advance_us);
+            state.pending_vid_advance_us = 0;
+        }
+
+        state.items.push_back(timed);
+        self.inner.available.notify_one();
+        Ok(outcome)
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> Result<TimedMedia, RecvTimeoutError> {
+        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = if state.items.is_empty() && !state.closed {
+            self.inner
+                .available
+                .wait_timeout_while(state, timeout, |s| s.items.is_empty() && !s.closed)
+                .unwrap_or_else(|e| e.into_inner())
+                .0
+        } else {
+            state
+        };
+
+        if let Some(timed) = state.items.pop_front() {
+            Ok(timed)
+        } else if state.closed {
+            Err(RecvTimeoutError::Disconnected)
+        } else {
+            Err(RecvTimeoutError::Timeout)
+        }
+    }
+
+    fn disconnect(&self) {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.closed = true;
+        self.inner.available.notify_all();
+    }
+
+    fn carry_video_advance(state: &mut BoundedMediaQueueState, advance_us: u64) {
+        if advance_us == 0 {
+            return;
+        }
+        for queued in &mut state.items {
+            if is_video(&queued.media) {
+                queued.vid_advance_us = queued.vid_advance_us.saturating_add(advance_us);
+                return;
+            }
+        }
+        state.pending_vid_advance_us = state.pending_vid_advance_us.saturating_add(advance_us);
+    }
 }
 
 /// Owns a session's per-bucket gstreamer `BufferPool`s and deactivates each one
@@ -512,17 +624,14 @@ pub(super) async fn make_factory(
                                 (stream_config, buffer, permit, media_rx, vid_src, aud_src, false, None)
                             };
 
-                        // ---- Clean fix: keep tokio receiver async; forward into bounded std channel ----
+                        // ---- Keep tokio receiver async; forward into oldest-evicting queue ----
                         let queue_capacity = media_queue_capacity(&stream_config);
                         let stream_label = format!("{name}::{stream}");
                         log::info!(
                             "{stream_label}: Media queue capacity set to {}",
                             queue_capacity
                         );
-                        let (std_tx, std_rx): (
-                            std_mpsc::SyncSender<TimedMedia>,
-                            std_mpsc::Receiver<TimedMedia>,
-                        ) = std_mpsc::sync_channel(queue_capacity);
+                        let media_queue = BoundedMediaQueue::new(queue_capacity);
 
                         let in_audio = std::sync::Arc::new(AtomicU64::new(0));
                         let in_video = std::sync::Arc::new(AtomicU64::new(0));
@@ -539,6 +648,7 @@ pub(super) async fn make_factory(
                         let drop_other_fwd = drop_other.clone();
                         let label_fwd = stream_label.clone();
                         let cancel_fwd = cancel_child.clone();
+                        let queue_fwd = media_queue.clone();
 
                         // The slow-path learning buffer is drained by the sender via
                         // `video_ts_from_camera`, which advances the video clock up to the
@@ -551,8 +661,8 @@ pub(super) async fn make_factory(
                             buffer.iter().rev().find_map(video_microseconds);
 
                         // Forwarder task: runs on tokio, owns media_rx. Stops when the
-                        // camera stream ends or the generation is cancelled; dropping
-                        // std_tx then disconnects the blocking sender too.
+                        // camera stream ends or the generation is cancelled; disconnecting
+                        // the queue then stops the blocking sender too.
                         tokio::spawn(async move {
                             let mut last_drop_log = std::time::Instant::now();
                             let mut dropped = 0u64;
@@ -613,41 +723,38 @@ pub(super) async fn make_factory(
                                     media: m,
                                     vid_advance_us: vid_advance,
                                 };
-                                match std_tx.try_send(timed) {
-                                    Ok(()) => {
+                                match queue_fwd.push_latest(timed) {
+                                    Ok(outcome) => {
                                         // Delivered: the carried advance is now the sender's to
                                         // apply, so clear the accumulator (video frames only).
                                         if is_video {
                                             pending_vid_advance_us = 0;
                                         }
-                                    }
-                                    Err(TrySendError::Full(_)) => {
-                                        // Dropped: keep this frame's delta in the accumulator so
-                                        // the next delivered video frame still advances the clock
-                                        // over the gap (CLAUDE.md: drop paths must advance it).
-                                        match kind {
-                                            0 => drop_audio_fwd.fetch_add(1, Ordering::Relaxed),
-                                            1 => drop_video_fwd.fetch_add(1, Ordering::Relaxed),
-                                            _ => drop_other_fwd.fetch_add(1, Ordering::Relaxed),
-                                        };
-                                        dropped += 1;
-                                        let now = std::time::Instant::now();
-                                        if now.duration_since(last_drop_log)
-                                            >= Duration::from_secs(1)
-                                        {
-                                            log::warn!(
-                                                "{label_fwd}: Media queue full; dropped {} frames in last {:?}",
-                                                dropped,
-                                                now.duration_since(last_drop_log)
-                                            );
-                                            dropped = 0;
-                                            last_drop_log = now;
+                                        if let QueuePushOutcome::Evicted { kind } = outcome {
+                                            match kind {
+                                                0 => drop_audio_fwd.fetch_add(1, Ordering::Relaxed),
+                                                1 => drop_video_fwd.fetch_add(1, Ordering::Relaxed),
+                                                _ => drop_other_fwd.fetch_add(1, Ordering::Relaxed),
+                                            };
+                                            dropped += 1;
+                                            let now = std::time::Instant::now();
+                                            if now.duration_since(last_drop_log)
+                                                >= Duration::from_secs(1)
+                                            {
+                                                log::warn!(
+                                                    "{label_fwd}: Media queue full; dropped {} frames in last {:?}",
+                                                    dropped,
+                                                    now.duration_since(last_drop_log)
+                                                );
+                                                dropped = 0;
+                                                last_drop_log = now;
+                                            }
                                         }
                                     }
-                                    Err(TrySendError::Disconnected(_)) => break,
+                                    Err(_) => break,
                                 }
                             }
-                            // Dropping std_tx will cause std_rx.recv_timeout to return Disconnected
+                            queue_fwd.disconnect();
                         });
 
                         // Run blocking code in tokio's blocking thread pool
@@ -655,6 +762,7 @@ pub(super) async fn make_factory(
                         // Move permit into this thread to keep it alive for the session duration
                         let sender_label = stream_label.clone();
                         let cancel_send = cancel_child.clone();
+                        let queue_recv = media_queue.clone();
                         // Cache key for the fast-path reconcile inside the loop.
                         let cache_key_loop = cache_key.clone();
                         spawn_blocking_logged(sender_label, move || {
@@ -730,14 +838,18 @@ pub(super) async fn make_factory(
                             let disconnect_grace = Duration::from_secs(2);
                             let mut play_logged = false;
 
-                            // Keepalive (cached fast path only): push a low-rate black
-                            // placeholder keyframe until the camera sends its first real
-                            // keyframe, so a client that connected before the camera
-                            // produced frames doesn't time out. Encoded once at the cached
-                            // resolution, so there's no resolution change at the handoff.
+                            // Keepalive (cached fast path only): replay the last real camera
+                            // IDR until the camera sends this session's first real keyframe, so
+                            // the SDP/caps-inferred parameter sets match the live stream. Fall
+                            // back to a synthetic placeholder only before any real IDR has been
+                            // captured for this stream.
                             let keepalive = if use_keepalive {
                                 match stream_config.vid_type {
-                                    Some(vt) => keepalive_keyframe(vt, stream_config.resolution),
+                                    Some(vt) => keepalive_keyframe_for(
+                                        &cache_key_loop,
+                                        vt,
+                                        stream_config.resolution,
+                                    ),
                                     None => None,
                                 }
                             } else {
@@ -775,7 +887,7 @@ pub(super) async fn make_factory(
                             let mut seen_real_keyframe = keepalive.is_none();
                             let mut next_keepalive = Instant::now();
                             // ~10 fps during the outage; some clients treat a 1 fps stream as
-                            // stalled. The frame is a tiny black IDR, so the bitrate is trivial.
+                            // stalled. The replayed/cold-start IDR is small enough at this rate.
                             let keepalive_step = Duration::from_millis(100);
                             let mut keepalive_pushed = 0u64;
                             let mut keepalive_audio_pushed = 0u64;
@@ -800,6 +912,9 @@ pub(super) async fn make_factory(
 
                             // Send buffered frames (no pacing)
                             for buffered in buffer.drain(..) {
+                                if is_video_keyframe(&buffered) {
+                                    cache_real_idr(&cache_key_loop, &buffered);
+                                }
                                 match send_to_sources(
                                     buffered,
                                     &stream_label,
@@ -1070,7 +1185,7 @@ pub(super) async fn make_factory(
                                 } else {
                                     Duration::from_millis(200)
                                 };
-                                let mut timed = match std_rx.recv_timeout(recv_wait) {
+                                let mut timed = match queue_recv.recv_timeout(recv_wait) {
                                     Ok(d) => d,
                                     Err(RecvTimeoutError::Timeout) => {
                                         // no frame right now; loop continues (heartbeat/disconnect still works)
@@ -1086,6 +1201,9 @@ pub(super) async fn make_factory(
 
                                 stats.tryrecv_ok += 1;
                                 stats.last_media_instant = Instant::now();
+                                if is_video_keyframe(&timed.media) {
+                                    cache_real_idr(&cache_key_loop, &timed.media);
+                                }
 
                                 // ---- Fast-path reconcile (cached caps vs. live stream) ----
                                 // Observe early frames; once the codec (and audio, if cached)
@@ -1313,6 +1431,14 @@ fn is_video_keyframe(m: &BcMedia) -> bool {
 
 fn is_video(m: &BcMedia) -> bool {
     matches!(m, BcMedia::Iframe(_) | BcMedia::Pframe(_))
+}
+
+fn media_kind(m: &BcMedia) -> u8 {
+    match m {
+        BcMedia::Aac(_) | BcMedia::Adpcm(_) => 0,
+        BcMedia::Iframe(_) | BcMedia::Pframe(_) => 1,
+        _ => 2,
+    }
 }
 
 /// The camera's capture timestamp (microseconds) for a video frame, if present.
@@ -1816,8 +1942,47 @@ fn clear_bin(bin: &Element) -> Result<()> {
     Ok(())
 }
 
-static KEEPALIVE_CACHE: Lazy<std::sync::Mutex<HashMap<(u8, u32, u32), Arc<Vec<u8>>>>> =
-    Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+static KEEPALIVE_CACHE: Lazy<Mutex<HashMap<(u8, u32, u32), Arc<Vec<u8>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+static REAL_IDR_CACHE: Lazy<Mutex<HashMap<StreamCacheKey, Arc<Vec<u8>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn cache_real_idr(cache_key: &StreamCacheKey, media: &BcMedia) {
+    let BcMedia::Iframe(BcMediaIframe {
+        video_type, data, ..
+    }) = media
+    else {
+        return;
+    };
+    if !contains_keyframe_nals(data, *video_type) {
+        log::debug!("keepalive: not caching camera IDR without complete parameter sets");
+        return;
+    }
+    if let Ok(mut cache) = REAL_IDR_CACHE.lock() {
+        cache.insert(cache_key.clone(), Arc::new(data.clone()));
+    }
+}
+
+fn cached_real_idr(cache_key: &StreamCacheKey, vid_type: VideoType) -> Option<Arc<Vec<u8>>> {
+    REAL_IDR_CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(cache_key).cloned())
+        .filter(|bytes| contains_keyframe_nals(bytes, vid_type))
+}
+
+fn keepalive_keyframe_for(
+    cache_key: &StreamCacheKey,
+    vid_type: VideoType,
+    resolution: [u32; 2],
+) -> Option<Arc<Vec<u8>>> {
+    if let Some(bytes) = cached_real_idr(cache_key, vid_type) {
+        log::debug!("keepalive: replaying cached camera {vid_type:?} IDR");
+        return Some(bytes);
+    }
+    keepalive_keyframe(vid_type, resolution)
+}
 
 /// A black keyframe (Annex-B byte-stream access unit) in the given codec at the
 /// given resolution, used as low-rate keepalive RTP so a client that connected
@@ -2132,6 +2297,7 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     // Set caps so RTSP server can build SDP before data flows
     let caps = Caps::builder("video/x-h264")
         .field("stream-format", "byte-stream")
+        .field("alignment", "au")
         .build();
     source.set_caps(Some(&caps));
 
@@ -2197,6 +2363,7 @@ fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     // Set caps so RTSP server can build SDP before data flows
     let caps = Caps::builder("video/x-h265")
         .field("stream-format", "byte-stream")
+        .field("alignment", "au")
         .build();
     source.set_caps(Some(&caps));
 
@@ -2741,6 +2908,39 @@ fn media_queue_capacity(stream_config: &StreamConfig) -> usize {
 mod tests {
     use super::*;
 
+    fn test_key(id: &str) -> StreamCacheKey {
+        StreamCacheKey {
+            camera_id: id.to_string(),
+            channel_id: 0,
+            stream: StreamKind::Sub,
+        }
+    }
+
+    fn h264_idr(byte: u8) -> Vec<u8> {
+        vec![
+            0, 0, 1, 0x67, byte, // SPS
+            0, 0, 1, 0x68, byte, // PPS
+            0, 0, 1, 0x65, byte, // IDR
+        ]
+    }
+
+    fn iframe(data: Vec<u8>, micros: u32) -> BcMedia {
+        BcMedia::Iframe(BcMediaIframe {
+            video_type: VideoType::H264,
+            microseconds: micros,
+            time: None,
+            data,
+        })
+    }
+
+    fn pframe(micros: u32) -> BcMedia {
+        BcMedia::Pframe(BcMediaPframe {
+            video_type: VideoType::H264,
+            microseconds: micros,
+            data: vec![0, 0, 1, 0x41],
+        })
+    }
+
     #[test]
     fn audio_watermark_drops_at_or_above_threshold() {
         // 1 MiB cap; watermark is AUDIO_DROP_WATERMARK_PCT (80%) -> 838860 bytes.
@@ -2768,5 +2968,74 @@ mod tests {
         // on a watermark basis (there is nothing to overflow).
         assert!(!audio_over_watermark(0, 0));
         assert!(!audio_over_watermark(10_000_000, 0));
+    }
+
+    #[test]
+    fn real_idr_cache_returns_camera_keyframe_for_matching_codec() {
+        let key = test_key("real-idr-cache-returns-camera-keyframe");
+        let idr = h264_idr(0x11);
+
+        cache_real_idr(&key, &iframe(idr.clone(), 1000));
+
+        let cached = cached_real_idr(&key, VideoType::H264).expect("cached real IDR");
+        assert_eq!(&*cached, &idr);
+        assert!(
+            cached_real_idr(&key, VideoType::H265).is_none(),
+            "cached H264 IDR must not be reused for H265"
+        );
+    }
+
+    #[test]
+    fn real_idr_cache_ignores_incomplete_keyframes() {
+        let key = test_key("real-idr-cache-ignores-incomplete-keyframes");
+        let missing_pps = vec![0, 0, 1, 0x67, 0x22, 0, 0, 1, 0x65, 0x22];
+
+        cache_real_idr(&key, &iframe(missing_pps, 1000));
+
+        assert!(
+            cached_real_idr(&key, VideoType::H264).is_none(),
+            "incomplete keyframes would advertise unsafe parameter sets"
+        );
+    }
+
+    #[test]
+    fn bounded_media_queue_evicts_oldest_and_carries_video_clock() {
+        let queue = BoundedMediaQueue::new(2);
+        queue
+            .push_latest(TimedMedia {
+                recv_at: std::time::Instant::now(),
+                media: pframe(1000),
+                vid_advance_us: 1_000,
+            })
+            .expect("first push");
+        queue
+            .push_latest(TimedMedia {
+                recv_at: std::time::Instant::now(),
+                media: pframe(2000),
+                vid_advance_us: 1_000,
+            })
+            .expect("second push");
+
+        let outcome = queue
+            .push_latest(TimedMedia {
+                recv_at: std::time::Instant::now(),
+                media: pframe(3000),
+                vid_advance_us: 1_000,
+            })
+            .expect("evicting push");
+
+        assert!(matches!(outcome, QueuePushOutcome::Evicted { kind: 1 }));
+
+        let first = queue
+            .recv_timeout(Duration::ZERO)
+            .expect("first queued item");
+        assert_eq!(
+            first.vid_advance_us, 2_000,
+            "oldest dropped video clock must be carried into next delivered video"
+        );
+        let second = queue
+            .recv_timeout(Duration::ZERO)
+            .expect("second queued item");
+        assert_eq!(second.vid_advance_us, 1_000);
     }
 }

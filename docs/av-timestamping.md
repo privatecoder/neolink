@@ -45,9 +45,15 @@ The pipeline drops frames under buffer pressure but never lets the clock skip:
   cannot). P-frames are dropped once the buffer reaches ~80 % of capacity in the send
   path; a separate backpressure guard drops at `0.85` of AppSrc capacity (`0.92` for
   high-bitrate streams).
+- **Forwarder bridge queue:** the queue between the async camera receiver and the
+  blocking RTSP sender is bounded. When it fills, it evicts the **oldest queued**
+  frame and enqueues the newest frame, so latency drains toward the current camera
+  output instead of staying pinned at the backlog.
 - **The clock still advances on dropped frames.** The drop paths call
-  `video_ts_from_camera` (via `video_microseconds`) so the video PTS stays continuous
-  across gaps, which keeps the audio anchor valid and prevents PTS discontinuities.
+  `video_ts_from_camera` (via `video_microseconds`) or carry the evicted video
+  frame's clock advance forward to the next delivered video frame, so the video PTS
+  stays continuous across gaps, which keeps the audio anchor valid and prevents PTS
+  discontinuities.
 
 ## Diagnostics
 
