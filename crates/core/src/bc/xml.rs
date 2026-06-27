@@ -93,7 +93,10 @@ pub struct BcXml {
     /// The list of streams and their configuration
     #[serde(rename = "StreamInfoList", skip_serializing_if = "Option::is_none")]
     pub stream_info_list: Option<StreamInfoList>,
-    /// Thre list of streams and their configuration
+    /// The live encoder configuration
+    #[serde(rename = "Compression", skip_serializing_if = "Option::is_none")]
+    pub compression: Option<Compression>,
+    /// The camera UID
     #[serde(rename = "Uid", skip_serializing_if = "Option::is_none")]
     pub uid: Option<Uid>,
     /// The floodlight settings for automatically turning on/off on schedule/motion
@@ -841,6 +844,72 @@ pub struct StreamInfoList {
     /// The stream infos. There is usually only one of these
     #[serde(default, rename = "StreamInfo")]
     pub stream_infos: Vec<StreamInfo>,
+}
+
+/// The live encoder configuration returned by GetEnc.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct Compression {
+    /// XML Version
+    #[serde(default, rename = "@version")]
+    pub version: String,
+    /// Channel id for these encoder settings.
+    #[serde(default, rename = "channelId")]
+    pub channel_id: u32,
+    /// Whether no translate frame mode is enabled.
+    #[serde(default, rename = "isNoTranslateFrame")]
+    pub is_no_translate_frame: u32,
+    /// Main stream encoder settings.
+    #[serde(rename = "mainStream", skip_serializing_if = "Option::is_none")]
+    pub main_stream: Option<CompressionStream>,
+    /// Sub stream encoder settings.
+    #[serde(rename = "subStream", skip_serializing_if = "Option::is_none")]
+    pub sub_stream: Option<CompressionStream>,
+    /// Third stream encoder settings.
+    #[serde(rename = "thirdStream", skip_serializing_if = "Option::is_none")]
+    pub third_stream: Option<CompressionStream>,
+}
+
+/// One stream's live encoder settings returned by GetEnc.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct CompressionStream {
+    /// Whether audio is enabled for this stream.
+    #[serde(default)]
+    pub audio: u32,
+    /// Human-readable resolution name, usually `WIDTH*HEIGHT`.
+    #[serde(default, rename = "resolutionName")]
+    pub resolution_name: String,
+    /// Encoded video width.
+    #[serde(default)]
+    pub width: u32,
+    /// Encoded video height.
+    #[serde(default)]
+    pub height: u32,
+    /// Live configured frame rate.
+    #[serde(default)]
+    pub frame: u32,
+    /// Live configured bitrate in kbit/s.
+    #[serde(default, rename = "bitRate")]
+    pub bit_rate: u32,
+    /// Encoder profile name.
+    #[serde(default, rename = "encoderProfile")]
+    pub encoder_profile: String,
+    /// Video codec type, observed as 0 for H264 and 1 for H265.
+    #[serde(default, rename = "videoEncType")]
+    pub video_enc_type: u32,
+    /// Optional GOP bounds.
+    #[serde(rename = "gop", skip_serializing_if = "Option::is_none")]
+    pub gop: Option<Gop>,
+}
+
+/// GOP bounds in a GetEnc stream.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct Gop {
+    /// Current GOP setting.
+    pub cur: u32,
+    /// Maximum GOP setting.
+    pub max: u32,
+    /// Minimum GOP setting.
+    pub min: u32,
 }
 
 /// The individual reply about the stream info
@@ -1628,6 +1697,104 @@ fn test_encryption_deser() {
         top_b if top_b == b => {}
         _ => panic!(),
     }
+}
+
+#[test]
+fn test_compression_deser() {
+    let sample = indoc!(
+        r#"
+        <?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <Compression version="1.1">
+        <channelId>0</channelId>
+        <isNoTranslateFrame>1</isNoTranslateFrame>
+        <mainStream>
+        <audio>1</audio>
+        <resolutionName>3840*2160</resolutionName>
+        <width>3840</width>
+        <height>2160</height>
+        <frame>20</frame>
+        <bitRate>4096</bitRate>
+        <encoderProfile>high</encoderProfile>
+        <videoEncType>1</videoEncType>
+        <gop>
+        <cur>1</cur>
+        <max>2</max>
+        <min>1</min>
+        </gop>
+        </mainStream>
+        <subStream>
+        <audio>1</audio>
+        <resolutionName>640*360</resolutionName>
+        <width>640</width>
+        <height>360</height>
+        <frame>15</frame>
+        <bitRate>512</bitRate>
+        <encoderProfile>main</encoderProfile>
+        <videoEncType>0</videoEncType>
+        <gop>
+        <cur>1</cur>
+        <max>2</max>
+        <min>1</min>
+        </gop>
+        </subStream>
+        <thirdStream>
+        <audio>0</audio>
+        <resolutionName>896*512</resolutionName>
+        <width>896</width>
+        <height>512</height>
+        <frame>20</frame>
+        <bitRate>512</bitRate>
+        <encoderProfile>main</encoderProfile>
+        <videoEncType>0</videoEncType>
+        </thirdStream>
+        </Compression>
+        </body>"#
+    );
+
+    let b: BcXml = quick_xml::de::from_str(sample).unwrap();
+    let compression = b.compression.as_ref().unwrap();
+    let main = compression.main_stream.as_ref().unwrap();
+    let sub = compression.sub_stream.as_ref().unwrap();
+
+    assert_eq!(compression.version, "1.1");
+    assert_eq!(main.frame, 20);
+    assert_eq!(sub.frame, 15);
+    assert_eq!(sub.bit_rate, 512);
+    assert!(compression.third_stream.as_ref().unwrap().gop.is_none());
+}
+
+#[test]
+fn test_compression_deser_defaults_missing_fields() {
+    let sample = indoc!(
+        r#"
+        <?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <Compression>
+        <mainStream>
+        <frame>20</frame>
+        </mainStream>
+        <subStream>
+        <bitRate>512</bitRate>
+        </subStream>
+        </Compression>
+        </body>"#
+    );
+
+    let b: BcXml = quick_xml::de::from_str(sample).unwrap();
+    let compression = b.compression.as_ref().unwrap();
+    let main = compression.main_stream.as_ref().unwrap();
+    let sub = compression.sub_stream.as_ref().unwrap();
+
+    assert_eq!(compression.version, "");
+    assert_eq!(compression.channel_id, 0);
+    assert_eq!(compression.is_no_translate_frame, 0);
+    assert_eq!(main.frame, 20);
+    assert_eq!(main.bit_rate, 0);
+    assert_eq!(main.resolution_name, "");
+    assert_eq!(sub.frame, 0);
+    assert_eq!(sub.bit_rate, 512);
+    assert_eq!(sub.video_enc_type, 0);
 }
 
 #[test]

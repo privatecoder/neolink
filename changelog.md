@@ -10,6 +10,40 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## 0.7.17
+
+Makes the per-stream metadata Neolink caches and advertises — **frame rate, bitrate
+and resolution** — reflect the camera's *actual current encoder settings* instead of
+an ambiguous capability field. Fixes a sub stream cached at the wrong frame rate
+(e.g. 10 fps instead of 15) and a main stream that could cache the wrong bitrate or
+resolution.
+
+### Fixes — stream metadata accuracy
+
+- **Frame rate, bitrate and resolution now come from the camera's live encoder
+  config, not the capability table.** The `GetStreamInfoList` ability table Neolink
+  read carries *factory-default* `defaultFramerate` / `defaultBitrate` values (which
+  do **not** track the camera's current setting) and lists resolution per *profile*
+  (Neolink took the first match, which is wrong when the main stream isn't on the
+  first profile). Neolink now queries the encoder configuration directly
+  (`GetEnc` → `<Compression>`) and uses its literal `<frame>`, `<bitRate>` and
+  `<width>`/`<height>` as the authoritative per-stream values — both when first
+  learning a stream (cold cache) and to **self-heal** an existing cache whose values
+  drifted. It falls back cleanly to the previous behaviour on cameras that don't
+  answer the query.
+- **The delivered frame rate is also measured from the live stream as a fallback.**
+  Where the encoder query is unavailable, Neolink samples the actual inter-frame
+  timing and snaps it to the camera's frame-rate table, replacing the previously
+  persisted (and sometimes wrong) configured value. Bitrate keeps the configured cap
+  (the real VBR average runs below it).
+
+### Notes
+
+- Internal accuracy only — **no configuration changes**. The live video was always
+  passed through at the true rate; only the cached/advertised sizing metadata is
+  corrected. A stale stream cache from an earlier version self-heals the first time
+  each stream is opened.
+
 ## 0.7.16
 
 Fixes the Home Assistant / go2rtc live-view **reconnect loop after a restart**: on a
