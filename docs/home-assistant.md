@@ -63,12 +63,16 @@ Three practical takeaways:
   to a WebRTC-first card typically can't render via WebRTC and must fall back to MSE.
 - **AAC isn't carried by WebRTC.** Even with H264 video, a WebRTC session will drop
   or transcode the audio. If you want AAC to "just work," prefer MSE/HLS.
-- **The "Balanced" (extern) stream is often the best WebRTC source.** It's H264 like
-  sub, but at a higher resolution and bitrate (e.g. 896×512 vs sub's 640×360) — and it
-  is **not selectable in the Reolink app** (only in its live-quality menu). Point go2rtc
-  at `/<name>/externStream` (Neolink `stream = "Extern"` or `"All"`) for a
-  broadly-playable H264 stream sharper than sub, without the H265 main's WebRTC limits.
-  See the [Streams table in the README](../README.md#streams-main-extern-sub).
+- **The third ("extern") stream is often the best WebRTC source.** On single-lens
+  cameras it's the app's "Balanced" live quality — H264 like sub but at a higher
+  resolution/bitrate (e.g. 896×512 vs sub's 640×360); you can pick it in live view but
+  its encoder config never appears in the app's Stream settings (only main + sub do).
+  Point go2rtc at `/<name>/externStream` (Neolink `stream = "Extern"` or `"All"`)
+  for a broadly-playable H264 stream sharper than sub, without the H265 main's WebRTC
+  limits. The slot is **model-dependent**, though: on dual-lens / tracking models it's
+  the *second lens* rather than a balanced stream, and some cameras don't serve it (it
+  falls back to sub) — so check what yours actually delivers. See the
+  [Streams table in the README](../README.md#streams-main-extern-sub).
 
 ## Why the first open can be slow (the fallback cascade)
 

@@ -24,11 +24,12 @@ original Neolink authors (credited in `LICENSE` and `Cargo.toml`).
 
 ## Streams: `Main`, `Extern`, `Sub`
 
-Reolink cameras encode **three** parallel streams, but the Reolink app's *Stream*
-settings only let you configure **two** (main + sub). The third — the app's
-**"Balanced"** live-view quality — is a separate, read-only encoder exposed only in
-the app's live-quality menu (never in Stream settings) and **not** published by
-Reolink's own RTSP service. Neolink can serve all three:
+Reolink cameras encode **three** parallel streams, but the Reolink app's *Stream
+settings* only show **two** (main + sub). The third is the app's **"Balanced"**
+live-view quality: you *can* select it in live view (the **Clear / Balanced / Fluent**
+quality switch), but its encoder config never appears in Stream settings and Reolink's
+own RTSP service doesn't publish it — which is why it's easy to miss. Neolink can serve
+all three:
 
 | App live quality | Neolink `stream` | RTSP path | Wire `<streamType>` | SDK enum | Example profile\* |
 |---|---|---|---|---|---|
@@ -43,11 +44,11 @@ values from the camera — don't assume these. Set `stream = "All"` to serve all
 **Why the third stream is useful (especially for WebRTC / Home Assistant):** browsers
 play **H.264 over WebRTC everywhere**, but H.265 (the usual main-stream codec) renders
 over WebRTC only on recent Safari/Apple — elsewhere it falls back to MSE. The sub
-stream is H.264 but low-resolution (e.g. 640×360). The **extern / "Balanced" stream is
-also H.264 but at a noticeably higher resolution and bitrate** (e.g. 896×512 / ~1.2
-Mbit/s) — and it is **not selectable in the Reolink app at all**. So it is often the
-best WebRTC source: a broadly-playable H.264 stream sharper than sub, without the H.265
-main's transport limits.
+stream is H.264 but low-resolution (e.g. 640×360). On single-lens cameras the **extern
+("Balanced") stream is also H.264 but at a noticeably higher resolution and bitrate**
+(e.g. 896×512 / ~1.2 Mbit/s) — and its encoder config **isn't shown in the app's Stream
+settings at all** (only main + sub are). So it is often the best WebRTC source: a
+broadly-playable H.264 stream sharper than sub, without the H.265 main's transport limits.
 
 > Not all models serve a third stream — on those, `Extern` falls back to the sub
 > stream. On multi-lens / tracking models the "extern" slot may be the *second lens*
