@@ -32,6 +32,43 @@ Cross-references:
   `E_BC_CMD_SET_ENC_PROFILE` / `E_BC_CMD_IFRAME_PREVIEW`); the encode profile is
   whatever the camera is configured for.
 
+## Stream types — the third ("Balanced") stream
+
+Reolink cameras (RGM-203-class and similar) encode **three** parallel streams, not two.
+The official client's live-quality menu maps 1:1 to them:
+
+| Live-quality label    | Wire `<streamType>` | Encoder-config element | SDK enum (FYI)           |
+|-----------------------|---------------------|------------------------|--------------------------|
+| Clear (Klar)          | `mainStream`        | `<mainStream>`         | `E_BC_STREAM_MAIN` = 0   |
+| Balanced (Balanciert) | `externStream`      | `<thirdStream>`        | `E_BC_STREAM_EXTERN` = 4 |
+| Fluent (Flüssig)      | `subStream`         | `<subStream>`          | `E_BC_STREAM_SUB` = 1    |
+
+- The third stream is selected on the wire with `<streamType>externStream</streamType>`
+  in the `Preview` body of the video-start message (`MSG_ID_VIDEO`, 3) — the same
+  mechanism used for main/sub. **Use `externStream` as the selector, not `thirdStream`.**
+  `thirdStream` is only the element *name* in the `GetEnc` / `<Compression>` encoder-config
+  response (msg 56); it is **not** a valid `<streamType>`. The firmware's stream-type
+  string table contains exactly `mainStream`, `subStream`, `externStream`, `mobileStream`.
+- `mobileStream` (`E_BC_STREAM_MOBILE` = 2) is a separate, mobile-optimized type present
+  in the firmware string table but not exposed by the cameras tested here — a
+  known-but-untested fourth type.
+- The third stream is **Baichuan-only**: it is not published over Reolink's own RTSP
+  service (which offers only main/sub), and its encoder settings are read-only (not
+  editable in the camera's Stream settings page).
+- Its profile is **per-camera** — read it from the `GetEnc` `<Compression><thirdStream>`
+  block (`<frame>`, `<width>`/`<height>`, `<videoEncType>`) or let the decoder learn it
+  from the stream; do not hardcode. On a verified RGM-203 it encodes ~896×512 H.264
+  ~20 fps ~1.2 Mbit/s, between main (4K H.265) and sub (360p H.264).
+- **Multi-lens caveat:** on dual-lens / tracking / telephoto models the client reuses
+  `E_BC_STREAM_EXTERN` for the *second lens* rather than a "balanced" stream. So
+  `externStream` is really "the third stream slot", whose meaning is model-dependent —
+  treat it as a generic third stream, not necessarily "balanced".
+
+In Neolink this is `StreamKind::Extern`: configure it per camera with `stream = "Extern"`
+(or `"All"` = main + extern + sub) and reach it on the RTSP path `/<name>/externStream`
+(alias `/<name>/extern`). See [media-streams.md](media-streams.md) for the per-stream
+wire values and [bc-protocol.md](bc-protocol.md) for `GetEnc` (`<Compression>`).
+
 ## RDT / p2p_udt flow control
 
 The camera is the reliable-transport **sender** running **CUBIC**. Its send rate is

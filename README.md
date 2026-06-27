@@ -22,6 +22,39 @@ This is a hardened fork of Neolink, with improvements focused on connection
 stability and on-demand connection behavior. It builds on the work of the
 original Neolink authors (credited in `LICENSE` and `Cargo.toml`).
 
+## Streams: `Main`, `Extern`, `Sub`
+
+Reolink cameras encode **three** parallel streams, but the Reolink app's *Stream*
+settings only let you configure **two** (main + sub). The third — the app's
+**"Balanced"** live-view quality — is a separate, read-only encoder exposed only in
+the app's live-quality menu (never in Stream settings) and **not** published by
+Reolink's own RTSP service. Neolink can serve all three:
+
+| App live quality | Neolink `stream` | RTSP path | Wire `<streamType>` | SDK enum | Example profile\* |
+|---|---|---|---|---|---|
+| Clear / Klar | `Main` | `/<name>/mainStream` | `mainStream` | `E_BC_STREAM_MAIN` (0) | 3840×2160 · 20 fps · 4096 kbps · **H.265** |
+| **Balanced / Balanciert** | `Extern` | `/<name>/externStream` | `externStream` | `E_BC_STREAM_EXTERN` (4) | 896×512 · 20 fps · 1228 kbps · **H.264** |
+| Fluent / Flüssig | `Sub` | `/<name>/subStream` | `subStream` | `E_BC_STREAM_SUB` (1) | 640×360 · 15 fps · 512 kbps · **H.264** |
+
+\*Profiles are **per-camera** (example from a verified RGM‑203). Neolink reads the real
+values from the camera — don't assume these. Set `stream = "All"` to serve all three
+(`Main + Extern + Sub`), or `stream = "Extern"` for just the third.
+
+**Why the third stream is useful (especially for WebRTC / Home Assistant):** browsers
+play **H.264 over WebRTC everywhere**, but H.265 (the usual main-stream codec) renders
+over WebRTC only on recent Safari/Apple — elsewhere it falls back to MSE. The sub
+stream is H.264 but low-resolution (e.g. 640×360). The **extern / "Balanced" stream is
+also H.264 but at a noticeably higher resolution and bitrate** (e.g. 896×512 / ~1.2
+Mbit/s) — and it is **not selectable in the Reolink app at all**. So it is often the
+best WebRTC source: a broadly-playable H.264 stream sharper than sub, without the H.265
+main's transport limits.
+
+> Not all models serve a third stream — on those, `Extern` falls back to the sub
+> stream. On multi-lens / tracking models the "extern" slot may be the *second lens*
+> rather than a balanced stream. See [docs/reolink.md](docs/reolink.md) for the protocol
+> details and [docs/home-assistant.md](docs/home-assistant.md) for codec/transport
+> trade-offs.
+
 ## Documentation
 
 Per-camera configuration options and their defaults are in the

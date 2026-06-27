@@ -27,6 +27,9 @@ distinct values:
 `Extern` is "between SD and HD" on cameras that support it, otherwise equivalent to
 `Sub`. Stream selection is configured per camera via `stream` (`Main` | `Sub` |
 `Both` | `All` | `Extern` | `None`); `All` = Main+Extern+Sub, `Both` = Main+Sub.
+The third stream is the official app's "Balanced" live quality and is Baichuan-only
+(not on Reolink's RTSP); see [reolink.md](reolink.md) for its app label, the
+`mobileStream` type, and the model-dependent multi-lens caveat.
 
 ## Frame format
 

@@ -56,13 +56,19 @@ those codecs play:
 | **HLS** (HA `stream` / LL-HLS) | ✅ | ✅ (fMP4) | ✅ |
 | **MJPEG** | n/a (re-encoded) | n/a | ❌ no audio; CPU-heavy fallback |
 
-Two practical takeaways:
+Three practical takeaways:
 
 - **H265 over WebRTC usually fails** outside Safari. go2rtc does **not** transcode
   video by default (that would need an ffmpeg source), so an H265 main stream offered
   to a WebRTC-first card typically can't render via WebRTC and must fall back to MSE.
 - **AAC isn't carried by WebRTC.** Even with H264 video, a WebRTC session will drop
   or transcode the audio. If you want AAC to "just work," prefer MSE/HLS.
+- **The "Balanced" (extern) stream is often the best WebRTC source.** It's H264 like
+  sub, but at a higher resolution and bitrate (e.g. 896×512 vs sub's 640×360) — and it
+  is **not selectable in the Reolink app** (only in its live-quality menu). Point go2rtc
+  at `/<name>/externStream` (Neolink `stream = "Extern"` or `"All"`) for a
+  broadly-playable H264 stream sharper than sub, without the H265 main's WebRTC limits.
+  See the [Streams table in the README](../README.md#streams-main-extern-sub).
 
 ## Why the first open can be slow (the fallback cascade)
 
