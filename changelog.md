@@ -10,6 +10,39 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## 0.7.18
+
+Fixes a pre-existing bug where **two streams opened at the same instant both fail** — each
+connects, then receives no video and the client times out. This is the cause of a Home
+Assistant dashboard whose cards "all get stuck" when they load together. Also completes
+support for the **third ("extern" / "Balanced") stream**, giving it correct frame rate,
+bitrate and resolution.
+
+### Fixes — RTSP / live view
+
+- **Simultaneous cold-start no longer starves itself.** The RTSP server handled each new
+  client's cold setup (camera connect + stream-type learning) by blocking the single
+  GStreamer server thread until it finished, so two clients arriving at the same moment
+  serialized and starved each other's media delivery until both timed out. The server now
+  runs client handling on a bounded thread pool, so simultaneous opens proceed concurrently.
+  Single opens and staggered opens were always fine; only the exact-simultaneous case (e.g.
+  a dashboard loading several cards at once) was affected.
+
+### Fixes — third / "extern" stream metadata
+
+- **The third stream now reports correct fps / bitrate / resolution.** The "Balanced" / extern
+  stream has no entry in the camera's ability table, so Neolink previously cached it with
+  zero resolution/fps/bitrate (which also tripped the simultaneous-open bug above). Neolink
+  now reads the live encoder config (`GetEnc`) for it; for camera units that report a
+  zero-dimension third stream in config (a per-unit firmware quirk), it derives the
+  resolution from the H.264/H.265 keyframe **SPS** — exactly what the official client's
+  decoder does — and falls back to the measured delivered frame rate. The extern stream is
+  served over RTSP at `/<name>/externStream` (`stream = "Extern"` or `"All"`).
+
+### Notes
+
+- Internal/reliability only — **no configuration changes**. A stale stream cache self-heals.
+
 ## 0.7.17
 
 Makes the per-stream metadata Neolink caches and advertises — **frame rate, bitrate
