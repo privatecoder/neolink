@@ -13,7 +13,8 @@ use gstreamer_rtsp_server::{
     gio::{TlsAuthenticationMode, TlsCertificate},
     prelude::*,
     subclass::prelude::*,
-    RTSPAuth, RTSPFilterResult, RTSPServer, RTSPToken, RTSP_TOKEN_MEDIA_FACTORY_ROLE,
+    RTSPAuth, RTSPFilterResult, RTSPServer, RTSPThreadPool, RTSPToken,
+    RTSP_TOKEN_MEDIA_FACTORY_ROLE,
 };
 use log::*;
 use std::{
@@ -31,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 /// How long to wait when acquiring a write lock on the server's shared state
 /// before giving up.
 const SERVER_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const RTSP_THREAD_POOL_MAX_THREADS: i32 = 16;
 
 glib::wrapper! {
     /// The wrapped RTSPServer
@@ -47,6 +49,13 @@ impl NeoRtspServer {
     pub(crate) fn new() -> AnyResult<Self> {
         gstreamer::init().context("Gstreamer failed to initialise")?;
         let factory = Object::new::<NeoRtspServer>();
+
+        // The default pool serializes client handling on one context. During a
+        // cold start, create_element() blocks while learning the stream, so two
+        // simultaneous clients can block each other and starve RTP delivery.
+        let thread_pool = RTSPThreadPool::new();
+        thread_pool.set_max_threads(RTSP_THREAD_POOL_MAX_THREADS);
+        factory.set_thread_pool(Some(&thread_pool));
 
         // Setup auth
         let auth = factory.auth().unwrap_or_default();

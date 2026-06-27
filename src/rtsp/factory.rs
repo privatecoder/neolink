@@ -8,7 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory};
 use gstreamer_app::{AppSink, AppSrc, AppSrcCallbacks, AppStreamType};
 use neolink_core::{
-    bc::xml::{Compression, CompressionStream},
+    bc::xml::{Compression, CompressionStream, EncodeTable},
     bc_protocol::{BcCamera, StreamKind},
     bcmedia::model::{
         AacDurationInfo, BcMedia, BcMediaIframe, BcMediaInfoV1, BcMediaInfoV2, BcMediaPframe,
@@ -118,8 +118,10 @@ impl StreamConfig {
         name: StreamKind,
         buffer_duration_ms: u64,
     ) -> AnyResult<Self> {
+        let stream_name = name.to_string();
         let (resolution, bitrate, fps, fps_table) = instance
-            .run_passive_task(|cam| {
+            .run_passive_task(move |cam| {
+                let stream_name = stream_name.clone();
                 Box::pin(async move {
                     let infos = cam
                         .get_stream_info()
@@ -128,57 +130,18 @@ impl StreamConfig {
                         .iter()
                         .flat_map(|info| info.encode_tables.clone())
                         .collect::<Vec<_>>();
-                    if let Some(encode) =
-                        infos.iter().find(|encode| encode.name == name.to_string())
-                    {
-                        let stream_name = name.to_string();
-                        let bitrate_table = encode
-                            .bitrate_table
-                            .split(',')
-                            .filter_map(|c| {
-                                let i: Result<u32, _> = c.parse();
-                                i.ok()
-                            })
-                            .collect::<Vec<u32>>();
-                        let framerate_table = encode
-                            .framerate_table
-                            .split(',')
-                            .filter_map(|c| {
-                                let i: Result<u32, _> = c.parse();
-                                i.ok()
-                            })
-                            .collect::<Vec<u32>>();
-                        let ability_fps = framerate_table
-                            .get(encode.default_framerate as usize)
-                            .copied()
-                            .unwrap_or(encode.default_framerate);
-                        let ability_bitrate = bitrate_table
-                            .get(encode.default_bitrate as usize)
-                            .copied()
-                            .unwrap_or(encode.default_bitrate)
-                            * 1024;
-                        let ability_resolution =
-                            [encode.resolution.width, encode.resolution.height];
-                        let live_stream = get_enc_stream_with_timeout(cam, &stream_name).await;
-                        let sizing = stream_sizing_from_get_enc(
-                            live_stream.as_ref(),
-                            ability_resolution,
-                            ability_bitrate,
-                            ability_fps,
-                        );
+                    // GetEnc is consulted even when the ability table lacks this stream
+                    // (extern/third stream), which otherwise has no sizing.
+                    let live_stream = get_enc_stream_with_timeout(cam, &stream_name).await;
+                    let sizing =
+                        bootstrap_sizing_from_get_enc(&infos, &stream_name, live_stream.as_ref());
 
-                        Ok((
-                            sizing.resolution,
-                            sizing.bitrate,
-                            // <frame> from GetEnc is the live literal fps; defaultFramerate in the
-                            // ability XML is a static factory default and must NOT be used for the
-                            // live rate (it doesn't track the setting).
-                            sizing.fps,
-                            framerate_table.clone(),
-                        ))
-                    } else {
-                        Ok(([0, 0], 0, 0, vec![]))
-                    }
+                    Ok((
+                        sizing.resolution,
+                        sizing.bitrate,
+                        sizing.fps,
+                        sizing.fps_table,
+                    ))
                 })
             })
             .await?;
@@ -203,8 +166,28 @@ impl StreamConfig {
 
     fn update_from_media(&mut self, media: &BcMedia) {
         match media {
-            BcMedia::InfoV1(BcMediaInfoV1 { fps, .. })
-            | BcMedia::InfoV2(BcMediaInfoV2 { fps, .. }) => self.update_fps(*fps as u32),
+            BcMedia::InfoV1(BcMediaInfoV1 {
+                fps,
+                video_width,
+                video_height,
+                ..
+            })
+            | BcMedia::InfoV2(BcMediaInfoV2 {
+                fps,
+                video_width,
+                video_height,
+                ..
+            }) => {
+                self.update_fps(*fps as u32);
+                // GetEnc/ability are the t=0 bootstrap resolution; only fall back to
+                // the live Info-frame dimensions when bootstrap left it unknown. This
+                // keeps precedence GetEnc > Info-frame > SPS and stops a known
+                // resolution from flipping between sources, which would otherwise force
+                // a needless CapsBreaking session teardown on the warm path.
+                if self.resolution == [0, 0] && *video_width > 0 && *video_height > 0 {
+                    self.resolution = [*video_width, *video_height];
+                }
+            }
             BcMedia::Aac(aac) => {
                 self.aud_type = Some(AudioType::Aac);
                 // Capture the AAC sample rate / channels so the fast path can encode
@@ -223,8 +206,17 @@ impl StreamConfig {
                     log::warn!("Ignoring malformed ADPCM frame shorter than its header");
                 }
             }
-            BcMedia::Iframe(BcMediaIframe { video_type, .. })
-            | BcMedia::Pframe(BcMediaPframe { video_type, .. }) => {
+            BcMedia::Iframe(BcMediaIframe {
+                video_type, data, ..
+            }) => {
+                self.vid_type = Some(*video_type);
+                if self.resolution == [0, 0] {
+                    if let Some(resolution) = coded_resolution_from_keyframe(*video_type, data) {
+                        self.resolution = resolution;
+                    }
+                }
+            }
+            BcMedia::Pframe(BcMediaPframe { video_type, .. }) => {
                 self.vid_type = Some(*video_type);
             }
         }
@@ -1388,7 +1380,7 @@ pub(super) async fn make_factory(
                                                 measured_fps.unwrap_or(observed.fps);
                                             let learned_sizing = stream_sizing_from_get_enc(
                                                 get_enc_stream.as_ref(),
-                                                baseline.resolution,
+                                                observed.resolution,
                                                 baseline.bitrate,
                                                 fallback_fps,
                                             );
@@ -1699,11 +1691,420 @@ fn video_microseconds(m: &BcMedia) -> Option<u32> {
     }
 }
 
+fn coded_resolution_from_keyframe(video_type: VideoType, data: &[u8]) -> Option<[u32; 2]> {
+    match video_type {
+        VideoType::H264 => h264_resolution_from_sps(data),
+        VideoType::H265 => h265_resolution_from_sps(data),
+    }
+}
+
+fn h264_resolution_from_sps(data: &[u8]) -> Option<[u32; 2]> {
+    let sps = find_h264_sps_nal(data)?;
+    let rbsp = remove_emulation_prevention_bytes(sps.get(1..)?)?;
+    parse_h264_sps_rbsp(&rbsp)
+}
+
+fn h265_resolution_from_sps(data: &[u8]) -> Option<[u32; 2]> {
+    let sps = find_h265_sps_nal(data)?;
+    let rbsp = remove_emulation_prevention_bytes(sps.get(2..)?)?;
+    parse_h265_sps_rbsp(&rbsp)
+}
+
+fn find_h264_sps_nal(data: &[u8]) -> Option<&[u8]> {
+    let mut current = find_start_code(data, 0);
+    if let Some((mut start, mut prefix_len)) = current {
+        loop {
+            let nal_start = start + prefix_len;
+            current = find_start_code(data, nal_start);
+            let nal_end = current.map(|(pos, _)| pos).unwrap_or(data.len());
+            if nal_start < nal_end {
+                let nal = &data[nal_start..nal_end];
+                if nal.first().is_some_and(|header| header & 0x1f == 7) {
+                    return Some(nal);
+                }
+            }
+            match current {
+                Some((next_start, next_prefix_len)) => {
+                    start = next_start;
+                    prefix_len = next_prefix_len;
+                }
+                None => break,
+            }
+        }
+    }
+
+    for length_size in [4usize, 2usize] {
+        let mut pos = 0usize;
+        while pos.checked_add(length_size)? <= data.len() {
+            let nal_len = match length_size {
+                4 => u32::from_be_bytes(data[pos..pos + 4].try_into().ok()?) as usize,
+                2 => u16::from_be_bytes(data[pos..pos + 2].try_into().ok()?) as usize,
+                _ => unreachable!(),
+            };
+            pos = pos.checked_add(length_size)?;
+            if nal_len == 0 || pos.checked_add(nal_len)? > data.len() {
+                break;
+            }
+            let nal = &data[pos..pos + nal_len];
+            if nal.first().is_some_and(|header| header & 0x1f == 7) {
+                return Some(nal);
+            }
+            pos = pos.checked_add(nal_len)?;
+        }
+    }
+
+    if data.first().is_some_and(|header| header & 0x1f == 7) {
+        Some(data)
+    } else {
+        None
+    }
+}
+
+fn find_h265_sps_nal(data: &[u8]) -> Option<&[u8]> {
+    let mut current = find_start_code(data, 0);
+    if let Some((mut start, mut prefix_len)) = current {
+        loop {
+            let nal_start = start + prefix_len;
+            current = find_start_code(data, nal_start);
+            let nal_end = current.map(|(pos, _)| pos).unwrap_or(data.len());
+            if nal_start < nal_end {
+                let nal = &data[nal_start..nal_end];
+                if h265_nal_type(nal) == Some(33) {
+                    return Some(nal);
+                }
+            }
+            match current {
+                Some((next_start, next_prefix_len)) => {
+                    start = next_start;
+                    prefix_len = next_prefix_len;
+                }
+                None => break,
+            }
+        }
+    }
+
+    for length_size in [4usize, 2usize] {
+        let mut pos = 0usize;
+        while pos.checked_add(length_size)? <= data.len() {
+            let nal_len = match length_size {
+                4 => u32::from_be_bytes(data[pos..pos + 4].try_into().ok()?) as usize,
+                2 => u16::from_be_bytes(data[pos..pos + 2].try_into().ok()?) as usize,
+                _ => unreachable!(),
+            };
+            pos = pos.checked_add(length_size)?;
+            if nal_len == 0 || pos.checked_add(nal_len)? > data.len() {
+                break;
+            }
+            let nal = &data[pos..pos + nal_len];
+            if h265_nal_type(nal) == Some(33) {
+                return Some(nal);
+            }
+            pos = pos.checked_add(nal_len)?;
+        }
+    }
+
+    if h265_nal_type(data) == Some(33) {
+        Some(data)
+    } else {
+        None
+    }
+}
+
+fn h265_nal_type(nal: &[u8]) -> Option<u8> {
+    (nal.len() >= 2).then(|| (nal[0] >> 1) & 0x3f)
+}
+
+fn find_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut i = from;
+    while i + 3 <= data.len() {
+        if data[i] == 0 && data[i + 1] == 0 {
+            if i + 4 <= data.len() && data[i + 2] == 0 && data[i + 3] == 1 {
+                return Some((i, 4));
+            }
+            if data[i + 2] == 1 {
+                return Some((i, 3));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn remove_emulation_prevention_bytes(data: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut zeros = 0u8;
+    for &byte in data {
+        if zeros >= 2 && byte == 0x03 {
+            zeros = 0;
+            continue;
+        }
+        out.push(byte);
+        zeros = if byte == 0 {
+            zeros.saturating_add(1)
+        } else {
+            0
+        };
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+struct BitReader<'a> {
+    data: &'a [u8],
+    bit_pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, bit_pos: 0 }
+    }
+
+    fn read_bit(&mut self) -> Option<u8> {
+        let byte = *self.data.get(self.bit_pos / 8)?;
+        let bit = (byte >> (7 - (self.bit_pos % 8))) & 1;
+        self.bit_pos = self.bit_pos.checked_add(1)?;
+        Some(bit)
+    }
+
+    fn read_bits(&mut self, bits: usize) -> Option<u32> {
+        if bits > 32 {
+            return None;
+        }
+        let mut value = 0u32;
+        for _ in 0..bits {
+            value = (value << 1) | self.read_bit()? as u32;
+        }
+        Some(value)
+    }
+
+    fn read_ue(&mut self) -> Option<u32> {
+        let mut leading_zero_bits = 0usize;
+        while self.read_bit()? == 0 {
+            leading_zero_bits = leading_zero_bits.checked_add(1)?;
+            if leading_zero_bits > 31 {
+                return None;
+            }
+        }
+        let suffix = if leading_zero_bits == 0 {
+            0
+        } else {
+            self.read_bits(leading_zero_bits)?
+        };
+        (1u32.checked_shl(leading_zero_bits as u32)?)
+            .checked_sub(1)?
+            .checked_add(suffix)
+    }
+
+    fn read_se(&mut self) -> Option<i32> {
+        // read_ue can return up to 0x7FFF_FFFF; do the mapping in i64 so (code_num + 1)
+        // can't overflow i32 (panics under debug/overflow-checks). The result always
+        // fits i32 for that input range; these se(v) reads are skip-only anyway.
+        let code_num = self.read_ue()? as i64;
+        let val = if code_num % 2 == 0 {
+            -(code_num / 2)
+        } else {
+            (code_num + 1) / 2
+        };
+        Some(val as i32)
+    }
+}
+
+fn parse_h264_sps_rbsp(rbsp: &[u8]) -> Option<[u32; 2]> {
+    let mut bits = BitReader::new(rbsp);
+    let profile_idc = bits.read_bits(8)?;
+    bits.read_bits(8)?;
+    bits.read_bits(8)?;
+    bits.read_ue()?;
+
+    let mut chroma_format_idc = 1u32;
+    if matches!(
+        profile_idc,
+        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+    ) {
+        chroma_format_idc = bits.read_ue()?;
+        if chroma_format_idc == 3 {
+            bits.read_bit()?;
+        }
+        bits.read_ue()?;
+        bits.read_ue()?;
+        bits.read_bit()?;
+        if bits.read_bit()? != 0 {
+            let count = if chroma_format_idc == 3 { 12 } else { 8 };
+            for i in 0..count {
+                if bits.read_bit()? != 0 {
+                    skip_h264_scaling_list(&mut bits, if i < 6 { 16 } else { 64 })?;
+                }
+            }
+        }
+    }
+
+    bits.read_ue()?;
+    let pic_order_cnt_type = bits.read_ue()?;
+    match pic_order_cnt_type {
+        0 => {
+            bits.read_ue()?;
+        }
+        1 => {
+            bits.read_bit()?;
+            bits.read_se()?;
+            bits.read_se()?;
+            let cycles = bits.read_ue()?;
+            for _ in 0..cycles {
+                bits.read_se()?;
+            }
+        }
+        _ => {}
+    }
+    bits.read_ue()?;
+    bits.read_bit()?;
+    let pic_width_in_mbs_minus1 = bits.read_ue()?;
+    let pic_height_in_map_units_minus1 = bits.read_ue()?;
+    let frame_mbs_only_flag = bits.read_bit()? != 0;
+    if !frame_mbs_only_flag {
+        bits.read_bit()?;
+    }
+    bits.read_bit()?;
+
+    let (mut crop_left, mut crop_right, mut crop_top, mut crop_bottom) = (0u32, 0u32, 0u32, 0u32);
+    if bits.read_bit()? != 0 {
+        crop_left = bits.read_ue()?;
+        crop_right = bits.read_ue()?;
+        crop_top = bits.read_ue()?;
+        crop_bottom = bits.read_ue()?;
+    }
+
+    let width = pic_width_in_mbs_minus1.checked_add(1)?.checked_mul(16)?;
+    let frame_height_in_mbs = (2u32.checked_sub(frame_mbs_only_flag as u32)?)
+        .checked_mul(pic_height_in_map_units_minus1.checked_add(1)?)?;
+    let height = frame_height_in_mbs.checked_mul(16)?;
+
+    let (sub_width_c, sub_height_c) = match chroma_format_idc {
+        0 => (1, 1),
+        1 => (2, 2),
+        2 => (2, 1),
+        3 => (1, 1),
+        _ => return None,
+    };
+    let crop_unit_x = sub_width_c;
+    let crop_unit_y = sub_height_c * (2u32.checked_sub(frame_mbs_only_flag as u32)?);
+    let cropped_width = width.checked_sub(
+        crop_left
+            .checked_add(crop_right)?
+            .checked_mul(crop_unit_x)?,
+    )?;
+    let cropped_height = height.checked_sub(
+        crop_top
+            .checked_add(crop_bottom)?
+            .checked_mul(crop_unit_y)?,
+    )?;
+
+    (cropped_width > 0 && cropped_height > 0).then_some([cropped_width, cropped_height])
+}
+
+fn parse_h265_sps_rbsp(rbsp: &[u8]) -> Option<[u32; 2]> {
+    let mut bits = BitReader::new(rbsp);
+    bits.read_bits(4)?;
+    let max_sub_layers_minus1 = bits.read_bits(3)? as usize;
+    if max_sub_layers_minus1 > 6 {
+        return None;
+    }
+    bits.read_bit()?;
+    skip_h265_profile_tier_level(&mut bits, max_sub_layers_minus1)?;
+
+    bits.read_ue()?;
+    let chroma_format_idc = bits.read_ue()?;
+    if chroma_format_idc == 3 {
+        bits.read_bit()?;
+    }
+    let width = bits.read_ue()?;
+    let height = bits.read_ue()?;
+
+    let (mut crop_left, mut crop_right, mut crop_top, mut crop_bottom) = (0u32, 0u32, 0u32, 0u32);
+    if bits.read_bit()? != 0 {
+        crop_left = bits.read_ue()?;
+        crop_right = bits.read_ue()?;
+        crop_top = bits.read_ue()?;
+        crop_bottom = bits.read_ue()?;
+    }
+
+    let (sub_width_c, sub_height_c) = match chroma_format_idc {
+        0 => (1, 1),
+        1 => (2, 2),
+        2 => (2, 1),
+        3 => (1, 1),
+        _ => return None,
+    };
+    let crop_width = crop_left
+        .saturating_add(crop_right)
+        .saturating_mul(sub_width_c);
+    let crop_height = crop_top
+        .saturating_add(crop_bottom)
+        .saturating_mul(sub_height_c);
+    let cropped_width = width.saturating_sub(crop_width);
+    let cropped_height = height.saturating_sub(crop_height);
+
+    (cropped_width > 0 && cropped_height > 0).then_some([cropped_width, cropped_height])
+}
+
+fn skip_h265_profile_tier_level(
+    bits: &mut BitReader<'_>,
+    max_sub_layers_minus1: usize,
+) -> Option<()> {
+    bits.read_bits(32)?;
+    bits.read_bits(32)?;
+    bits.read_bits(32)?;
+
+    let mut profile_present = [false; 8];
+    let mut level_present = [false; 8];
+    for i in 0..max_sub_layers_minus1 {
+        profile_present[i] = bits.read_bit()? != 0;
+        level_present[i] = bits.read_bit()? != 0;
+    }
+    if max_sub_layers_minus1 > 0 {
+        for _ in max_sub_layers_minus1..8 {
+            bits.read_bits(2)?;
+        }
+    }
+    for i in 0..max_sub_layers_minus1 {
+        if profile_present[i] {
+            bits.read_bits(32)?;
+            bits.read_bits(32)?;
+            bits.read_bits(24)?;
+        }
+        if level_present[i] {
+            bits.read_bits(8)?;
+        }
+    }
+
+    Some(())
+}
+
+fn skip_h264_scaling_list(bits: &mut BitReader<'_>, size: usize) -> Option<()> {
+    let mut last_scale = 8i32;
+    let mut next_scale = 8i32;
+    for _ in 0..size {
+        if next_scale != 0 {
+            next_scale = (last_scale + bits.read_se()? + 256) % 256;
+        }
+        if next_scale != 0 {
+            last_scale = next_scale;
+        }
+    }
+    Some(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct StreamSizing {
     resolution: [u32; 2],
     bitrate: u32,
     fps: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BootstrapStreamSizing {
+    resolution: [u32; 2],
+    bitrate: u32,
+    fps: u32,
+    fps_table: Vec<u32>,
 }
 
 fn get_enc_stream<'a>(
@@ -1759,6 +2160,68 @@ fn stream_sizing_from_get_enc(
         resolution,
         bitrate,
         fps,
+    }
+}
+
+fn bootstrap_sizing_from_get_enc(
+    infos: &[EncodeTable],
+    stream_name: &str,
+    live_stream: Option<&CompressionStream>,
+) -> BootstrapStreamSizing {
+    let (ability_resolution, ability_bitrate, ability_fps, framerate_table) =
+        if let Some(encode) = infos.iter().find(|encode| encode.name == stream_name) {
+            let bitrate_table = encode
+                .bitrate_table
+                .split(',')
+                .filter_map(|c| {
+                    let i: Result<u32, _> = c.parse();
+                    i.ok()
+                })
+                .collect::<Vec<u32>>();
+            let framerate_table = encode
+                .framerate_table
+                .split(',')
+                .filter_map(|c| {
+                    let i: Result<u32, _> = c.parse();
+                    i.ok()
+                })
+                .collect::<Vec<u32>>();
+            let ability_fps = framerate_table
+                .get(encode.default_framerate as usize)
+                .copied()
+                .unwrap_or(encode.default_framerate);
+            let ability_bitrate = bitrate_table
+                .get(encode.default_bitrate as usize)
+                .copied()
+                .unwrap_or(encode.default_bitrate)
+                * 1024;
+            let ability_resolution = [encode.resolution.width, encode.resolution.height];
+
+            (
+                ability_resolution,
+                ability_bitrate,
+                ability_fps,
+                framerate_table,
+            )
+        } else {
+            ([0, 0], 0, 0, Vec::new())
+        };
+
+    let sizing = stream_sizing_from_get_enc(
+        live_stream,
+        ability_resolution,
+        ability_bitrate,
+        // <frame> from GetEnc is the live literal fps; defaultFramerate in the
+        // ability XML is a static factory default and must NOT be used for the
+        // live rate (it doesn't track the setting).
+        ability_fps,
+    );
+
+    BootstrapStreamSizing {
+        resolution: sizing.resolution,
+        bitrate: sizing.bitrate,
+        fps: sizing.fps,
+        fps_table: framerate_table,
     }
 }
 
@@ -3369,6 +3832,182 @@ mod tests {
         })
     }
 
+    fn info_v2(width: u32, height: u32, fps: u8) -> BcMedia {
+        BcMedia::InfoV2(BcMediaInfoV2 {
+            video_width: width,
+            video_height: height,
+            fps,
+            start_year: 0,
+            start_month: 0,
+            start_day: 0,
+            start_hour: 0,
+            start_min: 0,
+            start_seconds: 0,
+            end_year: 0,
+            end_month: 0,
+            end_day: 0,
+            end_hour: 0,
+            end_min: 0,
+            end_seconds: 0,
+        })
+    }
+
+    fn h264_stream_896x512() -> Vec<u8> {
+        vec![
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1e, 0xf4, 0x07, 0x00, 0x83, 0x20, 0x00,
+            0x00, 0x01, 0x68, 0xce, 0x06, 0xe2, 0x00, 0x00, 0x01, 0x65, 0x88,
+        ]
+    }
+
+    fn h264_stream_640x360() -> Vec<u8> {
+        vec![
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1e, 0xf4, 0x05, 0x01, 0x7f, 0xca, 0x80,
+            0x00, 0x00, 0x01, 0x68, 0xce, 0x06, 0xe2, 0x00, 0x00, 0x01, 0x65, 0x88,
+        ]
+    }
+
+    fn h265_stream_3840x2160() -> Vec<u8> {
+        vec![
+            0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60, 0x00, 0x00,
+            0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x96, 0x95, 0x98, 0x09,
+            0x00, 0x00, 0x00, 0x01, 0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90,
+            0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x96, 0xa0, 0x01, 0xe0, 0x20, 0x02, 0x1c,
+            0x59, 0x65, 0x66, 0x92, 0x4c, 0xaf, 0x01, 0x68, 0x08, 0x00, 0x00, 0x03, 0x00, 0x08,
+            0x00, 0x00, 0x03, 0x00, 0x08, 0x40, 0x00, 0x00, 0x00, 0x01, 0x44, 0x01, 0xc1, 0x72,
+            0xb4, 0x62, 0x40,
+        ]
+    }
+
+    fn length_prefixed_from_annex_b(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut current = find_start_code(data, 0);
+        while let Some((start, prefix_len)) = current {
+            let nal_start = start + prefix_len;
+            current = find_start_code(data, nal_start);
+            let nal_end = current.map(|(pos, _)| pos).unwrap_or(data.len());
+            if nal_start < nal_end {
+                let nal = &data[nal_start..nal_end];
+                out.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+                out.extend_from_slice(nal);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn h264_sps_resolution_parses_annex_b_keyframes() {
+        assert_eq!(
+            coded_resolution_from_keyframe(VideoType::H264, &h264_stream_896x512()),
+            Some([896, 512])
+        );
+        assert_eq!(
+            coded_resolution_from_keyframe(VideoType::H264, &h264_stream_640x360()),
+            Some([640, 360])
+        );
+    }
+
+    #[test]
+    fn h264_sps_resolution_handles_malformed_input() {
+        assert_eq!(coded_resolution_from_keyframe(VideoType::H264, &[]), None);
+        assert_eq!(
+            coded_resolution_from_keyframe(VideoType::H264, &[0x00, 0x00, 0x01, 0x67, 0x42]),
+            None
+        );
+        assert_eq!(
+            coded_resolution_from_keyframe(VideoType::H265, &h264_stream_896x512()),
+            None
+        );
+    }
+
+    #[test]
+    fn h265_sps_resolution_parses_annex_b_keyframe_header() {
+        assert_eq!(
+            coded_resolution_from_keyframe(VideoType::H265, &h265_stream_3840x2160()),
+            Some([3840, 2160])
+        );
+    }
+
+    #[test]
+    fn h265_sps_resolution_parses_length_prefixed_keyframe_header() {
+        assert_eq!(
+            coded_resolution_from_keyframe(
+                VideoType::H265,
+                &length_prefixed_from_annex_b(&h265_stream_3840x2160())
+            ),
+            Some([3840, 2160])
+        );
+    }
+
+    #[test]
+    fn h265_sps_resolution_handles_malformed_input() {
+        assert_eq!(coded_resolution_from_keyframe(VideoType::H265, &[]), None);
+        assert_eq!(
+            coded_resolution_from_keyframe(VideoType::H265, &[0x00, 0x00, 0x01, 0x42, 0x01]),
+            None
+        );
+    }
+
+    #[test]
+    fn stream_config_learns_resolution_from_h264_iframe_sps() {
+        let mut config = StreamConfig {
+            resolution: [0, 0],
+            bitrate: 0,
+            fps: 0,
+            fps_table: vec![],
+            vid_type: None,
+            aud_type: None,
+            buffer_duration_ms: 3000,
+            aud_rate: 0,
+            aud_channels: 0,
+        };
+
+        config.update_from_media(&iframe(h264_stream_896x512(), 1000));
+
+        assert_eq!(config.vid_type, Some(VideoType::H264));
+        assert_eq!(config.resolution, [896, 512]);
+    }
+
+    #[test]
+    fn stream_config_learns_resolution_from_info_v2() {
+        let mut config = StreamConfig {
+            resolution: [0, 0],
+            bitrate: 0,
+            fps: 0,
+            fps_table: vec![],
+            vid_type: None,
+            aud_type: None,
+            buffer_duration_ms: 3000,
+            aud_rate: 0,
+            aud_channels: 0,
+        };
+
+        config.update_from_media(&info_v2(896, 512, 20));
+
+        assert_eq!(config.resolution, [896, 512]);
+        assert_eq!(config.fps, 20);
+    }
+
+    #[test]
+    fn stream_config_does_not_clobber_resolution_with_zero_info_dims() {
+        let mut config = StreamConfig {
+            resolution: [896, 512],
+            bitrate: 0,
+            fps: 15,
+            fps_table: vec![],
+            vid_type: None,
+            aud_type: None,
+            buffer_duration_ms: 3000,
+            aud_rate: 0,
+            aud_channels: 0,
+        };
+
+        config.update_from_media(&info_v2(0, 512, 20));
+        config.update_from_media(&info_v2(896, 0, 20));
+
+        assert_eq!(config.resolution, [896, 512]);
+        assert_eq!(config.fps, 20);
+    }
+
     #[test]
     fn audio_watermark_drops_at_or_above_threshold() {
         // 1 MiB cap; watermark is AUDIO_DROP_WATERMARK_PCT (80%) -> 838860 bytes.
@@ -3600,6 +4239,39 @@ mod tests {
         assert_eq!(absent.resolution, [1280, 720]);
         assert_eq!(absent.bitrate, 2_048 * 1024);
         assert_eq!(absent.fps, 15);
+    }
+
+    #[test]
+    fn bootstrap_sizing_uses_get_enc_when_ability_entry_is_missing() {
+        let stream = compression_stream(20);
+        let sizing = bootstrap_sizing_from_get_enc(&[], "externStream", Some(&stream));
+
+        assert_eq!(sizing.resolution, [640, 360]);
+        assert_eq!(sizing.bitrate, 512 * 1024);
+        assert_eq!(sizing.fps, 20);
+        assert!(sizing.fps_table.is_empty());
+    }
+
+    #[test]
+    fn bootstrap_sizing_falls_back_to_ability_values() {
+        let infos = vec![neolink_core::bc::xml::EncodeTable {
+            name: "subStream".to_string(),
+            resolution: neolink_core::bc::xml::StreamResolution {
+                width: 896,
+                height: 512,
+            },
+            default_framerate: 1,
+            default_bitrate: 2,
+            framerate_table: "15,10,7,4".to_string(),
+            bitrate_table: "128,256,512,768".to_string(),
+        }];
+
+        let sizing = bootstrap_sizing_from_get_enc(&infos, "subStream", None);
+
+        assert_eq!(sizing.resolution, [896, 512]);
+        assert_eq!(sizing.bitrate, 512 * 1024);
+        assert_eq!(sizing.fps, 10);
+        assert_eq!(sizing.fps_table, vec![15, 10, 7, 4]);
     }
 
     #[test]
