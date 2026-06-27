@@ -8,7 +8,8 @@ use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory};
 use gstreamer_app::{AppSink, AppSrc, AppSrcCallbacks, AppStreamType};
 use neolink_core::{
-    bc_protocol::StreamKind,
+    bc::xml::{Compression, CompressionStream},
+    bc_protocol::{BcCamera, StreamKind},
     bcmedia::model::{
         AacDurationInfo, BcMedia, BcMediaIframe, BcMediaInfoV1, BcMediaInfoV2, BcMediaPframe,
         VideoType,
@@ -57,6 +58,13 @@ use super::stream_cache::{self, reconcile, AudioType, Reconcile, StreamCacheKey,
 /// Monotonic per-client-connection counter so overlapping client retries can be told
 /// apart in the logs (the per-client label becomes e.g. `cam#7::subStream`).
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
+const MIN_FPS_MEASURE_VIDEO_FRAMES: u32 = 10;
+const MAX_SANE_MEASURED_FPS: u32 = 120;
+const MAX_SANE_FPS_TIMESPAN_US: u64 = 10_000_000;
+const POST_RECONCILE_FPS_VIDEO_BUDGET: u32 = 30;
+const GET_ENC_TIMEOUT: Duration = Duration::from_secs(5);
+
+type SharedGetEncStream = Arc<Mutex<Option<Option<CompressionStream>>>>;
 
 #[derive(Clone, Debug)]
 struct StreamConfig {
@@ -123,6 +131,7 @@ impl StreamConfig {
                     if let Some(encode) =
                         infos.iter().find(|encode| encode.name == name.to_string())
                     {
+                        let stream_name = name.to_string();
                         let bitrate_table = encode
                             .bitrate_table
                             .split(',')
@@ -139,18 +148,32 @@ impl StreamConfig {
                                 i.ok()
                             })
                             .collect::<Vec<u32>>();
+                        let ability_fps = framerate_table
+                            .get(encode.default_framerate as usize)
+                            .copied()
+                            .unwrap_or(encode.default_framerate);
+                        let ability_bitrate = bitrate_table
+                            .get(encode.default_bitrate as usize)
+                            .copied()
+                            .unwrap_or(encode.default_bitrate)
+                            * 1024;
+                        let ability_resolution =
+                            [encode.resolution.width, encode.resolution.height];
+                        let live_stream = get_enc_stream_with_timeout(cam, &stream_name).await;
+                        let sizing = stream_sizing_from_get_enc(
+                            live_stream.as_ref(),
+                            ability_resolution,
+                            ability_bitrate,
+                            ability_fps,
+                        );
 
                         Ok((
-                            [encode.resolution.width, encode.resolution.height],
-                            bitrate_table
-                                .get(encode.default_bitrate as usize)
-                                .copied()
-                                .unwrap_or(encode.default_bitrate)
-                                * 1024,
-                            framerate_table
-                                .get(encode.default_framerate as usize)
-                                .copied()
-                                .unwrap_or(encode.default_framerate),
+                            sizing.resolution,
+                            sizing.bitrate,
+                            // <frame> from GetEnc is the live literal fps; defaultFramerate in the
+                            // ability XML is a static factory default and must NOT be used for the
+                            // live rate (it doesn't track the setting).
+                            sizing.fps,
                             framerate_table.clone(),
                         ))
                     } else {
@@ -470,7 +493,7 @@ pub(super) async fn make_factory(
                         );
                         let cached = stream_cache::get(&cache_key);
 
-                        let (stream_config, mut buffer, permit, mut media_rx, vid_src, aud_src, use_keepalive, reconcile_baseline) =
+                        let (mut stream_config, mut buffer, permit, mut media_rx, vid_src, aud_src, use_keepalive, reconcile_baseline) =
                             if let Some(cached) = cached.filter(|c| c.vid_type.is_some()) {
                                 // ===== Fast path: stream type is cached =====
                                 // Usually build the pipeline from cached caps and return it to
@@ -698,6 +721,34 @@ pub(super) async fn make_factory(
                                 // nothing to reconcile against.
                                 (stream_config, buffer, permit, media_rx, vid_src, aud_src, false, None)
                             };
+
+                        let reconcile_get_enc_stream: Option<SharedGetEncStream> = if reconcile_baseline.is_some() {
+                            let state = Arc::new(Mutex::new(None));
+                            let state_task = state.clone();
+                            let stream_name = stream.to_string();
+                            let camera_get_enc = camera.clone();
+                            let cancel_get_enc = cancel_child.clone();
+                            tokio::spawn(async move {
+                                let fetch = camera_get_enc.run_passive_task(move |cam| {
+                                    let stream_name = stream_name.clone();
+                                    Box::pin(async move {
+                                        Ok(get_enc_stream_with_timeout(cam, &stream_name).await)
+                                    })
+                                });
+                                // Warm self-heal is single-attempt best-effort: timeout/GetEnc
+                                // errors are flattened to None, so transient disconnects wait
+                                // for a future session while frames keep flowing now.
+                                let snapshot = tokio::select! {
+                                    _ = cancel_get_enc.cancelled() => return,
+                                    snapshot = fetch => snapshot.unwrap_or(None),
+                                };
+                                let mut guard = state_task.lock().unwrap_or_else(|e| e.into_inner());
+                                *guard = Some(snapshot);
+                            });
+                            Some(state)
+                        } else {
+                            None
+                        };
 
                         // ---- Keep tokio receiver async; forward into oldest-evicting queue ----
                         let queue_capacity = media_queue_capacity(&stream_config);
@@ -984,6 +1035,10 @@ pub(super) async fn make_factory(
                             let mut observed_audio = false;
                             let mut reconcile_done = reconcile_baseline.is_none();
                             let mut reconcile_frames = 0u32;
+                            let mut observed_video_fps = VideoFpsSampler::default();
+                            let mut post_reconcile_refresh: Option<PostReconcileStatsRefresh> =
+                                None;
+                            let mut get_enc_refresh_done = reconcile_get_enc_stream.is_none();
 
                             // Send buffered frames (no pacing)
                             for buffered in buffer.drain(..) {
@@ -1279,6 +1334,16 @@ pub(super) async fn make_factory(
                                 if is_video_keyframe(&timed.media) {
                                     cache_real_idr(&cache_key_loop, &timed.media);
                                 }
+                                let video_micros = video_microseconds(&timed.media);
+                                let fps_sampling_finalized = post_reconcile_refresh
+                                    .as_ref()
+                                    .map(|refresh| refresh.is_finalized())
+                                    .unwrap_or(false);
+                                if reconcile_baseline.is_some() && !fps_sampling_finalized {
+                                    if let Some(micros) = video_micros {
+                                        observed_video_fps.record(micros);
+                                    }
+                                }
 
                                 // ---- Fast-path reconcile (cached caps vs. live stream) ----
                                 // Observe early frames; once the codec (and audio, if cached)
@@ -1302,31 +1367,60 @@ pub(super) async fn make_factory(
                                         reconcile_frames += 1;
                                         let audio_settled =
                                             observed_audio || baseline.aud_type.is_none();
-                                        if (observed_video && audio_settled)
-                                            || reconcile_frames >= 30
-                                        {
+                                        let measured_fps =
+                                            observed_video_fps.measured(&baseline.fps_table);
+                                        if caps_reconcile_ready(
+                                            observed_video,
+                                            audio_settled,
+                                            reconcile_frames,
+                                        ) {
                                             reconcile_done = true;
-                                            // Sizing fields are not carried in frames; keep the
-                                            // baseline's so only codec/audio can read as caps-
-                                            // breaking (resolution/bitrate drift is reconciled
-                                            // by the slow path on a future cold cache).
+                                            let ready_get_enc =
+                                                ready_get_enc_stream(&reconcile_get_enc_stream);
+                                            if ready_get_enc.is_some() {
+                                                get_enc_refresh_done = true;
+                                            }
+                                            let get_enc_stream = ready_get_enc.flatten();
+                                            let get_enc_fps_ready = get_enc_stream
+                                                .as_ref()
+                                                .is_some_and(|stream| stream.frame > 0);
+                                            let fallback_fps =
+                                                measured_fps.unwrap_or(observed.fps);
+                                            let learned_sizing = stream_sizing_from_get_enc(
+                                                get_enc_stream.as_ref(),
+                                                baseline.resolution,
+                                                baseline.bitrate,
+                                                fallback_fps,
+                                            );
+                                            observed.fps = learned_sizing.fps;
+                                            stream_config.fps = learned_sizing.fps;
+                                            stream_config.bitrate = learned_sizing.bitrate;
+                                            stream_config.resolution = learned_sizing.resolution;
+                                            // GetEnc carries live sizing. If it is unavailable,
+                                            // fall back to measured fps and cached sizing so older
+                                            // cameras still behave as before.
                                             let learned = StreamTypeCache {
                                                 vid_type: observed.vid_type,
                                                 aud_type: observed.aud_type.clone(),
                                                 aud_rate: observed.aud_rate,
                                                 aud_channels: observed.aud_channels,
-                                                fps: observed.fps,
-                                                resolution: baseline.resolution,
-                                                bitrate: baseline.bitrate,
+                                                fps: learned_sizing.fps,
+                                                resolution: learned_sizing.resolution,
+                                                bitrate: learned_sizing.bitrate,
                                                 fps_table: baseline.fps_table.clone(),
                                             };
+                                            let refresh = PostReconcileStatsRefresh::new(
+                                                learned.clone(),
+                                                learned_sizing.fps,
+                                                get_enc_fps_ready || measured_fps.is_some(),
+                                            );
                                             match reconcile(baseline, &learned) {
                                                 Reconcile::Identical => {}
                                                 Reconcile::DriftOnly => {
                                                     log::info!("{stream_label}: live fps/sizing drifted from cache; refreshing cache");
                                                     stream_cache::store(
                                                         cache_key_loop.clone(),
-                                                        learned,
+                                                        learned.clone(),
                                                     );
                                                 }
                                                 Reconcile::CapsBreaking => {
@@ -1343,6 +1437,86 @@ pub(super) async fn make_factory(
                                                     }
                                                     break;
                                                 }
+                                            }
+                                            post_reconcile_refresh = Some(refresh);
+                                        }
+                                    }
+                                } else {
+                                    if !get_enc_refresh_done {
+                                        if let Some(ready_get_enc) =
+                                            ready_get_enc_stream(&reconcile_get_enc_stream)
+                                        {
+                                            get_enc_refresh_done = true;
+                                            if let Some(get_enc_stream) = ready_get_enc {
+                                                if let (
+                                                    Some(baseline),
+                                                    Some(refresh),
+                                                ) = (
+                                                    reconcile_baseline.as_ref(),
+                                                    post_reconcile_refresh.as_mut(),
+                                                ) {
+                                                    let mut refreshed = refresh.persisted.clone();
+                                                    let sizing = stream_sizing_from_get_enc(
+                                                        Some(&get_enc_stream),
+                                                        refreshed.resolution,
+                                                        refreshed.bitrate,
+                                                        refreshed.fps,
+                                                    );
+                                                    refreshed.resolution = sizing.resolution;
+                                                    refreshed.bitrate = sizing.bitrate;
+                                                    refreshed.fps = sizing.fps;
+
+                                                    if get_enc_stream.frame > 0 {
+                                                        refresh.fps_finalized = true;
+                                                        refresh.persisted_fps = refreshed.fps;
+                                                    }
+
+                                                    match reconcile(baseline, &refreshed) {
+                                                        Reconcile::Identical => {
+                                                            refresh.persisted = refreshed;
+                                                        }
+                                                        Reconcile::DriftOnly => {
+                                                            stream_config.fps = refreshed.fps;
+                                                            stream_config.bitrate =
+                                                                refreshed.bitrate;
+                                                            refresh.persisted = refreshed.clone();
+                                                            log::info!("{stream_label}: live GetEnc sizing drifted from cache; refreshing cache");
+                                                            stream_cache::store(
+                                                                cache_key_loop.clone(),
+                                                                refreshed,
+                                                            );
+                                                        }
+                                                        Reconcile::CapsBreaking => {
+                                                            log::warn!("{stream_label}: live GetEnc sizing differs from cache (resolution changed); refreshing cache and tearing down this session so the client reconnects to a correct pipeline");
+                                                            stream_cache::store(
+                                                                cache_key_loop.clone(),
+                                                                refreshed,
+                                                            );
+                                                            if let Some(app) = vid_src.as_ref() {
+                                                                let _ = app.end_of_stream();
+                                                            }
+                                                            if let Some(app) = aud_src.as_ref() {
+                                                                let _ = app.end_of_stream();
+                                                            }
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if video_micros.is_some() {
+                                        if let Some(refresh) = post_reconcile_refresh.as_mut() {
+                                            if let Some(refreshed) =
+                                                refresh.record_video(&observed_video_fps)
+                                            {
+                                                stream_config.fps = refreshed.fps;
+                                                log::info!("{stream_label}: measured live fps differed from early cache reconcile; refreshing cache");
+                                                stream_cache::store(
+                                                    cache_key_loop.clone(),
+                                                    refreshed,
+                                                );
                                             }
                                         }
                                     }
@@ -1523,6 +1697,166 @@ fn video_microseconds(m: &BcMedia) -> Option<u32> {
         BcMedia::Pframe(f) => Some(f.microseconds),
         _ => None,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StreamSizing {
+    resolution: [u32; 2],
+    bitrate: u32,
+    fps: u32,
+}
+
+fn get_enc_stream<'a>(
+    compression: &'a Compression,
+    stream_name: &str,
+) -> Option<&'a CompressionStream> {
+    match stream_name {
+        "mainStream" => compression.main_stream.as_ref(),
+        "subStream" => compression.sub_stream.as_ref(),
+        "externStream" | "thirdStream" => compression.third_stream.as_ref(),
+        _ => None,
+    }
+}
+
+async fn get_enc_stream_with_timeout(
+    cam: &BcCamera,
+    stream_name: &str,
+) -> Option<CompressionStream> {
+    tokio::time::timeout(GET_ENC_TIMEOUT, cam.get_enc())
+        .await
+        .ok()?
+        .ok()
+        .and_then(|compression| get_enc_stream(&compression, stream_name).cloned())
+}
+
+fn ready_get_enc_stream(shared: &Option<SharedGetEncStream>) -> Option<Option<CompressionStream>> {
+    shared.as_ref().and_then(|state| {
+        state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .cloned()
+    })
+}
+
+fn stream_sizing_from_get_enc(
+    stream: Option<&CompressionStream>,
+    fallback_resolution: [u32; 2],
+    fallback_bitrate: u32,
+    fallback_fps: u32,
+) -> StreamSizing {
+    let resolution = stream
+        .and_then(|s| (s.width > 0 && s.height > 0).then_some([s.width, s.height]))
+        .unwrap_or(fallback_resolution);
+    let bitrate = stream
+        .and_then(|s| (s.bit_rate > 0).then_some(s.bit_rate * 1024))
+        .unwrap_or(fallback_bitrate);
+    let fps = stream
+        .and_then(|s| (s.frame > 0).then_some(s.frame))
+        .unwrap_or(fallback_fps);
+
+    StreamSizing {
+        resolution,
+        bitrate,
+        fps,
+    }
+}
+
+#[derive(Default)]
+struct VideoFpsSampler {
+    frames: u32,
+    first_us: Option<u32>,
+    last_us: Option<u32>,
+}
+
+impl VideoFpsSampler {
+    fn record(&mut self, micros: u32) {
+        self.first_us.get_or_insert(micros);
+        self.last_us = Some(micros);
+        self.frames = self.frames.saturating_add(1);
+    }
+
+    fn measured(&self, fps_table: &[u32]) -> Option<u32> {
+        measured_video_fps(self.frames, self.first_us?, self.last_us?, fps_table)
+    }
+}
+
+fn caps_reconcile_ready(observed_video: bool, audio_settled: bool, reconcile_frames: u32) -> bool {
+    (observed_video && audio_settled) || reconcile_frames >= 30
+}
+
+struct PostReconcileStatsRefresh {
+    persisted: StreamTypeCache,
+    persisted_fps: u32,
+    video_budget_remaining: u32,
+    fps_finalized: bool,
+}
+
+impl PostReconcileStatsRefresh {
+    fn new(persisted: StreamTypeCache, persisted_fps: u32, fps_finalized: bool) -> Self {
+        Self {
+            persisted,
+            persisted_fps,
+            video_budget_remaining: POST_RECONCILE_FPS_VIDEO_BUDGET,
+            fps_finalized,
+        }
+    }
+
+    fn is_finalized(&self) -> bool {
+        self.fps_finalized
+    }
+
+    fn record_video(&mut self, sampler: &VideoFpsSampler) -> Option<StreamTypeCache> {
+        if self.fps_finalized {
+            return None;
+        }
+
+        if let Some(fps) = sampler.measured(&self.persisted.fps_table) {
+            self.fps_finalized = true;
+            if fps != self.persisted_fps {
+                self.persisted_fps = fps;
+                self.persisted.fps = fps;
+                return Some(self.persisted.clone());
+            }
+            return None;
+        }
+
+        self.video_budget_remaining = self.video_budget_remaining.saturating_sub(1);
+        if self.video_budget_remaining == 0 {
+            self.fps_finalized = true;
+        }
+        None
+    }
+}
+
+fn measured_video_fps(
+    video_frames: u32,
+    first_us: u32,
+    last_us: u32,
+    fps_table: &[u32],
+) -> Option<u32> {
+    if video_frames < MIN_FPS_MEASURE_VIDEO_FRAMES {
+        return None;
+    }
+
+    let span_us = last_us.wrapping_sub(first_us) as u64;
+    if span_us == 0 || span_us > MAX_SANE_FPS_TIMESPAN_US {
+        return None;
+    }
+
+    let intervals = u64::from(video_frames - 1);
+    let rounded = ((intervals * 1_000_000) + (span_us / 2)) / span_us;
+    if rounded == 0 || rounded > u64::from(MAX_SANE_MEASURED_FPS) {
+        return None;
+    }
+    let rounded = rounded as u32;
+
+    fps_table
+        .iter()
+        .copied()
+        .filter(|fps| *fps > 0)
+        .min_by_key(|fps| fps.abs_diff(rounded))
+        .or(Some(rounded))
 }
 
 /// Outcome of pushing a buffer to an appsrc / sending a frame to the sources.
@@ -3165,5 +3499,146 @@ mod tests {
         let frames = vec![pframe(1000), pframe(2000)];
 
         assert!(drain_from_first_keyframe(frames).is_none());
+    }
+
+    #[test]
+    fn measured_video_fps_snaps_to_nearest_table_value() {
+        assert_eq!(
+            measured_video_fps(30, 0, 1_973_000, &[15, 10, 7, 4]),
+            Some(15)
+        );
+    }
+
+    #[test]
+    fn measured_video_fps_requires_enough_frames_and_positive_span() {
+        assert_eq!(measured_video_fps(9, 0, 600_000, &[15, 10]), None);
+        assert_eq!(measured_video_fps(10, 500_000, 500_000, &[15, 10]), None);
+    }
+
+    fn compression_stream(frame: u32) -> neolink_core::bc::xml::CompressionStream {
+        neolink_core::bc::xml::CompressionStream {
+            audio: 1,
+            resolution_name: "640*360".to_string(),
+            width: 640,
+            height: 360,
+            frame,
+            bit_rate: 512,
+            encoder_profile: "main".to_string(),
+            video_enc_type: 0,
+            gop: None,
+        }
+    }
+
+    #[test]
+    fn get_enc_live_fps_selects_literal_stream_frame() {
+        let compression = neolink_core::bc::xml::Compression {
+            version: "1.1".to_string(),
+            channel_id: 0,
+            is_no_translate_frame: 1,
+            main_stream: Some(compression_stream(20)),
+            sub_stream: Some(compression_stream(15)),
+            third_stream: Some(compression_stream(12)),
+        };
+
+        assert_eq!(get_enc_stream(&compression, "subStream").unwrap().frame, 15);
+        assert_eq!(
+            get_enc_stream(&compression, "externStream").unwrap().frame,
+            12
+        );
+    }
+
+    #[test]
+    fn stream_sizing_prefers_get_enc_live_values() {
+        let compression = neolink_core::bc::xml::Compression {
+            version: "1.1".to_string(),
+            channel_id: 0,
+            is_no_translate_frame: 1,
+            main_stream: None,
+            sub_stream: Some(compression_stream(15)),
+            third_stream: None,
+        };
+
+        let sizing = stream_sizing_from_get_enc(
+            get_enc_stream(&compression, "subStream"),
+            [320, 240],
+            256 * 1024,
+            10,
+        );
+
+        assert_eq!(sizing.resolution, [640, 360]);
+        assert_eq!(sizing.bitrate, 512 * 1024);
+        assert_eq!(sizing.fps, 15);
+    }
+
+    #[test]
+    fn stream_sizing_falls_back_per_missing_or_zero_get_enc_field() {
+        let mut stream = compression_stream(0);
+        stream.width = 0;
+        stream.height = 720;
+        stream.bit_rate = 0;
+        let compression = neolink_core::bc::xml::Compression {
+            version: "1.1".to_string(),
+            channel_id: 0,
+            is_no_translate_frame: 1,
+            main_stream: Some(stream),
+            sub_stream: None,
+            third_stream: None,
+        };
+
+        let sizing = stream_sizing_from_get_enc(
+            get_enc_stream(&compression, "mainStream"),
+            [1920, 1080],
+            4_096 * 1024,
+            20,
+        );
+
+        assert_eq!(sizing.resolution, [1920, 1080]);
+        assert_eq!(sizing.bitrate, 4_096 * 1024);
+        assert_eq!(sizing.fps, 20);
+
+        let absent = stream_sizing_from_get_enc(None, [1280, 720], 2_048 * 1024, 15);
+        assert_eq!(absent.resolution, [1280, 720]);
+        assert_eq!(absent.bitrate, 2_048 * 1024);
+        assert_eq!(absent.fps, 15);
+    }
+
+    #[test]
+    fn caps_reconcile_ready_does_not_wait_for_fps_sample() {
+        assert!(caps_reconcile_ready(true, true, 2));
+        assert!(caps_reconcile_ready(false, false, 30));
+        assert!(!caps_reconcile_ready(true, false, 2));
+    }
+
+    #[test]
+    fn post_reconcile_refresh_persists_late_measured_fps_once() {
+        let persisted = StreamTypeCache {
+            vid_type: Some(VideoType::H264),
+            aud_type: Some(AudioType::Aac),
+            resolution: [640, 480],
+            bitrate: 512_000,
+            fps: 10,
+            fps_table: vec![15, 10, 7, 4],
+            aud_rate: 16_000,
+            aud_channels: 1,
+        };
+        let mut sampler = VideoFpsSampler::default();
+        sampler.record(0);
+        let mut refresh = PostReconcileStatsRefresh::new(persisted, 10, false);
+
+        let mut refreshed = None;
+        for frame in 1..10 {
+            sampler.record(frame * 66_667);
+            refreshed = refresh.record_video(&sampler);
+            if frame < 9 {
+                assert!(refreshed.is_none());
+            }
+        }
+
+        let refreshed = refreshed.expect("measured fps refresh");
+        assert_eq!(refreshed.fps, 15);
+        assert!(refresh.is_finalized());
+
+        sampler.record(666_670);
+        assert!(refresh.record_video(&sampler).is_none());
     }
 }

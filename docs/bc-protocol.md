@@ -126,3 +126,17 @@ Implemented in `crates/core/src/bc/crypto.rs`.
 | 104/105 | GET/SET_GENERAL | 438 | FLOODLIGHT_TASKS_READ |
 
 (See `model.rs` for the full list.)
+
+### `GET_ENC` (56) — live encoder config
+
+Returns the camera's **current** per-stream encoder settings as a `<Compression>`
+XML (`mainStream` / `subStream` / `thirdStream`, each with a literal `<frame>` fps,
+`<bitRate>`, `<width>`/`<height>`, `<videoEncType>`). This is distinct from the
+device-level `STREAM_INFO_LIST` (146), whose `encodeTable` carries only *capability*
+lists plus *factory-default* `defaultFramerate`/`defaultBitrate` that do **not** track
+the active setting (and lists resolution per profile). `GET_ENC` is the authoritative
+source for the live frame rate / bitrate / resolution.
+
+It is a **channel-level** query: the request body must carry the channel in an
+`Extension` (`channelId`), like `BATTERY_INFO`/`GET_LED_STATUS` — a bare request
+(as used for the device-level `STREAM_INFO_LIST`) is rejected with `response_code 400`.
