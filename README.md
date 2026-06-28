@@ -33,9 +33,9 @@ all three:
 
 | App live quality | Neolink `stream` | RTSP path | Wire `<streamType>` | SDK enum | Example profile\* |
 |---|---|---|---|---|---|
-| Clear / Klar | `Main` | `/<name>/mainStream` | `mainStream` | `E_BC_STREAM_MAIN` (0) | 3840×2160 · 20 fps · 4096 kbps · **H.265** |
-| **Balanced / Balanciert** | `Extern` | `/<name>/externStream` | `externStream` | `E_BC_STREAM_EXTERN` (4) | 896×512 · 20 fps · 1228 kbps · **H.264** |
-| Fluent / Flüssig | `Sub` | `/<name>/subStream` | `subStream` | `E_BC_STREAM_SUB` (1) | 640×360 · 15 fps · 512 kbps · **H.264** |
+| Clear | `Main` | `/<name>/mainStream` | `mainStream` | `E_BC_STREAM_MAIN` (0) | 3840×2160 · 20 fps · 4096 kbps · **H.265** |
+| **Balanced** | `Extern` | `/<name>/externStream` | `externStream` | `E_BC_STREAM_EXTERN` (4) | 896×512 · 20 fps · 1228 kbps · **H.264** |
+| Fluent | `Sub` | `/<name>/subStream` | `subStream` | `E_BC_STREAM_SUB` (1) | 640×360 · 15 fps · 512 kbps · **H.264** |
 
 \*Profiles are **per-camera** (example from a verified RGM‑203). Neolink reads the real
 values from the camera — don't assume these. Set `stream = "All"` to serve all three

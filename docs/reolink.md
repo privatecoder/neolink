@@ -39,9 +39,9 @@ The official client's live-quality menu maps 1:1 to them:
 
 | Live-quality label    | Wire `<streamType>` | Encoder-config element | SDK enum (FYI)           |
 |-----------------------|---------------------|------------------------|--------------------------|
-| Clear (Klar)          | `mainStream`        | `<mainStream>`         | `E_BC_STREAM_MAIN` = 0   |
-| Balanced (Balanciert) | `externStream`      | `<thirdStream>`        | `E_BC_STREAM_EXTERN` = 4 |
-| Fluent (Flüssig)      | `subStream`         | `<subStream>`          | `E_BC_STREAM_SUB` = 1    |
+| Clear                 | `mainStream`        | `<mainStream>`         | `E_BC_STREAM_MAIN` = 0   |
+| Balanced              | `externStream`      | `<thirdStream>`        | `E_BC_STREAM_EXTERN` = 4 |
+| Fluent                | `subStream`         | `<subStream>`          | `E_BC_STREAM_SUB` = 1    |
 
 - The third stream is selected on the wire with `<streamType>externStream</streamType>`
   in the `Preview` body of the video-start message (`MSG_ID_VIDEO`, 3) — the same
