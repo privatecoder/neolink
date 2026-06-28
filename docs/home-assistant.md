@@ -45,13 +45,15 @@ Common front-ends, all of which ultimately pull RTSP and go through go2rtc:
 
 ## Codecs vs. browser transports — the crux
 
-Reolink main streams are commonly **H265 (HEVC)** video with **AAC** audio; sub
-streams are often **H264**. The transport the card ends up using determines whether
-those codecs play:
+Reolink cameras encode **H265 (HEVC)** main / **H264** sub video with **AAC** audio.
+Neolink passes the **video** through untouched, but **decodes the AAC and re-serves the
+audio as uncompressed L16 PCM — it never outputs AAC over RTSP.** So the codecs that
+actually reach go2rtc are H264/H265 video + **L16 PCM** audio, and the transport the card
+uses determines whether they play:
 
-| Transport | H264 video | H265 video | AAC audio |
+| Transport | H264 video | H265 video | Audio (Neolink serves **L16 PCM**) |
 |---|---|---|---|
-| **WebRTC** | ✅ everywhere | ⚠️ Safari/Apple only (Chrome HEVC-over-WebRTC is very limited) | ❌ not a WebRTC codec — go2rtc transcodes to Opus or drops audio |
+| **WebRTC** | ✅ everywhere | ⚠️ Safari/Apple only (Chrome HEVC-over-WebRTC is very limited) | ✅ go2rtc converts the PCM to Opus/PCMA — **no ffmpeg** |
 | **MSE** (Media Source Extensions) | ✅ | ✅ in Chromium/Edge | ✅ |
 | **HLS** (HA `stream` / LL-HLS) | ✅ | ✅ (fMP4) | ✅ |
 | **MJPEG** | n/a (re-encoded) | n/a | ❌ no audio; CPU-heavy fallback |
@@ -61,8 +63,12 @@ Three practical takeaways:
 - **H265 over WebRTC usually fails** outside Safari. go2rtc does **not** transcode
   video by default (that would need an ffmpeg source), so an H265 main stream offered
   to a WebRTC-first card typically can't render via WebRTC and must fall back to MSE.
-- **AAC isn't carried by WebRTC.** Even with H264 video, a WebRTC session will drop
-  or transcode the audio. If you want AAC to "just work," prefer MSE/HLS.
+- **Audio plays over WebRTC — there's no AAC to worry about.** Neolink decodes the
+  camera's AAC and serves uncompressed **L16 PCM**, which go2rtc converts to WebRTC's
+  Opus/PCMA natively (no ffmpeg). The usual "AAC isn't a WebRTC codec, use MSE/HLS for
+  sound" advice for raw-AAC RTSP sources **does not apply to Neolink**. Trade-off: L16 is
+  uncompressed (~256 kbps mono / ~512 kbps stereo at 16 kHz) — heavier than AAC, but it's
+  Neolink → go2rtc on the LAN, so in practice a non-issue.
 - **The third ("extern") stream is often the best WebRTC source.** On single-lens
   cameras it's the app's "Balanced" live quality — H264 like sub but at a higher
   resolution/bitrate (e.g. 896×512 vs sub's 640×360); you can pick it in live view but
@@ -81,7 +87,7 @@ The AlexxIT WebRTC card (used directly, or via Advanced Camera Card's
 `webrtc → mse → mp4 → mjpeg` — opening a fresh go2rtc connection for each until one
 renders. go2rtc in turn opens a new RTSP pull to Neolink per attempt.
 
-With an **H265 + AAC** main stream the usual sequence is:
+With an **H265** main stream the usual sequence is:
 
 1. **WebRTC** is tried first → fails to render H265 in a non-Safari browser → torn
    down after a second or two.
@@ -128,8 +134,9 @@ closed, or the viewer/go2rtc gives up on its own).
 One prerequisite: the codec/rate are only cached after a *successful* view, so the
 **first** open of a camera after the add-on (re)starts must happen while the camera is
 online. After that, offline opens and reboots recover automatically. The silent-audio
-part needs an AAC stream; if it can't be built, the stream falls back to the previous
-behaviour (video keepalive only, which some players still drop during a long outage).
+keepalive needs the camera's audio decode pipeline to build; if it can't, the stream
+falls back to the previous behaviour (video keepalive only, which some players still
+drop during a long outage).
 
 ## Live view connects then drops in a reconnect loop
 
@@ -346,7 +353,7 @@ and backpressure handle these bursts.
 |---|---|---|
 | Live view takes ~10–20 s to appear, then works | WebRTC tried first on an H265 stream → fallback cascade | Pin `mode: mse`, or use the H264 sub stream |
 | Black/no video in some browsers, fine in Safari | H265 over WebRTC unsupported off Apple | `mode: mse` (Chromium) or use sub (H264) |
-| Video but no audio over WebRTC | AAC isn't a WebRTC codec | Use MSE/HLS, or let go2rtc transcode audio to Opus |
+| Video but no audio over WebRTC | Camera has no audio enabled, or a go2rtc audio-conversion hiccup | Audio normally works over WebRTC — Neolink serves L16 PCM (not AAC) that go2rtc converts to Opus. Check the camera actually has audio, and go2rtc's logs |
 | *"Wrong response on DESCRIBE"* | Client hit port **8554** = HA's built-in go2rtc, not Neolink | Use Neolink's actual port (8558 in the add-on) |
 | Repeated connect/disconnect in Neolink's log when opening a card | Card's mode-fallback + per-probe on-demand relay setup | Pin the mode; consider `connect_mode: always` or a go2rtc stream |
 | Choppy/laggy 4K on a multi-camera dashboard | Decoding several H265 main streams | Use sub streams for the tiles |

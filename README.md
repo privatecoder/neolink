@@ -63,7 +63,8 @@ Per-camera configuration options and their defaults are in the
 technical references live in [`docs/`](docs/) ([index](docs/README.md)):
 
 - [Using Neolink with Home Assistant](docs/home-assistant.md) — go2rtc / WebRTC / MSE
-  / HLS viewing, H264/H265 + AAC, offline-reboot recovery, GOP and CBR/VBR trade-offs.
+  / HLS viewing, H264/H265 video + L16-PCM audio (Neolink decodes the camera's AAC),
+  offline-reboot recovery, GOP and CBR/VBR trade-offs.
 - [Connection, discovery & bandwidth](docs/connection-and-bandwidth.md) — discovery
   methods, regions, the receiver-rate ACK feedback (`recv_bytes_per_sec`), diagnostics.
 - [Connection modes & lifecycle](docs/connection-modes.md), [architecture](docs/architecture.md),
