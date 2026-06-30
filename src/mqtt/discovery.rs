@@ -98,7 +98,7 @@ enum Encoding {
 
 #[derive(Serialize, Debug)]
 struct DiscoveryCamera {
-    name: String,
+    name: Option<String>,
     unique_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     icon: Option<String>,
@@ -265,7 +265,7 @@ pub(crate) async fn enable_discovery(
                     availability: availability.clone(),
 
                     // Identifiers
-                    name: format!("{} Floodlight", friendly_name.as_str()),
+                    name: "Floodlight".to_string(),
                     unique_id: format!("neolink_{}_floodlight", cam_config.name),
                     // Match native home assistant integration: https://github.com/home-assistant/core/blob/dev/homeassistant/components/reolink/light.py#L49
                     icon: Some("mdi:spotlight-beam".to_string()),
@@ -311,7 +311,7 @@ pub(crate) async fn enable_discovery(
                     availability: availability.clone(),
 
                     // Identifiers
-                    name: format!("{} FloodlightTasks", friendly_name.as_str()),
+                    name: "FloodlightTasks".to_string(),
                     unique_id: format!("neolink_{}_floodlight_tasks", cam_config.name),
                     // Match native home assistant integration: https://github.com/home-assistant/core/blob/dev/homeassistant/components/reolink/light.py#L49
                     icon: Some("mdi:spotlight-beam".to_string()),
@@ -357,7 +357,7 @@ pub(crate) async fn enable_discovery(
                     availability: availability.clone(),
 
                     // Identifiers
-                    name: format!("{} Camera", friendly_name.as_str()),
+                    name: None,
                     unique_id: format!("neolink_{}_camera", cam_config.name),
                     icon: Some("mdi:camera-iris".to_string()),
 
@@ -392,7 +392,7 @@ pub(crate) async fn enable_discovery(
                     availability: availability.clone(),
 
                     // Identifiers
-                    name: format!("{} LED", friendly_name.as_str()),
+                    name: "LED".to_string(),
                     unique_id: format!("neolink_{}_led", cam_config.name),
                     icon: Some("mdi:led-on".to_string()),
 
@@ -431,7 +431,7 @@ pub(crate) async fn enable_discovery(
                     availability: availability.clone(),
 
                     // Identifiers
-                    name: format!("{} IR", friendly_name.as_str()),
+                    name: "IR".to_string(),
                     unique_id: format!("neolink_{}_ir", cam_config.name),
                     icon: Some("mdi:lightbulb-night".to_string()),
 
@@ -467,7 +467,7 @@ pub(crate) async fn enable_discovery(
                     availability: availability.clone(),
 
                     // Identifiers
-                    name: format!("{} MD", friendly_name.as_str()),
+                    name: "MD".to_string(),
                     unique_id: format!("neolink_{}_md", cam_config.name),
                     icon: Some("mdi:motion-sensor".to_string()),
 
@@ -503,7 +503,7 @@ pub(crate) async fn enable_discovery(
                     availability: availability.clone(),
 
                     // Identifiers
-                    name: format!("{} Reboot", friendly_name.as_str()),
+                    name: "Reboot".to_string(),
                     unique_id: format!("neolink_{}_reboot", cam_config.name),
                     icon: Some("mdi:restart".to_string()),
 
@@ -539,7 +539,7 @@ pub(crate) async fn enable_discovery(
                         availability: availability.clone(),
 
                         // Identifiers
-                        name: format!("{} Pan {}", friendly_name.as_str(), dir),
+                        name: format!("Pan {}", dir),
                         unique_id: format!("neolink_{}_pan_{}", cam_config.name, dir),
                         icon: Some(format!("mdi:pan-{}", dir)),
 
@@ -575,7 +575,7 @@ pub(crate) async fn enable_discovery(
                     availability: availability.clone(),
 
                     // Identifiers
-                    name: format!("{} Battery", friendly_name.as_str()),
+                    name: "Battery".to_string(),
                     unique_id: format!("neolink_{}_battery", cam_config.name),
                     icon: Some("mdi:battery".to_string()),
 
@@ -612,7 +612,7 @@ pub(crate) async fn enable_discovery(
                     availability: availability.clone(),
 
                     // Identifiers
-                    name: format!("{} Siren", friendly_name.as_str()),
+                    name: "Siren".to_string(),
                     unique_id: format!("neolink_{}_siren", cam_config.name),
                     icon: Some("mdi:bell".to_string()),
 
@@ -647,7 +647,7 @@ pub(crate) async fn enable_discovery(
                     availability: availability.clone(),
 
                     // Identifiers
-                    name: format!("{} Doorbell", friendly_name.as_str()),
+                    name: "Doorbell".to_string(),
                     unique_id: format!("neolink_{}_doorbell", cam_config.name),
                     icon: Some("mdi:doorbell".to_string()),
 

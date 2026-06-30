@@ -1028,6 +1028,7 @@ pub(super) async fn make_factory(
                             let mut reconcile_done = reconcile_baseline.is_none();
                             let mut reconcile_frames = 0u32;
                             let mut observed_video_fps = VideoFpsSampler::default();
+                            let mut observed_gop = ObservedGop::default();
                             let mut post_reconcile_refresh: Option<PostReconcileStatsRefresh> =
                                 None;
                             let mut get_enc_refresh_done = reconcile_get_enc_stream.is_none();
@@ -1238,13 +1239,14 @@ pub(super) async fn make_factory(
                                     let drop_audio = drop_audio.swap(0, Ordering::Relaxed);
                                     let drop_video = drop_video.swap(0, Ordering::Relaxed);
                                     let drop_other = drop_other.swap(0, Ordering::Relaxed);
+                                    let (gop_seconds, gop_frames) = observed_gop.latest();
 
                                     log::debug!(
                                         "{stream_label}: HB elapsed={:?} vid_ts={:?} aud_ts={:?} \
                                         vid_buf={}/{} aud_buf={}/{} last_media={:?} \
                                         vid_push={} aud_push={} dropP_pressure={} dropP_backpressure={} \
                                         dropA_pressure={} dropA_flushing={} \
-                                        fps={} frame_us={} av_drift_ms={} \
+                                        fps={} frame_us={} av_drift_ms={} gop_s={:.2} gop_frames={} \
                                         aud_avg_us={} aud_min_us={} aud_max_us={} aud_last_us={} aud_rate={} \
                                         aud_adts_frames={} aud_raw_blocks={} aud_profile={} aud_samp_idx={} aud_ch={} \
                                         aud_frame_len={} aud_hdr_len={} aud_payload={} aud_parsed={} aud_bytes={} \
@@ -1263,6 +1265,8 @@ pub(super) async fn make_factory(
                                         stream_config.fps,
                                         frame_step_us,
                                         av_drift_ms,
+                                        gop_seconds,
+                                        gop_frames,
                                         aud_snap.avg_us,
                                         aud_snap.min_us,
                                         aud_snap.max_us,
@@ -1325,6 +1329,18 @@ pub(super) async fn make_factory(
                                 stats.last_media_instant = Instant::now();
                                 if is_video_keyframe(&timed.media) {
                                     cache_real_idr(&cache_key_loop, &timed.media);
+                                }
+                                if let Some((seconds, frames)) = observed_gop.record(&timed.media)
+                                {
+                                    if let Some((seconds, frames)) =
+                                        observed_gop.take_first_report(seconds, frames)
+                                    {
+                                        log::debug!(
+                                            "{stream_label}: observed GOP ~= {:.2}s ({} frames)",
+                                            seconds,
+                                            frames
+                                        );
+                                    }
                                 }
                                 let video_micros = video_microseconds(&timed.media);
                                 let fps_sampling_finalized = post_reconcile_refresh
@@ -2241,6 +2257,62 @@ impl VideoFpsSampler {
 
     fn measured(&self, fps_table: &[u32]) -> Option<u32> {
         measured_video_fps(self.frames, self.first_us?, self.last_us?, fps_table)
+    }
+}
+
+#[derive(Default)]
+struct ObservedGop {
+    last_keyframe_us: Option<u32>,
+    video_frames_since_keyframe: u32,
+    last_gop_seconds: Option<f64>,
+    last_gop_frames: u32,
+    first_reported: bool,
+}
+
+impl ObservedGop {
+    fn record(&mut self, media: &BcMedia) -> Option<(f64, u32)> {
+        if !is_video(media) {
+            return None;
+        }
+
+        self.video_frames_since_keyframe = self.video_frames_since_keyframe.saturating_add(1);
+
+        if !is_video_keyframe(media) {
+            return None;
+        }
+
+        let micros = video_microseconds(media)?;
+        let measured = self.last_keyframe_us.and_then(|last| {
+            let delta_us = micros.wrapping_sub(last);
+            (delta_us > 0).then_some((
+                delta_us as f64 / 1_000_000.0,
+                self.video_frames_since_keyframe,
+            ))
+        });
+
+        self.last_keyframe_us = Some(micros);
+        self.video_frames_since_keyframe = 0;
+
+        if let Some((seconds, frames)) = measured {
+            self.last_gop_seconds = Some(seconds);
+            self.last_gop_frames = frames;
+            Some((seconds, frames))
+        } else {
+            None
+        }
+    }
+
+    fn latest(&self) -> (f64, u32) {
+        (self.last_gop_seconds.unwrap_or(0.0), self.last_gop_frames)
+    }
+
+    fn take_first_report(&mut self, seconds: f64, frames: u32) -> Option<(f64, u32)> {
+        if self.first_reported {
+            None
+        } else {
+            self.first_reported = true;
+            Some((seconds, frames))
+        }
     }
 }
 
@@ -4152,6 +4224,41 @@ mod tests {
     fn measured_video_fps_requires_enough_frames_and_positive_span() {
         assert_eq!(measured_video_fps(9, 0, 600_000, &[15, 10]), None);
         assert_eq!(measured_video_fps(10, 500_000, 500_000, &[15, 10]), None);
+    }
+
+    #[test]
+    fn observed_gop_measures_keyframe_interval_once_complete() {
+        let mut gop = ObservedGop::default();
+
+        assert_eq!(gop.record(&iframe(h264_idr(0x41), 1_000_000)), None);
+        assert_eq!(gop.record(&pframe(1_500_000)), None);
+        assert_eq!(gop.record(&pframe(2_000_000)), None);
+
+        let (seconds, frames) = gop
+            .record(&iframe(h264_idr(0x42), 2_500_000))
+            .expect("second keyframe produces GOP");
+
+        assert_eq!(seconds, 1.5);
+        assert_eq!(frames, 3);
+        assert_eq!(gop.latest(), (1.5, 3));
+        assert_eq!(gop.take_first_report(seconds, frames), Some((1.5, 3)));
+        assert_eq!(gop.take_first_report(seconds, frames), None);
+    }
+
+    #[test]
+    fn observed_gop_uses_wrapping_camera_timestamps() {
+        let mut gop = ObservedGop::default();
+
+        assert_eq!(
+            gop.record(&iframe(h264_idr(0x51), u32::MAX - 499_999)),
+            None
+        );
+        let (seconds, frames) = gop
+            .record(&iframe(h264_idr(0x52), 500_000))
+            .expect("wrapped timestamp produces GOP");
+
+        assert_eq!(seconds, 1.0);
+        assert_eq!(frames, 1);
     }
 
     fn compression_stream(frame: u32) -> neolink_core::bc::xml::CompressionStream {

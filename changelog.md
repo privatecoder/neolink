@@ -10,6 +10,37 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## 0.7.19
+
+Cleaner Home Assistant MQTT entity names, a debug-only GOP diagnostic, and a docs
+correction. No functional change to streaming.
+
+### Changed
+
+- **MQTT discovery entity names no longer repeat the camera name.** Entities were
+  published with the device name baked into the entity name, so Home Assistant
+  produced doubled ids like `camera.<name>_<name>_camera`. Each entity now carries
+  only its function name, so HA generates clean ids — `camera.<name>` (the camera
+  inherits the device name; the `_camera` suffix is gone), `light.<name>_floodlight`,
+  `binary_sensor.<name>_md`, etc. Existing entities keep their current `entity_id`
+  (HA keys by `unique_id`) — only the display name tidies up; **new** discoveries get
+  the clean ids. To clean an existing one, delete the device in HA and let it
+  re-discover, or rename the `entity_id`.
+
+### Added
+
+- **Debug-only observed-GOP (keyframe-interval) measurement.** With `debug` logging
+  on the RTSP subsystem, each stream's heartbeat now reports `gop_s` / `gop_frames`,
+  plus a one-time `observed GOP ~= X.Xs (N frames)` line — handy for diagnosing
+  catch-up / latency behaviour. Nothing is logged at `info`, and serving is unchanged.
+
+### Docs
+
+- Corrected the RTSP-port note: port **8554** is taken by **AlexxIT's go2rtc** (the
+  *WebRTC Camera* integration's bundled go2rtc and the AlexxIT go2rtc add-on), **not**
+  Home Assistant's built-in go2rtc — which uses the 1-prefixed ports (**18554** RTSP /
+  **11984** API). The add-on's **8558** default avoids the AlexxIT-go2rtc clash.
+
 ## 0.7.18
 
 Fixes a pre-existing bug where **two streams opened at the same instant both fail** — each
