@@ -20,9 +20,12 @@ This document is generic. Replace `front-door` with your own camera name and
 - **MQTT** (optional) for status/commands and HA discovery.
 
 **Port note:** the Home Assistant add-on defaults RTSP to **8558**, not the upstream
-default 8554, because HA's built-in go2rtc already listens on 8554. If you point a
-client at 8554 you'll reach HA's go2rtc instead of Neolink and typically see a
-*"wrong response on DESCRIBE"* error. Use the port Neolink actually bound.
+default 8554, because **AlexxIT's go2rtc** defaults to 8554 — both the WebRTC Camera
+integration's bundled go2rtc and the [AlexxIT go2rtc add-on](https://github.com/AlexxIT/hassio-addons)
+take that port. If you point a client at 8554 you'll reach that go2rtc instead of
+Neolink and typically see a *"wrong response on DESCRIBE"* error. (HA's *built-in*
+go2rtc uses the 1-prefixed ports — 18554 RTSP / 11984 API — so it doesn't clash.)
+Use the port Neolink actually bound.
 
 ## The Home Assistant viewing path
 
@@ -354,7 +357,7 @@ and backpressure handle these bursts.
 | Live view takes ~10–20 s to appear, then works | WebRTC tried first on an H265 stream → fallback cascade | Pin `mode: mse`, or use the H264 sub stream |
 | Black/no video in some browsers, fine in Safari | H265 over WebRTC unsupported off Apple | `mode: mse` (Chromium) or use sub (H264) |
 | Video but no audio over WebRTC | Camera has no audio enabled, or a go2rtc audio-conversion hiccup | Audio normally works over WebRTC — Neolink serves L16 PCM (not AAC) that go2rtc converts to Opus. Check the camera actually has audio, and go2rtc's logs |
-| *"Wrong response on DESCRIBE"* | Client hit port **8554** = HA's built-in go2rtc, not Neolink | Use Neolink's actual port (8558 in the add-on) |
+| *"Wrong response on DESCRIBE"* | Client hit port **8554** = an AlexxIT go2rtc (WebRTC Camera / go2rtc add-on), not Neolink (HA's built-in go2rtc is on 18554) | Use Neolink's actual port (8558 in the add-on) |
 | Repeated connect/disconnect in Neolink's log when opening a card | Card's mode-fallback + per-probe on-demand relay setup | Pin the mode; consider `connect_mode: always` or a go2rtc stream |
 | Choppy/laggy 4K on a multi-camera dashboard | Decoding several H265 main streams | Use sub streams for the tiles |
 
